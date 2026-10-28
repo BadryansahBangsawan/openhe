@@ -1289,8 +1289,12 @@ impl LiveDepth {
     }
 
     /// Stores one frame: the depth of every matrix key at its DEFKEY
-    /// position.
+    /// position. A frame with travel where the matrix has no key (halves
+    /// mixed up, see `TravelFrame::fits`) is skipped.
     pub fn apply(&mut self, snap: &DeviceSnapshot, frame: &TravelFrame) {
+        if !frame.fits(&snap.matrix) {
+            return;
+        }
         for (row, col, code) in snap.matrix.keys() {
             if let Some(v) = frame
                 .um

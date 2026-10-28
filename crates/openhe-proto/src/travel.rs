@@ -69,6 +69,26 @@ impl TravelFrame {
     }
 }
 
+impl TravelFrame {
+    /// Every matrix position without a key reads 0.
+    ///
+    /// RM6X21 replies carry their SUB but not their PART, so a late reply
+    /// to one half that arrives while the other half is awaited would put
+    /// its rows in the wrong place. Such a frame usually shows travel where
+    /// the matrix has no key (row 0 and the gaps are empty), so consumers
+    /// skip frames that do not fit rather than credit the wrong keys.
+    pub fn fits(&self, matrix: &crate::defkey::Matrix) -> bool {
+        self.um
+            .iter()
+            .zip(matrix.codes.iter())
+            .all(|(vals, codes)| {
+                vals.iter()
+                    .zip(codes.iter())
+                    .all(|(&v, &code)| code != 0 || v == 0)
+            })
+    }
+}
+
 /// `[sub, part, FF, FF]`, no GET/SET flag.
 pub fn request(sub: u8, part: u8) -> Request {
     Request {
@@ -127,6 +147,19 @@ mod tests {
             rep.copy_from_slice(&all[i * 64..(i + 1) * 64]);
         }
         out
+    }
+
+    #[test]
+    fn a_frame_fits_when_keyless_positions_read_zero() {
+        let mut m = crate::defkey::Matrix::default();
+        m.codes[1][0] = 0x29;
+        let mut f = TravelFrame {
+            um: [[0; COLS]; ROWS],
+        };
+        f.um[1][0] = 3400;
+        assert!(f.fits(&m));
+        f.um[0][0] = 1200; // row 0 has no keys
+        assert!(!f.fits(&m));
     }
 
     fn v(r: usize, c: usize) -> u16 {

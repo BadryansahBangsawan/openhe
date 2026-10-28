@@ -545,6 +545,47 @@ mod tests {
         assert_eq!(f.um[5][20], 5062);
     }
 
+    /// Replies PART 1 twice (a duplicate, as after a retry) and PART 2
+    /// once, each right after its request.
+    struct DuplicatePart1 {
+        out: std::collections::VecDeque<[u8; 64]>,
+    }
+
+    impl Transport for DuplicatePart1 {
+        fn write(&mut self, r: &[u8; 64]) -> Result<(), Error> {
+            let part = r[5];
+            let value = if part == 1 { 1000 } else { 5000 };
+            let times = if part == 1 { 2 } else { 1 };
+            for _ in 0..times {
+                self.out.extend(rm_reply(SUB_TRAVEL, value));
+            }
+            Ok(())
+        }
+
+        fn read(&mut self, _t: u32) -> Result<Option<[u8; 64]>, Error> {
+            Ok(self.out.pop_front())
+        }
+    }
+
+    /// RM6X21 replies are matched on SUB only (they carry no PART). A
+    /// second PART-1 reply that is already waiting when PART 2 is
+    /// requested is drained before the write, so it is never taken as the
+    /// PART-2 answer. (One that arrives *while* PART 2 is awaited cannot be
+    /// told apart; the app ignores frames that do not fit the matrix.)
+    #[test]
+    fn a_late_duplicate_part1_reply_is_not_taken_for_part2() {
+        let mut k = Keyboard::new(
+            DuplicatePart1 {
+                out: Default::default(),
+            },
+            Model::Win68HeMax,
+        );
+        let f = k.travel().unwrap();
+        assert_eq!(f.um[0][0], 1000);
+        assert_eq!(f.um[3][0], 5000, "rows 3..5 come from the PART-2 reply");
+        assert_eq!(f.um[5][20], 5062);
+    }
+
     #[test]
     fn calibration_values_use_sub_six() {
         let mut m = MockTransport::new();

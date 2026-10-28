@@ -135,7 +135,12 @@ impl Request {
     ///   GET and SET). A multi-entry SET is matched on its first entry only.
     /// - DefKey: R[1] is the first requested row (`payload[1]`).
     /// - Rm6x21: R[1] is the SUB (`payload[0]`); only the first of the reply's
-    ///   3 reports carries a header, the rest are raw continuations.
+    ///   3 reports carries a header, the rest are raw continuations. The
+    ///   reply does not echo the PART, so a late reply to PART 1 that
+    ///   arrives while PART 2 is awaited (after a retry) matches too. One
+    ///   already waiting is drained before the write; for the rest the
+    ///   consumers skip frames that do not fit the matrix
+    ///   (`TravelFrame::fits`).
     ///
     /// A payload too short to carry those fields never matches.
     pub fn expects(&self, resp: &Response) -> bool {

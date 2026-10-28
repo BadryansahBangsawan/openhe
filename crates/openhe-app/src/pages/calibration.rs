@@ -165,7 +165,14 @@ pub struct Progress {
 impl Progress {
     /// Takes in one sample. Only `count` samples (after the settle time)
     /// can mark keys as calibrated.
+    ///
+    /// A sample with travel where the matrix has no key (halves of the
+    /// frame mixed up, see `TravelFrame::fits`) is ignored, so it can never
+    /// mark the wrong keys as calibrated.
     pub fn apply(&mut self, snap: &DeviceSnapshot, s: &Sample, count: bool) {
+        if !s.travel.fits(&snap.matrix) {
+            return;
+        }
         for (row, col, code) in snap.matrix.keys() {
             let (r, c) = (usize::from(row), usize::from(col));
             let Some(tr) = s.travel.um.get(r).and_then(|x| x.get(c)) else {
@@ -1095,6 +1102,12 @@ mod tests {
         assert!(p.done.contains(&0x1A));
         assert!(!p.done.contains(&0x04));
         assert_eq!(p.done.len(), 1);
+        // A frame with travel at a keyless position is ignored.
+        let mut bad = sample(&snap, |_| 3400);
+        bad.travel.um[0][0] = 3400; // row 0 has no keys
+        let before = p.clone();
+        p.apply(&snap, &bad, true);
+        assert_eq!(p, before);
         assert_eq!(p.remaining(&snap).len(), snap.matrix.len() - 1);
         // Sticky: releasing W keeps it done.
         p.apply(&snap, &sample(&snap, |_| 0), true);
