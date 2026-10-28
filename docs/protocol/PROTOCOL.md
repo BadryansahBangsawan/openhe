@@ -788,7 +788,7 @@ Suggested safe probes are GETs only: SYNC, DEFKEY, KEY GET, PRGB GET (the LEN-15
 11. **Firmware version string format** returned by SYNC. It affects the SOCD packet format choice.
    - RESOLVED: firmware string is `App V1.1.3` (finding 6), so the new SOCD format (>= 1.0.7) applies.
 12. **RGBNACK (0x47).** Its exact meaning, and whether it is needed before PRGB GET.
-   - Note: with RGBNACK sent first, a LEN-44 PRGB GET was still rejected (finding 14). The LEN-15 GET has not yet been tried on hardware.
+   - Note: with RGBNACK sent first, a LEN-44 PRGB GET was still rejected (finding 14). RGBNACK itself is rejected (0xFF) on FW App V1.1.3, and the LEN-15 GET works without it (finding 22).
 13. **Logo/side light.** Does the WIN 68 HE MAX hardware have a light that LOGORGB 0x19 controls?
 14. **Persistence.** Are settings saved to flash immediately, given that SAVING_PARAMETER 0x02 is never used? KRGB needs the explicit 0xFE commit.
 15. **Bootloader re-enumeration.** Does the bootloader appear with the same VID/PID/usage page? The official updater exe flow is not in this app.
@@ -830,3 +830,4 @@ Findings 14 to 21 come from the first OpenHE hardware test session on the same k
 19. **Live depth verified.** RM6X21 (2,1) + (2,2) every 100 ms returned per-key travel in µm (0 at rest, up to 3400 bottomed out) at the matrix positions of the pressed keys (e.g. Space (5,6), RAlt (5,9), Fn (5,10), W (2,2), E (2,3)); keys at rest read 0. This is consistent with the row split of 3.4: PART 1 is rows 0..2, PART 2 rows 3..5.
 20. **Calibration values** (6,1) + (6,2) outside calibration: exactly the 68 key cells are non-zero, about 2220–2400 each (raw u16; e.g. Esc 2284, G 2397, LCtrl 2223), and stable between reads.
 21. **Status (3,1)** read once a second for 16 s: the body was `00 03` followed by zeros only, with and without keys pressed. Its meaning stays unknown; OpenHE does not read it.
+22. **Lighting read on FW App V1.1.3.** RGBNACK (`5C 04 00 94 47 01 FF FF`) is **rejected** with CMD 0xFF (DeviceFail); OpenHE ignores that one failure and still sends the GET. The LEN-15 PRGB GET `5C 0F 18 B8 00 …` **works**. Reply raw[0..48]: `5C 2D 98 55 00 00 00 00 00 00 00 FF FF 00 FF 00 FF 00 7F 7F FF FF 00 00 FF 7F 00 7F FF 7F 7F 00 FF 7F 7F 7F FF 00 00 00 00 C1 03 03 03 02 06 07`. Decoded with the SET offsets: LEN 0x2D, CMD 0x98; colours (B,G,R,FF) = red, green, (7F,7F,00), blue, (7F,00,7F), (00,7F,7F), (7F,7F,7F); R[37] flags 0xC1 = on, not reversed, bit4 clear, **bits 6 and 7 set (meaning unknown; parsers must ignore them)**; R[38] brightness 3, R[39] mode 3 (Ripple Light), R[40] speed 3, R[41] sleep 2 min, R[42] static colour 6, R[43] dynamic colour 7. The checksum covers raw[48], which was not captured.
