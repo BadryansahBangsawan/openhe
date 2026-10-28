@@ -18,7 +18,7 @@ pub struct KeySettings {
     pub switch: u16,
 }
 
-/// Read-only typed access to a keyboard.
+/// Typed access to a keyboard: reads, plus verified per-key writes.
 pub struct Keyboard<T: Transport> {
     pub model: Model,
     session: Session<T>,
@@ -106,13 +106,46 @@ impl<T: Transport> Keyboard<T> {
             switch,
         })
     }
+
+    /// Writes per-key parameters, then reads each one back to confirm it stuck.
+    ///
+    /// Every request from `key::set` goes through the session, so each SET reply
+    /// is matched by the usual rules. Afterwards every entry is read with
+    /// `key_param` and compared with the value written; a difference is an
+    /// `Error::Io` that starts with "verify failed". Nothing is read back after a
+    /// failed SET, and an empty `entries` does no I/O. Entries should be unique
+    /// per `(key, param)`: with duplicates only the last write can verify.
+    pub fn set_key_params(&mut self, entries: &[(u8, KeyParam, u16)]) -> Result<(), Error> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for req in key::set(entries) {
+            self.session.call(&req)?;
+        }
+        for &(key, param, want) in entries {
+            let got = self.key_param(key, param)?;
+            if got != want {
+                return Err(Error::Io(format!(
+                    "verify failed: key 0x{key:02X} layout {}: wrote {want}, read {got}",
+                    param.layout()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::MockTransport;
+    use openhe_proto::frame::FrameError;
     use openhe_proto::key::{Advanced, TouchMode};
+
+    /// The payload of a written frame (`5C LEN CMD CHK` header stripped).
+    fn payload(frame: &[u8; 64]) -> &[u8] {
+        &frame[4..4 + usize::from(frame[1])]
+    }
 
     fn defkey_reply(row_a: u8, a: &[u8], row_b: u8, b: &[u8]) -> [u8; 64] {
         let mut raw = [0u8; 64];
@@ -242,5 +275,108 @@ mod tests {
         let mut k = kb(m);
         assert_eq!(k.system_mode(), Ok(Some(SystemMode::Windows)));
         assert_eq!(k.polling_rate(), Ok(PollingRate::Hz1000));
+    }
+
+    #[test]
+    fn set_then_verify() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x0A, 4, 1500)); // SET echo
+        m.push_reply(key_reply(0x0A, 4, 1500)); // read-back GET
+        let mut k = kb(m);
+        assert_eq!(
+            k.set_key_params(&[(0x0A, KeyParam::Actuation, 1500)]),
+            Ok(())
+        );
+        let w = k.session_mut().transport().written();
+        assert_eq!(w.len(), 2);
+        assert_eq!(payload(&w[0]), [0x01, 0x0A, 0x04, 0xDC, 0x05]); // SET 1500 = 0x05DC
+        assert_eq!(payload(&w[1]), [0x00, 0x0A, 0x04, 0x00, 0x00]); // GET
+    }
+
+    #[test]
+    fn set_verify_mismatch() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x0A, 4, 1500)); // SET echo
+        m.push_reply(key_reply(0x0A, 4, 2000)); // read-back differs
+        let e = kb(m)
+            .set_key_params(&[(0x0A, KeyParam::Actuation, 1500)])
+            .unwrap_err();
+        assert_eq!(
+            e,
+            Error::Io("verify failed: key 0x0A layout 4: wrote 1500, read 2000".to_string())
+        );
+    }
+
+    #[test]
+    fn set_nothing_does_no_io() {
+        let mut k = kb(MockTransport::new());
+        assert_eq!(k.set_key_params(&[]), Ok(()));
+        assert!(k.session_mut().transport().written().is_empty());
+    }
+
+    #[test]
+    fn failed_set_is_not_read_back() {
+        let mut m = MockTransport::new();
+        let mut fail = [0u8; 64];
+        fail[2] = 0xFF;
+        m.push_reply(fail); // the keyboard rejects the SET
+        m.push_reply(key_reply(0x0A, 4, 1500)); // a read-back would accept this; it must stay unread
+        let mut k = kb(m);
+        let e = k
+            .set_key_params(&[(0x0A, KeyParam::Actuation, 1500)])
+            .unwrap_err();
+        assert_eq!(e, Error::Frame(FrameError::DeviceFail));
+        let w = k.session_mut().transport().written();
+        assert_eq!(w.len(), 1);
+        assert_eq!(payload(&w[0])[0], 0x01);
+    }
+
+    #[test]
+    fn set_batches_then_verifies_each_entry_in_order() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x0A, 4, 1500)); // one SET packet carries both entries
+        m.push_reply(key_reply(0x0A, 4, 1500)); // read-back of entry 1: ok
+        m.push_reply(key_reply(0x0A, 20, 99)); // read-back of entry 2: differs from 100
+        let mut k = kb(m);
+        let e = k
+            .set_key_params(&[
+                (0x0A, KeyParam::Actuation, 1500),
+                (0x0A, KeyParam::RtPress, 100),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            e,
+            Error::Io("verify failed: key 0x0A layout 20: wrote 100, read 99".to_string())
+        );
+        let w = k.session_mut().transport().written();
+        assert_eq!(w.len(), 3);
+        assert_eq!(
+            payload(&w[0]),
+            [0x01, 0x0A, 0x04, 0xDC, 0x05, 0x0A, 0x14, 0x64, 0x00]
+        );
+        assert_eq!(payload(&w[1]), [0x00, 0x0A, 0x04, 0x00, 0x00]);
+        assert_eq!(payload(&w[2]), [0x00, 0x0A, 0x14, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn set_sends_every_packet_past_fourteen_entries() {
+        let entries: Vec<_> = (0..15u8)
+            .map(|i| (0x10 + i, KeyParam::Actuation, 1000 + u16::from(i)))
+            .collect();
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x10, 4, 1000)); // SET echo, packet 1 (14 entries)
+        m.push_reply(key_reply(0x1E, 4, 1014)); // SET echo, packet 2 (1 entry)
+        for &(key, _, v) in &entries {
+            m.push_reply(key_reply(key, 4, v)); // read-backs
+        }
+        let mut k = kb(m);
+        assert_eq!(k.set_key_params(&entries), Ok(()));
+        let w = k.session_mut().transport().written();
+        assert_eq!(w.len(), 2 + 15);
+        assert_eq!(payload(&w[0]).len(), 1 + 14 * 4);
+        assert_eq!(payload(&w[1]), [0x01, 0x1E, 0x04, 0xF6, 0x03]);
+        for (frame, &(key, _, _)) in w[2..].iter().zip(&entries) {
+            assert_eq!(payload(frame), [0x00, key, 0x04, 0x00, 0x00]);
+        }
     }
 }

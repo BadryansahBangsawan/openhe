@@ -52,7 +52,8 @@ pub struct KeyOut {
     pub error: Option<String>,
 }
 
-fn mm(m: openhe_proto::units::Micrometers) -> String {
+/// Millimeters with three decimals, e.g. `1.500`.
+pub fn mm(m: openhe_proto::units::Micrometers) -> String {
     format!("{:.3}", m.to_mm())
 }
 
