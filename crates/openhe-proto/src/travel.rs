@@ -12,6 +12,7 @@
 //! SUB 2 is travel in micrometers; SUB 6 is calibration values (raw u16).
 
 use crate::frame::{Cmd, FrameError, Request, MAGIC, REPORT_LEN};
+use thiserror::Error;
 
 pub const ROWS: usize = 6;
 pub const COLS: usize = 21;
@@ -42,12 +43,24 @@ pub struct TravelHalf {
     pub um: [[u16; COLS]; 3],
 }
 
+/// The two halves of a frame were read with different SUBs (e.g. travel and
+/// calibration values mixed).
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("RM6X21 halves have different SUBs: {top} and {bottom}")]
+pub struct SubMismatch {
+    pub top: u8,
+    pub bottom: u8,
+}
+
 impl TravelFrame {
     /// Rows 0..=2 from `top` (PART 1), rows 3..=5 from `bottom` (PART 2). The
-    /// halves must carry the same SUB.
-    pub fn from_halves(top: &TravelHalf, bottom: &TravelHalf) -> Result<TravelFrame, FrameError> {
+    /// halves must carry the same SUB, else `SubMismatch`.
+    pub fn from_halves(top: &TravelHalf, bottom: &TravelHalf) -> Result<TravelFrame, SubMismatch> {
         if top.sub != bottom.sub {
-            return Err(FrameError::NotAReply);
+            return Err(SubMismatch {
+                top: top.sub,
+                bottom: bottom.sub,
+            });
         }
         let mut um = [[0u16; COLS]; ROWS];
         um[..3].copy_from_slice(&top.um);
@@ -193,7 +206,7 @@ mod tests {
         let cal = parse(&capture(6, v)).unwrap();
         assert_eq!(
             TravelFrame::from_halves(&top, &cal),
-            Err(FrameError::NotAReply)
+            Err(SubMismatch { top: 2, bottom: 6 })
         );
     }
 }
