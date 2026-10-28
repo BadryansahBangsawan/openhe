@@ -1,0 +1,288 @@
+     0 0x0000 "△"                                                   
+     1 0x0001 "Fn"                                                  
+     4 0x0004 "A"                          KeyA                     
+     5 0x0005 "B"                          KeyB                     
+     6 0x0006 "C"                          KeyC                     
+     7 0x0007 "D"                          KeyD                     
+     8 0x0008 "E"                          KeyE                     
+     9 0x0009 "F"                          KeyF                     
+    10 0x000A "G"                          KeyG                     
+    11 0x000B "H"                          KeyH                     
+    12 0x000C "I"                          KeyI                     
+    13 0x000D "J"                          KeyJ                     
+    14 0x000E "K"                          KeyK                     
+    15 0x000F "L"                          KeyL                     
+    16 0x0010 "M"                          KeyM                     
+    17 0x0011 "N"                          KeyN                     
+    18 0x0012 "O"                          KeyO                     
+    19 0x0013 "P"                          KeyP                     
+    20 0x0014 "Q"                          KeyQ                     
+    21 0x0015 "R"                          KeyR                     
+    22 0x0016 "S"                          KeyS                     
+    23 0x0017 "T"                          KeyT                     
+    24 0x0018 "U"                          KeyU                     
+    25 0x0019 "V"                          KeyV                     
+    26 0x001A "W"                          KeyW                     
+    27 0x001B "X"                          KeyX                     
+    28 0x001C "Y"                          KeyY                     
+    29 0x001D "Z"                          KeyZ                     
+    30 0x001E "1"                          Digit1                   
+    31 0x001F "2"                          Digit2                   
+    32 0x0020 "3"                          Digit3                   
+    33 0x0021 "4"                          Digit4                   
+    34 0x0022 "5"                          Digit5                   
+    35 0x0023 "6"                          Digit6                   
+    36 0x0024 "7"                          Digit7                   
+    37 0x0025 "8"                          Digit8                   
+    38 0x0026 "9"                          Digit9                   
+    39 0x0027 "0"                          Digit0                   
+    40 0x0028 "Enter"                      Enter                    
+    41 0x0029 "ESC"                        Escape                   
+    42 0x002A "Back Space"                 Backspace                
+    43 0x002B "Tab"                        Tab                      
+    44 0x002C "Space"                      Space                    
+    45 0x002D "-"                          Minus                    
+    46 0x002E "="                          Equal                    
+    47 0x002F "["                          BracketLeft              
+    48 0x0030 "]"                          BracketRight             
+    49 0x0031 "\\"                         Backslash                
+    50 0x0032 "no"                                                  
+    51 0x0033 ";"                          Semicolon                
+    52 0x0034 "'"                          Quote                    
+    53 0x0035 "`"                          Backquote                
+    54 0x0036 ","                          Comma                    
+    55 0x0037 "."                          Period                   
+    56 0x0038 "/"                          Slash                    
+    57 0x0039 "Cap"                                                 
+    58 0x003A "F1"                         F1                       
+    59 0x003B "F2"                         F2                       
+    60 0x003C "F3"                         F3                       
+    61 0x003D "F4"                         F4                       
+    62 0x003E "F5"                         F5                       
+    63 0x003F "F6"                         F6                       
+    64 0x0040 "F7"                         F7                       
+    65 0x0041 "F8"                         F8                       
+    66 0x0042 "F9"                         F9                       
+    67 0x0043 "F10"                        F10                      
+    68 0x0044 "F11"                        F11                      
+    69 0x0045 "F12"                        F12                      
+    70 0x0046 "PrtSc"                                               
+    71 0x0047 "ScrLc"                      ScrollLock               
+    72 0x0048 "Pause"                      Pause                    
+    73 0x0049 "Ins"                        Insert                   
+    74 0x004A "Home"                       Home                     
+    75 0x004B "PgUp"                       PageUp                   
+    76 0x004C "Del"                        Delete                   
+    77 0x004D "End"                        End                      
+    78 0x004E "PgDn"                       PageDown                 
+    79 0x004F "→"                          ArrowRight               
+    80 0x0050 "←"                          ArrowLeft                
+    81 0x0051 "↓"                          ArrowDown                
+    82 0x0052 "↑"                          ArrowUp                  
+    83 0x0053 "NumLc"                      NumLock                  
+    84 0x0054 "/"                          NumpadDivide             
+    85 0x0055 "*"                          NumpadMultiply           
+    86 0x0056 "-"                          NumpadSubtract           
+    87 0x0057 "+"                          NumpadAdd                
+    88 0x0058 "Enter"                      NumpadEnter              
+    89 0x0059 "1"                          Numpad1                  
+    90 0x005A "2"                          Numpad2                  
+    91 0x005B "3"                          Numpad3                  
+    92 0x005C "4"                          Numpad4                  
+    93 0x005D "5"                          Numpad5                  
+    94 0x005E "6"                          Numpad6                  
+    95 0x005F "7"                          Numpad7                  
+    96 0x0060 "8"                          Numpad8                  
+    97 0x0061 "9"                          Numpad9                  
+    98 0x0062 "0"                          Numpad0                  
+    99 0x0063 "."                          NumpadDecimal            
+   100 0x0064 "no2"                                                 
+   101 0x0065 "App"                                                 
+   102 0x0066 "Power"                                               
+   103 0x0067 "="                                                   
+   104 0x0068 "F13"                        F13                      
+   105 0x0069 "F14"                        F14                      
+   106 0x006A "F15"                        F15                      
+   107 0x006B "F16"                        F16                      
+   108 0x006C "F17"                        F17                      
+   109 0x006D "F18"                        F18                      
+   110 0x006E "F19"                        F19                      
+   111 0x006F "F20"                        F20                      
+   112 0x0070 "F21"                        F21                      
+   113 0x0071 "F22"                        F22                      
+   114 0x0072 "F23"                        F23                      
+   115 0x0073 "F24"                        F24                      
+   116 0x0074 "Execute"                                             
+   117 0x0075 "Help"                                                
+   118 0x0076 "Menu"                       ContextMenu              
+   119 0x0077 "Select"                                              
+   120 0x0078 "Stop"                                                
+   121 0x0079 "Again"                                               
+   122 0x007A "Undo"                                                
+   123 0x007B "Cut"                                                 
+   124 0x007C "Copy"                                                
+   125 0x007D "Paste"                                               
+   126 0x007E "Find"                                                
+   127 0x007F "Mute"                                                
+   128 0x0080 "Vol+"                                                
+   129 0x0081 "Vol-"                                                
+   130 0x0082 "Caps Lock"                  CapsLock                 
+   131 0x0083 "Num Lock"                                            
+   132 0x0084 "Scroll Lock"                                         
+   133 0x0085 "."                                                   
+   134 0x0086 "="                                                   
+   135 0x0087 "In1"                                                 
+   136 0x0088 "In2"                                                 
+   137 0x0089 "In3"                                                 
+   138 0x008A "In4"                                                 
+   139 0x008B "In5"                                                 
+   140 0x008C "In6"                                                 
+   141 0x008D "In7"                                                 
+   142 0x008E "In8"                                                 
+   143 0x008F "In9"                                                 
+   144 0x0090 "Lang1"                                               
+   145 0x0091 "Lang2"                                               
+   146 0x0092 "Lang3"                                               
+   147 0x0093 "Lang4"                                               
+   148 0x0094 "Lang5"                                               
+   149 0x0095 "Lang6"                                               
+   150 0x0096 "Lang7"                                               
+   151 0x0097 "Lang8"                                               
+   152 0x0098 "Lang9"                                               
+   153 0x0099 "Alt Erase"                                           
+   154 0x009A "Sys Request"                                         
+   155 0x009B "Cancel"                                              
+   156 0x009C "Clear"                                               
+   157 0x009D "Prior"                                               
+   158 0x009E "Return"                                              
+   159 0x009F "Sepaeator"                                           
+   160 0x00A0 "Out"                                                 
+   161 0x00A1 "Oper"                                                
+   162 0x00A2 "Clear Again"                                         
+   163 0x00A3 "Crsel"                                               
+   164 0x00A4 "Exsel"                                               
+   165 0x00A5 "Desktop Power Down"                                  
+   166 0x00A6 "Desktop Sleep"                                       
+   167 0x00A7 "-"                                                   
+   168 0x00A8 "-"                                                   
+   169 0x00A9 "-"                                                   
+   170 0x00AA "-"                                                   
+   171 0x00AB "-"                                                   
+   172 0x00AC "-"                                                   
+   173 0x00AD "Play Pause"                                          
+   174 0x00AE "Next Track"                                          
+   175 0x00AF "Ptrack"                                              
+   176 0x00B0 "Stop"                                                
+   177 0x00B1 "Mute"                                                
+   178 0x00B2 "Vol+"                                                
+   179 0x00B3 "Vol-"                                                
+   180 0x00B4 "Media"                                               
+   181 0x00B5 "Email"                                               
+   182 0x00B6 "Calc"                                                
+   183 0x00B7 "PC"                                                  
+   184 0x00B8 "WWW"                                                 
+   185 0x00B9 "Search"                                              
+   186 0x00BA "AC Back"                                             
+   187 0x00BB "Forward"                                             
+   188 0x00BC "Refresh"                                             
+   189 0x00BD "Bookmarks"                                           
+   190 0x00BE "MACT"                                                
+   191 0x00BF "MACC"                                                
+   192 0x00C0 "SCDE"                                                
+   193 0x00C1 "SCIN"                                                
+   194 0x00C2 "-"                                                   
+   195 0x00C3 "-"                                                   
+   196 0x00C4 "-"                                                   
+   197 0x00C5 "-"                                                   
+   198 0x00C6 "-"                                                   
+   199 0x00C7 i18n:key1                                             
+   200 0x00C8 i18n:key2                                             
+   201 0x00C9 "-"                                                   
+   202 0x00CA "-"                                                   
+   203 0x00CB "-"                                                   
+   204 0x00CC "-"                                                   
+   205 0x00CD "-"                                                   
+   206 0x00CE "-"                                                   
+   207 0x00CF "-"                                                   
+   208 0x00D0 "-"                                                   
+   209 0x00D1 "-"                                                   
+   210 0x00D2 "-"                                                   
+   211 0x00D3 "-"                                                   
+   212 0x00D4 "-"                                                   
+   213 0x00D5 "-"                                                   
+   214 0x00D6 "-"                                                   
+   215 0x00D7 "-"                                                   
+   216 0x00D8 "-"                                                   
+   217 0x00D9 "-"                                                   
+   218 0x00DA "-"                                                   
+   219 0x00DB "-"                                                   
+   220 0x00DC "-"                                                   
+   221 0x00DD "-"                                                   
+   222 0x00DE "-"                                                   
+   223 0x00DF "-"                                                   
+   224 0x00E0 "Ctrl"                       ControlLeft              
+   225 0x00E1 "Shift"                      ShiftLeft                
+   226 0x00E2 "Alt"                        AltLeft                  
+   227 0x00E3 "Win"                        MetaLeft                 
+   228 0x00E4 "Ctrl"                       ControlRight             
+   229 0x00E5 "Shift"                      ShiftRight               
+   230 0x00E6 "Alt"                        AltRight                 
+   231 0x00E7 "Win"                        MetaRight                
+   232 0x00E8 "-"                                                   
+  4207 0x106F i18n:key3                                     type=0  icon=lightAdd
+  4208 0x1070 i18n:key4                                     type=0  icon=lightSub
+  4277 0x10B5 i18n:key5                                     type=0  icon=previous
+  4278 0x10B6 i18n:key6                                     type=0  icon=nextTrack
+  4279 0x10B7 i18n:key7                                     type=0  icon=stop
+  4301 0x10CD i18n:key8                                     type=0  icon=play
+  4322 0x10E2 i18n:key9                                     type=0  icon=mute
+  4329 0x10E9 i18n:key10                                    type=0  icon=volAdd
+  4330 0x10EA i18n:key11                                    type=0  icon=volSub
+  4483 0x1183 "Media"                                       type=0  icon=media
+  4490 0x118A "Email"                                       type=0  icon=email
+  4498 0x1192 "Calc"                                        type=0  icon=calc
+  4500 0x1194 "File"                                        type=0  icon=file
+  4641 0x1221 "search"                                      type=0  icon=search
+  4643 0x1223 "www"                                         type=0  icon=www
+  4767 0x129F "desktop"                                             
+ 25141 0x6235 "~"                                                   
+ 29441 0x7301 i18n:key12                   MouseLeft        type=4  icon=mouseLeft
+ 29442 0x7302 i18n:key13                   MouseRight       type=4  icon=mouseRight
+ 29443 0x7303 i18n:key14                   MouseMiddle      type=4  icon=mouseCenter
+ 29444 0x7304 i18n:key15                   MouseMoveLeft    type=4  icon=mouseMoveLeft
+ 29445 0x7305 i18n:key16                   MouseMoveRight   type=4  icon=mouseMoveRight
+ 29446 0x7306 i18n:key17                   MouseMoveTop     type=4  icon=mouseMoveTop
+ 29447 0x7307 i18n:key18                                    type=4  icon=mouseMoveBottom
+ 29448 0x7308 i18n:key19                   MouseWheelAdd    type=4  icon=wheelAdd
+ 29449 0x7309 i18n:key20                   MouseWheelSub    type=4  icon=wheelSub
+ 61441 0xF001 "Fn1"                                         type=0  
+ 61442 0xF002 "Fn2"                                         type=0  
+ 61443 0xF003 "Fn3"                                         type=0  
+ 61696 0xF100 i18n:key21                                    type=1  icon=reset
+ 61697 0xF101 "Win"                                         type=1  icon=win
+ 61698 0xF102 "Mac"                                         type=1  icon=mac
+ 61699 0xF103 i18n:key22                                            
+ 61704 0xF108 i18n:key23                                    type=1  
+ 61705 0xF109 i18n:key24                                    type=1  
+ 61706 0xF10A i18n:key25                                    type=1  
+ 61708 0xF10C i18n:key26                                    type=1  
+ 61707 0xF10B i18n:key27                                    type=1  icon=wasdExchange
+ 62217 0xF309 "LockWin"                                     type=1  icon=winLock
+ 62231 0xF317 i18n:key28                                    type=2  icon=mainLightStatus
+ 62225 0xF311 i18n:key29                                    type=2  icon=lightDirection
+ 62224 0xF310 i18n:key30                                    type=2  icon=lightModeAdd
+ 62255 0xF32F i18n:key31                                    type=2  icon=lightModeSub
+ 62226 0xF312 i18n:key32                                    type=2  icon=lightAdd
+ 62227 0xF313 i18n:key33                                    type=2  icon=lightSub
+ 62228 0xF314 i18n:key34                                    type=2  icon=lightSpeedAdd
+ 62229 0xF315 i18n:key35                                    type=2  icon=lightSpeedSub
+ 62246 0xF326 i18n:key36                                    type=3  icon=logoLightStatus
+ 62247 0xF327 i18n:key37                                    type=3  icon=lightDirection
+ 62245 0xF325 i18n:key38                                    type=3  icon=lightModeAdd
+ 62252 0xF32C i18n:key39                                    type=3  icon=lightModeSub
+ 62250 0xF32A i18n:key40                                    type=3  icon=lightAdd
+ 62251 0xF32B i18n:key41                                    type=3  icon=lightSub
+ 62248 0xF328 i18n:key42                                    type=3  icon=lightSpeedAdd
+ 62249 0xF329 i18n:key43                                    type=3  icon=lightSpeedSub
+ 62262 0xF336 "Static-Light-Change"                                 
+ 62265 0xF339 "snap tap on"                                         
