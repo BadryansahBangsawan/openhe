@@ -116,6 +116,7 @@ rest     0x00 padding to 64 bytes
 
   So **response CMD = request CMD | 0x80**. [C for these five; I for the rest]
 - **Header stripping** [C]. The queue removes the first 4 bytes before parsing: `deviceUsagePage===65456 ? data : data.slice(4)`. Our usage page is 0xFFA0, so the header is stripped. Bytes 0 to 3 are `[?, LEN, CMD|0x80, CHK]`, and byte 0's value is [?].
+  Observed on hardware: byte 0 is 0x5C, the same magic as requests (see 7.x, finding 1).
 - **Response payload layout** after stripping 4 bytes. [I, but consistent with every parser in the SDK]
 
   ```
@@ -791,7 +792,9 @@ Suggested safe probes are GETs only: SYNC, DEFKEY, KEY GET, PRGB GET, 0x00 queri
 
 ### 7.x Hardware findings (WIN 68 HE MAX, FW App V1.1.3)
 
-Read-only capture over USB on macOS with `openhe --trace info` and `openhe --trace dump --json` (exit 0, 68 keys, 0 read errors). Raw files are in `docs/protocol/captures/` (serial redacted; the redaction rewrote the serial bytes in the SYNC reply, so that one reply's checksum no longer matches).
+Findings 1 to 10 come from a read-only capture over USB on macOS with `openhe --trace info` and `openhe --trace dump --json` (exit 0, 68 keys, 0 read errors). Raw files are in `docs/protocol/captures/` (serial redacted; the redacted SYNC reply still matches its checksum, which covers only the last payload byte, 0xFF).
+
+Findings 11 to 13 come from the first write on the same keyboard: `openhe --trace set-actuation G 1.50`, then a restore to 2.000 mm, with independent `dump --json` runs before, between and after. Raw files: `docs/protocol/captures/win68-set-actuation.txt`.
 
 1. Reply byte 0 is 0x5C, the same magic as requests.
 2. Replies use CMD|0x80: SYNC 0x81, order 0x80, KEY 0xA3, DEFKEY 0xAB.
@@ -803,3 +806,6 @@ Read-only capture over USB on macOS with `openhe --trace info` and `openhe --tra
 8. DEFKEY matrix is 6x21 with row 0 empty; the real keys are in rows 1..5 (see 4.1). Right-hand column is Insert 49 / Delete 4C / PgUp 4B / PgDn 4E; arrows 52/50/51/4F; Fn 01; RAlt E6; RCtrl E4.
 9. Factory defaults for all 68 keys: touch Global, advanced None, actuation 2.000 mm, RT press 0.020 mm, RT release 0.020 mm, top deadzone 0.200 mm, bottom deadzone 0.200 mm, switch 0 (Wing Chun).
 10. Two HID entries on usage page 0xFFA0 share one path (usages 1 and 2); selecting usage 1 opens the right one.
+11. KEY SET `5C 05 23 BE 01 0A 04 DC 05` (key 0x0A, LAYOUT 4, 1500 µm = 0x05DC) gets exactly one reply, `5C 39 A3 6D 00 0A 04 DC 05 FF FF FF 00 ...`. It is an echo of the written key, layout and value with status 00, and it is indistinguishable from a KEY GET reply (finding 7): the read-back GET that followed returned the same 64 bytes. The bytes alone do not show whether it echoes the request or reports the stored value, so a write is confirmed only by a separate read-back. The restore SET `5C 05 23 C0 01 0A 04 D0 07` (2000 µm) behaved the same.
+12. Writing LAYOUT 4 on a Global-mode key changes only DB0. An independent `dump` after the write differed from the pre-write dump in exactly one field, (row 3, col 5) code 0x0A actuation 2.000 → 1.500 mm. The key's Mode (LAYOUT 8) stayed 0x0000 (touch Global, advanced None), so the Mode byte is not touched as a side effect; its RT, deadzone and switch values, the other 67 keys and profile 0 did not change either. After the restore the full dump was identical to the pre-write dump.
+13. [?] Whether DB0 has a physical effect while the key is in Global mode is still unverified. The read-back proves the stored value (1500 µm), not where the switch actually triggers; the key stayed in touch mode Global throughout and no physical trigger test was done.
