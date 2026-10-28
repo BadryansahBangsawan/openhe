@@ -647,6 +647,8 @@ pub struct Page {
     read_ok: bool,
     /// `Worker::lighting_generation` last looked at.
     seen_lighting: Option<u64>,
+    /// The keyboard profile the page shows (lighting is per profile).
+    seen_profile: Option<u8>,
     /// The keyboard changed its lighting while the form had unsent edits:
     /// "Terapkan" waits until the user reloads or keeps the edits.
     external_change: bool,
@@ -688,6 +690,7 @@ impl Default for Page {
             device: None,
             read_ok: false,
             seen_lighting: None,
+            seen_profile: None,
             external_change: false,
             loading: None,
             loaded_generation: None,
@@ -752,6 +755,7 @@ impl Page {
 
     pub fn ui(&mut self, ctx: &AppCtx, ui: &mut Ui) {
         self.poll(ctx);
+        self.follow_profile(ctx.snapshot.map(|s| s.profile));
         self.follow_lighting(ctx.worker.lighting_generation());
         self.start_reads(ctx);
         page_with_right_panel(
@@ -804,6 +808,35 @@ impl Page {
         }
         // Key colours keep unsent paint on a re-read (see `finish_key_load`).
         self.key_loaded_generation = None;
+    }
+
+    /// Lighting and key colours belong to a profile: on a switch (top bar,
+    /// keyboard, per-app rule) unsent edits and paint of the old profile
+    /// are dropped, with the last apply's result, and everything is read
+    /// again.
+    fn follow_profile(&mut self, profile: Option<u8>) {
+        let Some(p) = profile else {
+            return;
+        };
+        let moved = self.seen_profile.is_some_and(|s| s != p);
+        self.seen_profile = Some(p);
+        if !moved {
+            return;
+        }
+        if let Some(d) = &self.device {
+            self.form = Form::from_lighting(d);
+        }
+        self.external_change = false;
+        self.loaded_generation = None;
+        self.failure = None;
+        self.applied = false;
+        self.last_sent = None;
+        self.key_device.clear();
+        self.key_edit.clear();
+        self.key_loaded_generation = None;
+        self.key_failure = None;
+        self.key_applied = false;
+        self.key_last_sent = None;
     }
 
     /// "Muat ulang" after a change on the keyboard: drop the edits and read
