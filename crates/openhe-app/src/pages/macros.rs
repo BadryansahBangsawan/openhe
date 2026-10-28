@@ -902,6 +902,8 @@ pub struct Page {
     bind_pending: Option<Pending<BindOutcome>>,
     /// The key the running bind goes to (its result belongs to it).
     bind_key: Option<u8>,
+    /// The last bind sent, for "Coba lagi"; forgotten when the selected
+    /// macro changes or is edited.
     last_bind: Option<(u8, SavedMacro)>,
     failure: Option<Failure>,
     bound: bool,
@@ -965,6 +967,7 @@ impl Page {
 
     pub fn ui(&mut self, ctx: &AppCtx, ui: &mut Ui) {
         self.sync_selection(ctx);
+        self.forget_stale_bind(ctx);
         self.record_frame(ctx, ui);
         self.poll(ctx);
         self.start_reads(ctx);
@@ -993,6 +996,19 @@ impl Page {
             Some(i) if i < n => Some(i),
             _ => Some(0),
         };
+    }
+
+    /// The last bind's result and "Coba lagi" are about one macro: once
+    /// another macro is selected, or this one is edited, they go.
+    fn forget_stale_bind(&mut self, ctx: &AppCtx) {
+        let Some((_, sent)) = &self.last_bind else {
+            return;
+        };
+        if self.current(ctx).as_ref() != Some(sent) {
+            self.last_bind = None;
+            self.bound = false;
+            self.failure = None;
+        }
     }
 
     fn current(&self, ctx: &AppCtx) -> Option<SavedMacro> {
@@ -1159,7 +1175,9 @@ impl Page {
                     text,
                     technical: fx.technical,
                 });
-                self.bound = fx.bound;
+                // "Terpasang" only while the bound macro is still the one
+                // shown.
+                self.bound = fx.bound && self.last_bind.is_some();
             }
         }
     }

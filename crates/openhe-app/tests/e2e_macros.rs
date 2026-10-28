@@ -5,6 +5,7 @@
 mod support;
 use eframe::egui::{Key, Modifiers};
 use openhe_app::storage::AppData;
+use support::sim::Reject;
 use support::*;
 
 const G: u8 = 0x0A;
@@ -201,4 +202,33 @@ fn a_key_picked_during_a_bind_does_not_take_its_result() {
         openhe_proto::key::Advanced::None,
         "G's result was written onto H"
     );
+}
+
+#[test]
+fn switching_or_editing_the_macro_forgets_the_last_bind() {
+    let mut w = recorded();
+    pick_target(&mut w, G);
+    w.idle();
+    w.apply("Pasang ke tombol");
+    assert!(w.has("Macro terpasang di keyboard"), "{:?}", w.labels());
+    // Another macro: the "bound" note was about the first one.
+    w.click("+ Baru");
+    w.frames(2);
+    assert!(!w.has("Macro terpasang di keyboard"), "{:?}", w.labels());
+
+    // A failed bind, then the macro is edited: no retry of the old copy.
+    w.click("Macro baru");
+    w.sim().rejects.push(Reject {
+        cmd: 0x20,
+        sets_only: true,
+        at: vec![],
+        times: 1,
+    });
+    w.click("Pasang ke tombol");
+    w.until("bind failed", 20, |w| w.has("Coba lagi"));
+    let n = w.h_count("×");
+    w.click_nth("×", n - 1);
+    w.click_nth("×", n - 2);
+    w.frames(2);
+    assert!(!w.has("Coba lagi"), "a retry would send the old macro");
 }
