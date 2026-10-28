@@ -287,6 +287,33 @@ fn screenshot_07_pengaturan() {
     shots(&mut w, "07-pengaturan");
 }
 
+/// Template: a saved template and a backup listed, the Gaming FPS
+/// preview open (summary and highlighted keys).
+#[test]
+#[ignore]
+fn screenshot_09_template() {
+    let mut w = world(profile_names());
+    w.page("Template");
+    w.click("Simpan setting sekarang…");
+    w.type_in_last_field("Kerja harian");
+    w.click("Simpan");
+    w.until("saved", 20, |w| w.has_text("Template disimpan."));
+    for name in ["Caps jadi Ctrl", "Gaming FPS"] {
+        w.click(name);
+        w.until("the preview", 20, |w| {
+            w.app().templates().preview_keys().is_some()
+        });
+        if name == "Caps jadi Ctrl" {
+            w.click("Terapkan");
+            w.until("applied", 30, |w| {
+                w.has_text("Tersimpan di keyboard") && !w.worker.is_busy()
+            });
+            w.idle();
+        }
+    }
+    shots(&mut w, "09-template");
+}
+
 fn skin_slug(s: &openhe_app::skin::KeyboardSkin) -> &'static str {
     use openhe_app::skin::KeyboardSkin::*;
     match s {

@@ -369,25 +369,6 @@ impl OpenHeApp {
         self.performance.preview_live(depths, select);
     }
 
-    /// Screenshot hook: see `pages::templates::Page::preview_state`.
-    #[cfg(feature = "preview")]
-    pub fn preview_templates(&mut self) {
-        let status = self.worker.status();
-        let snapshot = match &status {
-            ConnectionStatus::Connected(s) => Some(s),
-            _ => None,
-        };
-        let ctx = AppCtx {
-            worker: &self.worker,
-            snapshot,
-            status: &status,
-            busy: false,
-            theme: &self.theme,
-            data: &self.data,
-        };
-        self.templates.preview_state(&ctx);
-    }
-
     /// The Template page (tests read its preview and open files with it).
     pub fn templates(&self) -> &pages::templates::Page {
         &self.templates

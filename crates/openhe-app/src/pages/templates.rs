@@ -691,31 +691,6 @@ impl Page {
         });
     }
 
-    /// Screenshot hook: a Gaming FPS preview on the snapshot's keys (as
-    /// read now), without reading or writing the keyboard.
-    #[cfg(feature = "preview")]
-    pub fn preview_state(&mut self, ctx: &AppCtx) {
-        let Some(snap) = ctx.snapshot else { return };
-        let current = crate::templates::snapshot_keys(snap);
-        let tpl = Builtin::GamingFps.template(snap.model, &keys_of(ctx));
-        if let Ok(plan) = plan_template(&tpl, snap, &current) {
-            let summary = summary(&plan, snap.matrix.keys().count());
-            self.flow = Flow::Preview {
-                tpl: Box::new(tpl),
-                source: Source::Builtin(Builtin::GamingFps),
-                current,
-                plan: Box::new(plan),
-                summary,
-                on: Stamp::now(ctx).unwrap_or(Stamp {
-                    profile: snap.profile,
-                    connects: 0,
-                    generation: 0,
-                }),
-                refreshed: false,
-            };
-        }
-    }
-
     // ----------------------------------------------------------- UI
 
     pub fn ui(&mut self, ctx: &AppCtx, ui: &mut Ui) {
