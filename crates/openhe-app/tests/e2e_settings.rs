@@ -249,3 +249,20 @@ fn launch_at_login_shows_the_os_state_not_the_saved_flag() {
     );
     assert!(!w.role_checked(eframe::egui::accesskit::Role::CheckBox, 1));
 }
+
+#[test]
+fn a_restart_result_goes_once_the_profile_changes_elsewhere() {
+    let mut w = settings();
+    let c = w.worker.connects();
+    let r = w.rect("Profil 3");
+    w.click_at(r.left_top() + eframe::egui::vec2(20.0, 12.0));
+    reconnected(&mut w, c);
+    let done = "Keyboard tersambung lagi dengan Profil 3.";
+    assert!(w.has_text(done), "{:?}", w.labels());
+    // Back to profile 1 from the top bar: the card's note is stale.
+    let c = w.worker.connects();
+    w.click("1");
+    reconnected(&mut w, c);
+    assert_eq!(w.sim().profile, 0);
+    assert!(!w.has_text(done), "{:?}", w.labels());
+}

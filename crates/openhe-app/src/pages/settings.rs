@@ -776,6 +776,9 @@ pub struct Page {
     restart: RestartRun,
     /// What the last restart flow was for (its status shows there).
     last_restart: Option<RestartKind>,
+    /// Profile and polling rate when the last restart's result was first
+    /// shown (see [`Page::forget_stale_restart`]).
+    restart_seen: Option<(u8, PollingRate)>,
     /// Polling segment shown while a change is under way.
     polling_target: Option<PollingRate>,
     transfer: Transfer,
@@ -802,6 +805,7 @@ impl Default for Page {
             switch_error: None,
             restart: RestartRun::default(),
             last_restart: None,
+            restart_seen: None,
             polling_target: None,
             transfer: Transfer::Idle,
             auto_enabled: false,
@@ -838,6 +842,7 @@ impl Page {
             }
         }
         self.restart.pump(ctx.worker, ctx.snapshot, now);
+        self.forget_stale_restart(ctx.snapshot);
         if !self.restart.is_busy() {
             self.polling_target = None;
         } else {
@@ -957,6 +962,29 @@ impl Page {
                 };
                 self.auto_enabled = true;
             }
+        }
+    }
+
+    /// A finished restart's "✔ … Profil 3" / "… 1000 Hz" describes the
+    /// keyboard as it was then: once the profile or polling rate changes
+    /// elsewhere (top bar, keyboard, per-app rule) the note goes.
+    fn forget_stale_restart(&mut self, snapshot: Option<&DeviceSnapshot>) {
+        if !matches!(self.restart.state, Restart::Done(_) | Restart::Failed(..)) {
+            self.restart_seen = None;
+            return;
+        }
+        let Some(s) = snapshot else {
+            return;
+        };
+        let now = (s.profile, s.polling);
+        match self.restart_seen {
+            None => self.restart_seen = Some(now),
+            Some(then) if then != now => {
+                self.restart.state = Restart::Idle;
+                self.last_restart = None;
+                self.restart_seen = None;
+            }
+            Some(_) => {}
         }
     }
 
