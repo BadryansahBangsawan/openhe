@@ -174,3 +174,31 @@ fn the_fn_key_cannot_be_a_target() {
     assert!(w.has_text("Tombol Fn tidak bisa diberi macro."));
     assert!(!w.enabled("Pasang ke tombol"));
 }
+
+#[test]
+fn a_key_picked_during_a_bind_does_not_take_its_result() {
+    let mut w = recorded();
+    pick_target(&mut w, G);
+    w.idle();
+    // A slow keyboard: the bind is still running when the picker is used.
+    w.sim().set_delay = std::time::Duration::from_millis(150);
+    w.click("Ganti");
+    w.click("Pasang ke tombol");
+    assert!(w.has_text("Memasang"), "{:?}", w.labels());
+    assert!(!w.enabled("Ganti"), "the target can change mid-bind");
+    // The picker window was already open: a pick is ignored.
+    w.click_key(0x0B, false);
+    w.until("bind done", 20, |w| w.has("Macro terpasang di keyboard"));
+    w.sim().set_delay = std::time::Duration::ZERO;
+    w.idle();
+    let snap = w.snapshot();
+    assert_eq!(
+        snap.keys[&G].mode.advanced,
+        openhe_proto::key::Advanced::Macro
+    );
+    assert_eq!(
+        snap.keys[&0x0B].mode.advanced,
+        openhe_proto::key::Advanced::None,
+        "G's result was written onto H"
+    );
+}

@@ -900,6 +900,8 @@ pub struct Page {
     binding_for: Option<(u8, u64)>,
     binding_pending: Option<Pending<Option<MacroBinding>>>,
     bind_pending: Option<Pending<BindOutcome>>,
+    /// The key the running bind goes to (its result belongs to it).
+    bind_key: Option<u8>,
     last_bind: Option<(u8, SavedMacro)>,
     failure: Option<Failure>,
     bound: bool,
@@ -931,6 +933,7 @@ impl Default for Page {
             binding_for: None,
             binding_pending: None,
             bind_pending: None,
+            bind_key: None,
             last_bind: None,
             failure: None,
             bound: false,
@@ -1135,15 +1138,16 @@ impl Page {
             if let Some(r) = p.poll() {
                 self.bind_pending = None;
                 let fx = bind_effects(r);
-                let target = self.target;
-                if let (Some(key), Some(s)) = (target, fx.patch) {
+                // The result is the bound key's, whatever is selected now.
+                let key = self.bind_key.take();
+                if let (Some(key), Some(s)) = (key, fx.patch) {
                     ctx.worker.patch_snapshot(move |snap| {
                         snap.keys.insert(key, s);
                     });
                 }
                 match fx.binding {
-                    Some(b) => self.binding = Some(Ok(b)),
-                    None => self.binding_for = None, // read again
+                    Some(b) if key == self.target => self.binding = Some(Ok(b)),
+                    _ => self.binding_for = None, // read again
                 }
                 // Binding over a function also changed its SOCD partner (and
                 // the job re-reads only the target): read everything again.
@@ -1198,6 +1202,7 @@ impl Page {
         self.bind_replaces = ctx
             .snapshot
             .is_some_and(|s| replaced_function(s, key).is_some());
+        self.bind_key = Some(key);
         self.last_bind = Some((key, m.clone()));
         let actions = m.to_actions();
         let (mode, repeat, interval) = (m.play_mode(), m.repeat_count(), m.interval_ms);
@@ -1748,7 +1753,10 @@ impl Page {
                         let b = egui::Button::new(RichText::new(label).color(color::ACCENT))
                             .frame(false);
                         if ui
-                            .add_enabled(ctx.connected() && !self.recording(), b)
+                            .add_enabled(
+                                ctx.connected() && !self.recording() && self.bind_pending.is_none(),
+                                b,
+                            )
                             .clicked()
                         {
                             self.picking = true;
@@ -1894,6 +1902,9 @@ impl Page {
             });
         if !open {
             self.picking = false;
+        }
+        if self.bind_pending.is_some() {
+            picked = None; // the target stays put until the bind is done
         }
         if let Some(k) = picked {
             self.picking = false;
