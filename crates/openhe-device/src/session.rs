@@ -50,6 +50,48 @@ impl<T: Transport> Session<T> {
         self.exchange(req, n.max(1))
     }
 
+    /// Like `call`, but with a single attempt: no reply within 1000 ms is
+    /// `Error::Timeout`, and the request is never written twice. For commands
+    /// that must not be repeated (factory reset) or that make the keyboard
+    /// re-enumerate (polling rate). Draining and reply matching are the same.
+    pub fn call_once(&mut self, req: &Request) -> Result<Response, Error> {
+        let mut out = self.exchange_with(req, 1, 1)?;
+        let first = out.remove(0);
+        Ok(Response::decode(&first)?)
+    }
+
+    /// Non-blocking read of whatever input is waiting: protocol replies, in
+    /// arrival order. Nothing is written. Reports that are not replies (noise,
+    /// stale failure reports) are skipped. A read error ends the drain; use
+    /// `try_poll` to see it.
+    pub fn poll(&mut self) -> Vec<Response> {
+        let mut out = Vec::new();
+        let _ = self.drain_into(&mut out);
+        out
+    }
+
+    /// `poll`, but a transport error (e.g. `Disconnected`) is returned. Replies
+    /// read before the error are kept as events.
+    pub fn try_poll(&mut self) -> Result<Vec<Response>, Error> {
+        let mut out = Vec::new();
+        match self.drain_into(&mut out) {
+            Ok(()) => Ok(out),
+            Err(e) => {
+                self.events.append(&mut out);
+                Err(e)
+            }
+        }
+    }
+
+    fn drain_into(&mut self, out: &mut Vec<Response>) -> Result<(), Error> {
+        while let Some(raw) = self.t.read(0)? {
+            if let Ok(resp) = Response::decode(&raw) {
+                out.push(resp);
+            }
+        }
+        Ok(())
+    }
+
     /// Reads with a zero timeout until nothing is waiting. Replies become
     /// events; non-replies and stale failure reports are dropped, since they
     /// cannot belong to a request that has not been sent yet.
@@ -63,8 +105,17 @@ impl<T: Transport> Session<T> {
     }
 
     fn exchange(&mut self, req: &Request, n: usize) -> Result<Vec<[u8; 64]>, Error> {
+        self.exchange_with(req, n, MAX_ATTEMPTS)
+    }
+
+    fn exchange_with(
+        &mut self,
+        req: &Request,
+        n: usize,
+        attempts: usize,
+    ) -> Result<Vec<[u8; 64]>, Error> {
         let frame = req.encode()?;
-        for _ in 0..MAX_ATTEMPTS {
+        for _ in 0..attempts {
             self.drain()?;
             self.t.write(&frame)?;
             let deadline = Instant::now() + Duration::from_millis(ATTEMPT_MS);
@@ -313,5 +364,79 @@ mod tests {
         assert_eq!(v[0], a);
         assert_eq!(v[1][0], 7);
         assert_eq!(v[2][0], 8);
+    }
+
+    #[test]
+    fn call_once_matches_the_reply_with_one_write() {
+        let mut m = MockTransport::new();
+        m.push_pending(reply(0x80, 0x70)); // stale: drained into events first
+        m.push_reply(key_reply(0x0B, 4, 1500)); // not the answer: queued
+        m.push_reply(key_reply(0x0A, 4, 2000));
+        let mut s = Session::new(m);
+        let r = s.call_once(&key::get(0x0A, KeyParam::Actuation)).unwrap();
+        assert_eq!(key::parse_value(&r), Some((0x0A, 4, 2000)));
+        assert_eq!(s.transport().written().len(), 1);
+        assert_eq!(s.take_events().len(), 2);
+    }
+
+    #[test]
+    fn call_once_never_retries() {
+        let mut s = Session::new(MockTransport::new());
+        let e = s.call_once(&key::get(4, KeyParam::Actuation)).unwrap_err();
+        assert_eq!(e, Error::Timeout);
+        assert_eq!(s.transport().written().len(), 1);
+    }
+
+    #[test]
+    fn call_once_propagates_disconnect_and_device_fail() {
+        let mut m = MockTransport::new();
+        m.fail_with(Error::Disconnected);
+        let mut s = Session::new(m);
+        let e = s.call_once(&key::get(4, KeyParam::Actuation)).unwrap_err();
+        assert_eq!(e, Error::Disconnected);
+
+        let mut m = MockTransport::new();
+        m.push_reply(reply(0xFF, 0));
+        let mut s = Session::new(m);
+        let e = s.call_once(&key::get(4, KeyParam::Actuation)).unwrap_err();
+        assert_eq!(e, Error::Frame(FrameError::DeviceFail));
+        assert_eq!(s.transport().written().len(), 1);
+    }
+
+    #[test]
+    fn poll_returns_pending_reports_without_writing() {
+        let mut m = MockTransport::new();
+        m.push_pending(reply(0x80, 0x70));
+        m.push_pending(key_reply(0x0A, 4, 1111));
+        m.push_reply(reply(0x80, 0x21)); // only arrives while a read waits
+        let mut s = Session::new(m);
+        let got = s.poll();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].raw[5], 0x70);
+        assert_eq!(key::parse_value(&got[1]), Some((0x0A, 4, 1111)));
+        assert!(s.transport().written().is_empty());
+        assert!(s.poll().is_empty());
+        assert!(s.take_events().is_empty());
+    }
+
+    #[test]
+    fn poll_skips_non_reply_reports() {
+        let mut m = MockTransport::new();
+        let [a, b] = noise();
+        m.push_pending(a);
+        m.push_pending(reply(0x80, 0x70));
+        m.push_pending(b);
+        let mut s = Session::new(m);
+        let got = s.poll();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].raw[5], 0x70);
+    }
+
+    #[test]
+    fn try_poll_reports_a_disconnect() {
+        let mut s = Session::new(MockTransport::new());
+        s.transport_mut().fail_with(Error::Disconnected);
+        assert_eq!(s.try_poll().unwrap_err(), Error::Disconnected);
+        assert!(s.poll().is_empty());
     }
 }
