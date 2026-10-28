@@ -6,6 +6,12 @@
 //! (`Keyboard::set_layer_codes`). The Fn key on the Base layer is locked: the
 //! UI never queues a change for it, and "Kembalikan ke bawaan" skips it.
 //!
+//! Layer semantics (from the factory dump of a WIN 68 HE MAX): on the Fn
+//! layers code 0x0001 is transparent ("Ikut Base"); the Fn key itself is
+//! 0xF001 on Base (Fn1 while held), and RCtrl is 0xF002 on Fn1 (Fn2 while
+//! held). 0x0001 is never put on Base. "Kembalikan ke bawaan" writes the
+//! factory content of the open layer ([`factory_code`]).
+//!
 //! The codes of a layer are read for all keys by one job when its tab is
 //! opened and cached per layer. After a failed write the written keys are read
 //! again; when that fails too the cache is dropped and a reload requested.
@@ -33,12 +39,16 @@ use std::collections::{BTreeMap, BTreeSet};
 mod strings {
     pub const LAYER: &str = "Layer";
     pub const HINT_BASE: &str = "Layer utama · tombol Fn terkunci";
-    pub const HINT_FN: &str = "Aktif saat Fn ditahan · tombol kosong = ikut Base";
+    pub const HINT_FN: &str = "Aktif saat tombol Fn-nya ditahan · Ikut Base = sama seperti di Base";
     pub const RESET: &str = "Kembalikan ke bawaan";
-    pub const RESET_BASE_ONLY: &str =
-        "Hanya untuk layer Base; layer Fn tidak punya isi bawaan yang dikenal OpenHE.";
-    pub const RESET_CONFIRM: &str =
-        "Semua tombol di layer Base kembali ke fungsi bawaannya (tombol Fn dilewati). Perubahan Base yang belum diterapkan dibuang.";
+    pub const RESET_UNKNOWN_FN: &str =
+        "Isi bawaan layer Fn keyboard ini belum dikenal OpenHE; hanya layer Base yang bisa dikembalikan.";
+    pub const RESET_CONFIRM_BASE: &str =
+        "Semua tombol di layer Base kembali ke fungsi bawaannya (tombol Fn, Win dan Alt dilewati; Win dan Alt bertukar menurut mode Win/Mac). Perubahan Base yang belum diterapkan dibuang.";
+    pub const RESET_CONFIRM_FN: &str =
+        "Semua tombol di layer ini kembali ke isi bawaan pabrik. Perubahan layer ini yang belum diterapkan dibuang.";
+    pub const FOLLOW_BASE: &str = "Ikut Base";
+    pub const FOLLOW_BASE_PICK: &str = "Ikut Base (transparan)";
     pub const RESET_YES: &str = "Ya, kembalikan";
     pub const CANCEL: &str = "Batal";
 
@@ -60,7 +70,7 @@ mod strings {
     pub const KEYS_SELECTED: &str = "tombol dipilih";
     pub const UNREAD: &str = "…";
     pub const UNKNOWN_CODE: &str = "Kode";
-    pub const RESET_NOTHING: &str = "Semua tombol di layer Base sudah memakai fungsi bawaan.";
+    pub const RESET_NOTHING: &str = "Semua tombol di layer ini sudah memakai fungsi bawaan.";
     pub const NEW: &str = "Baru";
     pub const UNCHANGED: &str = "—";
     pub const LOCKED: &str =
@@ -117,6 +127,16 @@ pub fn is_locked(layer: Layer, key: u8) -> bool {
     layer == Layer::Base && key == FN_KEY
 }
 
+/// On the Fn layers, code 0x0001 means "transparent": the key does what it
+/// does on Base. It is not a Fn key (the factory Fn key is 0xF001, Fn1
+/// while held) and is never written on Base.
+pub const TRANSPARENT: u16 = 0x0001;
+
+/// Whether `code` may be put on `layer`: not [`TRANSPARENT`] on Base.
+pub fn allowed_on(layer: Layer, code: u16) -> bool {
+    !(layer == Layer::Base && code == TRANSPARENT)
+}
+
 // ------------------------------------------------------------- key names
 
 pub const CATEGORIES: [Category; 10] = [
@@ -153,6 +173,10 @@ pub fn category_name(c: Category) -> &'static str {
 /// known meaning and stay "Kode 0x…".
 fn indonesian(code: u16) -> Option<(&'static str, &'static str)> {
     Some(match code {
+        TRANSPARENT => (t::FOLLOW_BASE, t::FOLLOW_BASE),
+        0xF001 => ("Fn1 (tahan)", "Fn1"),
+        0xF002 => ("Fn2 (tahan)", "Fn2"),
+        0xF003 => ("Fn3 (tahan)", "Fn3"),
         0x106F => ("Kecerahan layar +", "Cerah +"),
         0x1070 => ("Kecerahan layar −", "Cerah −"),
         0x10B5 => ("Lagu berikutnya", "Lagu >"),
@@ -250,6 +274,16 @@ pub fn short_code_name(code: u16) -> String {
     }
 }
 
+/// The name on a picker button: [`code_name`], except that the transparent
+/// code says what it does.
+pub fn picker_label(code: u16) -> String {
+    if code == TRANSPARENT {
+        t::FOLLOW_BASE_PICK.to_string()
+    } else {
+        code_name(code)
+    }
+}
+
 /// Codes offered by the picker: reserved placeholders ("-"), the unnamed
 /// non-US keys and the two codes with no known meaning are hidden.
 pub fn pickable(k: &KeyCode) -> bool {
@@ -271,7 +305,7 @@ pub fn picker_matches(k: &KeyCode, query: &str) -> bool {
     if q.is_empty() {
         return true;
     }
-    code_name(k.code).to_lowercase().contains(&q)
+    picker_label(k.code).to_lowercase().contains(&q)
         || k.label.to_lowercase().contains(&q)
         || hex_query(&q).is_some_and(|h| format!("{:04x}", k.code).contains(h))
 }
@@ -302,7 +336,8 @@ impl Changes {
     }
 
     /// Queues `code` for `keys` on `layer`; returns how many keys were
-    /// accepted. The Fn key on Base is never queued. A code equal to the
+    /// accepted. The Fn key on Base is never queued, and nothing is queued
+    /// when `code` is not [`allowed_on`] the layer. A code equal to the
     /// key's current one (`current`) removes a queued change instead.
     pub fn queue(
         &mut self,
@@ -312,6 +347,9 @@ impl Changes {
         current: impl Fn(Layer, u8) -> Option<u16>,
     ) -> usize {
         let mut accepted = 0;
+        if !allowed_on(layer, code) {
+            return 0;
+        }
         for &key in keys {
             if is_locked(layer, key) {
                 continue;
@@ -352,21 +390,104 @@ impl Changes {
     }
 }
 
-/// "Kembalikan ke bawaan": every key's own default code on Base, except Fn.
-pub fn reset_entries(keys: impl IntoIterator<Item = u8>) -> Vec<(u8, Layer, u16)> {
-    reset_entries_skipping(keys, |_| None)
+/// WIN 68 HE MAX factory Fn1 layer: the keys that do not follow Base
+/// (from an untouched factory dump, PROTOCOL 7.x finding 16).
+const WIN68_FN1: [(u8, u16); 29] = [
+    (0x04, 0xF101), // A: Windows mode
+    (0x13, 0x0047), // P: ScrLk
+    (0x16, 0xF102), // S: Mac mode
+    (0x1E, 0x003A), // 1..0: F1..F10
+    (0x1F, 0x003B),
+    (0x20, 0x003C),
+    (0x21, 0x003D),
+    (0x22, 0x003E),
+    (0x23, 0x003F),
+    (0x24, 0x0040),
+    (0x25, 0x0041),
+    (0x26, 0x0042),
+    (0x27, 0x0043),
+    (0x29, 0x0035), // Esc: `
+    (0x2C, 0xF100), // Space: restore defaults
+    (0x2D, 0x0045), // -: F12
+    (0x2F, 0x004A), // [: Home
+    (0x30, 0x004D), // ]: End
+    (0x33, 0x0046), // ;: PrtSc
+    (0x34, 0x0048), // ': Pause
+    (0x39, 0xF344), // Caps: not in the keycode table
+    (0x49, 0xF317), // Ins: light on / off
+    (0x4B, 0xF310), // PgUp: effect +
+    (0x4C, 0xF311), // Del: effect direction
+    (0x4F, 0xF314), // →: speed +
+    (0x50, 0xF315), // ←: speed −
+    (0x51, 0xF313), // ↓: brightness −
+    (0x52, 0xF312), // ↑: brightness +
+    (0xE4, 0xF002), // RCtrl: Fn2 (hold)
+];
+
+/// WIN 68 HE MAX factory Fn2 layer (same dump). 0x6152 and 0x681B are not
+/// in the keycode table.
+const WIN68_FN2: [(u8, u16); 10] = [
+    (0x1E, 0x1070),
+    (0x1F, 0x106F),
+    (0x20, 0x6152),
+    (0x21, 0x681B),
+    (0x24, 0x10B6),
+    (0x25, 0x10CD),
+    (0x26, 0x10B5),
+    (0x27, 0x10E2),
+    (0x2D, 0x10EA),
+    (0x2E, 0x10E9),
+];
+
+/// The Fn key's factory Base code: Fn1 while held.
+pub const FN1_HOLD: u16 = 0xF001;
+
+/// What `key` sends on `layer` on a factory-fresh keyboard, when known.
+///
+/// - Base: the key's own code; the Fn key is Fn1 (hold, 0xF001). LAlt and
+///   LWin (0xE2, 0xE3) swap with the Win/Mac mode, so they have none.
+/// - Fn1 / Fn2 / Fn3 of the WIN 68 HE MAX: the factory tables (Fn3 follows
+///   Base everywhere). The WIN 60 HE MAX Fn layers were never dumped.
+pub fn factory_code(model: Model, layer: Layer, key: u8) -> Option<u16> {
+    let from = |table: &[(u8, u16)]| {
+        table
+            .iter()
+            .find(|&&(k, _)| k == key)
+            .map_or(TRANSPARENT, |&(_, c)| c)
+    };
+    match (layer, model) {
+        (Layer::Base, _) => match key {
+            FN_KEY => Some(FN1_HOLD),
+            0xE2 | 0xE3 => None,
+            k => Some(u16::from(k)),
+        },
+        (_, Model::Win60HeMax) => None,
+        (Layer::Fn1, Model::Win68HeMax) => Some(from(&WIN68_FN1)),
+        (Layer::Fn2, Model::Win68HeMax) => Some(from(&WIN68_FN2)),
+        (Layer::Fn3, Model::Win68HeMax) => Some(TRANSPARENT),
+    }
 }
 
-/// Like [`reset_entries`], but leaves out keys whose current Base code
-/// (`current`, when known) already is their default.
-pub fn reset_entries_skipping(
+/// Whether "Kembalikan ke bawaan" knows the factory content of `layer`.
+pub fn reset_supported(model: Model, layer: Layer) -> bool {
+    layer == Layer::Base || model == Model::Win68HeMax
+}
+
+/// "Kembalikan ke bawaan" for `layer`: every key's [`factory_code`], except
+/// the locked Fn key on Base and keys without a known factory code (Win and
+/// Alt on Base). Keys whose current code (`current`, when known) already
+/// is the factory one are left out.
+pub fn reset_entries(
+    model: Model,
+    layer: Layer,
     keys: impl IntoIterator<Item = u8>,
     current: impl Fn(u8) -> Option<u16>,
 ) -> Vec<(u8, Layer, u16)> {
     keys.into_iter()
-        .filter(|&k| !is_locked(Layer::Base, k))
-        .filter(|&k| current(k) != Some(u16::from(k)))
-        .map(|k| (k, Layer::Base, u16::from(k)))
+        .filter(|&k| !is_locked(layer, k))
+        .filter_map(|k| factory_code(model, layer, k).map(|c| (k, c)))
+        .filter(|&(k, c)| current(k) != Some(c))
+        .map(|(k, c)| (k, layer, c))
         .collect()
 }
 
@@ -541,13 +662,17 @@ fn chip(ui: &mut Ui, text: &str, active: bool, enabled: bool) -> egui::Response 
 }
 
 /// The codes the picker shows for `state`: matching the search across all
-/// categories, else the active category.
-pub fn picker_codes(state: &PickerState) -> Vec<&'static KeyCode> {
+/// categories, else the active category. The transparent code is offered
+/// only for a Fn layer (`layer`); `None` is a picker outside the layers
+/// (the Tombol Lanjutan bindings).
+pub fn picker_codes(state: &PickerState, layer: Option<Layer>) -> Vec<&'static KeyCode> {
     let searching = !state.search.trim().is_empty();
     let cat = state.category.unwrap_or(Category::Basic);
+    let transparent_ok = layer.is_some_and(|l| l != Layer::Base);
     keycodes::all()
         .iter()
         .filter(|k| pickable(k))
+        .filter(|k| k.code != TRANSPARENT || transparent_ok)
         .filter(|k| {
             if searching {
                 picker_matches(k, &state.search)
@@ -563,6 +688,7 @@ pub fn picker_codes(state: &PickerState) -> Vec<&'static KeyCode> {
 pub fn picker_ui(
     ui: &mut Ui,
     state: &mut PickerState,
+    layer: Option<Layer>,
     current: Option<u16>,
     enabled: bool,
     max_height: f32,
@@ -588,7 +714,7 @@ pub fn picker_ui(
                 .vertical_align(Align::Center),
         );
         ui.add_space(8.0);
-        let codes = picker_codes(state);
+        let codes = picker_codes(state, layer);
         egui::ScrollArea::vertical()
             .max_height(max_height)
             .auto_shrink([false, true])
@@ -600,7 +726,7 @@ pub fn picker_ui(
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                     for k in codes {
-                        let name = code_name(k.code);
+                        let name = picker_label(k.code);
                         let resp = chip(ui, &name, current == Some(k.code), enabled)
                             .on_hover_text(format!("{name} · 0x{:04X}", k.code));
                         if resp.clicked() {
@@ -638,7 +764,7 @@ pub fn code_field(
         .show(|ui| {
             ui.set_width(316.0);
             let mut st: PickerState = ui.data(|d| d.get_temp(state_id)).unwrap_or_default();
-            let picked = picker_ui(ui, &mut st, Some(*value), true, 260.0);
+            let picked = picker_ui(ui, &mut st, None, Some(*value), true, 260.0);
             ui.data_mut(|d| d.insert_temp(state_id, st));
             if let Some(code) = picked {
                 *value = code;
@@ -730,9 +856,15 @@ fn code_of(codes: &BTreeMap<u8, BTreeMap<u8, u16>>, layer: Layer, key: u8) -> Op
 }
 
 /// Per-key decoration for `layer`: the key's code under its legend, a stroke
-/// when it differs from the default, the accent for a pending change and a
-/// lock for the Fn key on Base.
+/// when it differs from the factory code, the accent for a pending change
+/// and a lock for the Fn key on Base.
+///
+/// On Base a key at its factory code shows nothing; Win and Alt count as
+/// unchanged with either code (they swap with the OS mode). On a Fn layer
+/// a transparent key shows nothing, and any other code is shown, stroked
+/// only when it is not the factory code.
 pub fn decoration(
+    model: Model,
     layer: Layer,
     key: u8,
     current: Option<u16>,
@@ -757,17 +889,21 @@ pub fn decoration(
     let Some(code) = current else {
         return KeyDecoration::default();
     };
-    let default = match layer {
-        Layer::Base => u16::from(key),
-        _ => 0,
+    let factory = factory_code(model, layer, key);
+    let unchanged = match layer {
+        Layer::Base if matches!(key, 0xE2 | 0xE3) => matches!(code, 0xE2 | 0xE3),
+        // A Fn layer without a known factory table: transparent is the
+        // neutral state.
+        _ if factory.is_none() => code == TRANSPARENT,
+        _ => factory == Some(code),
     };
-    if code == default {
+    if unchanged && (layer == Layer::Base || code == TRANSPARENT) {
         return KeyDecoration::default();
     }
     KeyDecoration {
         label2: Some(short_code_name(code)),
         fill: None,
-        stroke: Some(color::INFO.gamma_multiply(0.7)),
+        stroke: (!unchanged).then(|| color::INFO.gamma_multiply(0.7)),
         badge: None,
     }
 }
@@ -936,12 +1072,20 @@ impl Page {
         let Some(snap) = ctx.snapshot else {
             return;
         };
-        let known = self.loaded.contains(&(Layer::Base as u8));
+        let layer = self.layer;
+        if !reset_supported(snap.model, layer) {
+            self.confirm_reset = false;
+            return;
+        }
+        let known = self.loaded.contains(&(layer as u8));
         let codes = &self.codes;
-        let entries = reset_entries_skipping(snap.matrix.keys().map(|(_, _, c)| c), |k| {
-            known.then(|| code_of(codes, Layer::Base, k)).flatten()
-        });
-        self.changes.clear_layer(Layer::Base);
+        let entries = reset_entries(
+            snap.model,
+            layer,
+            snap.matrix.keys().map(|(_, _, c)| c),
+            |k| known.then(|| code_of(codes, layer, k)).flatten(),
+        );
+        self.changes.clear_layer(layer);
         self.confirm_reset = false;
         if entries.is_empty() {
             self.error = None;
@@ -1031,15 +1175,16 @@ impl Page {
                 .color(color::MUTED),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let enabled = self.editable(ctx) && self.layer == Layer::Base;
+                let supported = reset_supported(model, self.layer);
+                let enabled = self.editable(ctx) && supported;
                 let btn = egui::Button::new(RichText::new(t::RESET).color(color::TEXT))
                     .fill(color::BG)
                     .stroke(line(1.0, color::BORDER_STRONG))
                     .corner_radius(CornerRadius::same(size::CONTROL_RADIUS + 2))
                     .min_size(egui::vec2(0.0, 38.0));
                 let mut resp = ui.add_enabled(enabled, btn);
-                if self.layer != Layer::Base {
-                    resp = resp.on_disabled_hover_text(t::RESET_BASE_ONLY);
+                if !supported {
+                    resp = resp.on_disabled_hover_text(t::RESET_UNKNOWN_FN);
                 }
                 if resp.clicked() {
                     self.confirm_reset = true;
@@ -1055,7 +1200,15 @@ impl Page {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.add(
-                        egui::Label::new(RichText::new(t::RESET_CONFIRM).color(color::TEXT)).wrap(),
+                        egui::Label::new(
+                            RichText::new(if self.layer == Layer::Base {
+                                t::RESET_CONFIRM_BASE
+                            } else {
+                                t::RESET_CONFIRM_FN
+                            })
+                            .color(color::TEXT),
+                        )
+                        .wrap(),
                     );
                     ui.horizontal(|ui| {
                         if ui
@@ -1086,6 +1239,7 @@ impl Page {
                             return KeyDecoration::default();
                         }
                         decoration(
+                            model,
                             layer,
                             key,
                             code_of(codes, layer, key),
@@ -1124,7 +1278,14 @@ impl Page {
         let mut picked = None;
         Card::new().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            picked = picker_ui(ui, &mut self.picker, current, editable && selectable, h);
+            picked = picker_ui(
+                ui,
+                &mut self.picker,
+                Some(self.layer),
+                current,
+                editable && selectable,
+                h,
+            );
             ui.add_space(8.0);
             card::hint(
                 ui,
@@ -1207,11 +1368,11 @@ impl Page {
                 format!("{} {}", t::FN_PLUS, keycodes::legend(first))
             };
             card::hint(ui, format!("{who} {} {now}", t::NOW_SENDS));
-            if layer == Layer::Base && !is_locked(layer, first) {
-                card::hint(
-                    ui,
-                    format!("{}: {}", t::DEFAULT_IS, code_name(u16::from(first))),
-                );
+            let model = ctx.snapshot.map_or(Model::Win68HeMax, |s| s.model);
+            if let Some(factory) = factory_code(model, layer, first) {
+                if !is_locked(layer, first) {
+                    card::hint(ui, format!("{}: {}", t::DEFAULT_IS, code_name(factory)));
+                }
             }
         } else {
             card::hint(ui, format!("{} {}", keys.len(), t::KEYS_SELECTED));
@@ -1463,15 +1624,26 @@ mod tests {
     }
 
     #[test]
-    fn fn_on_fn_layers_and_fn_as_a_code_are_allowed() {
+    fn fn_on_fn_layers_and_fn1_hold_on_base_are_allowed() {
         let mut c = Changes::default();
         for l in [Layer::Fn1, Layer::Fn2, Layer::Fn3] {
             assert_eq!(c.queue(l, &[0x01], 0x04, none), 1);
         }
-        // Caps -> Fn on Base is fine: code 0x01 is not the locked key.
-        assert_eq!(c.queue(Layer::Base, &[0x39], 0x01, none), 1);
-        assert_eq!(c.get(Layer::Base, 0x39), Some(0x01));
+        // Caps -> Fn on Base uses the Fn1 hold code, like the factory Fn key.
+        assert_eq!(c.queue(Layer::Base, &[0x39], 0xF001, none), 1);
+        assert_eq!(c.get(Layer::Base, 0x39), Some(0xF001));
         assert_eq!(c.len(), 4);
+    }
+
+    #[test]
+    fn transparent_is_never_queued_on_base() {
+        // 0x0001 means "follow Base" on the Fn layers; on Base it is not a
+        // Fn key (that is 0xF001), so it is refused there.
+        let mut c = Changes::default();
+        assert_eq!(c.queue(Layer::Base, &[0x39, 0x04], TRANSPARENT, none), 0);
+        assert!(c.is_empty());
+        assert_eq!(c.queue(Layer::Fn1, &[0x39], TRANSPARENT, none), 1);
+        assert_eq!(c.get(Layer::Fn1, 0x39), Some(0x0001));
     }
 
     #[test]
@@ -1506,9 +1678,25 @@ mod tests {
         assert!(c.is_empty());
     }
 
+    fn win68_keys() -> Vec<u8> {
+        reference_matrix(Model::Win68HeMax)
+            .keys()
+            .map(|(_, _, c)| c)
+            .collect()
+    }
+
+    fn unknown_current(_: u8) -> Option<u16> {
+        None
+    }
+
     #[test]
-    fn reset_skips_the_fn_key_and_writes_default_codes() {
-        let e = reset_entries([0x29, 0x01, 0x04, 0x39]);
+    fn base_reset_skips_fn_and_the_os_swapped_win_alt_keys() {
+        let e = reset_entries(
+            Model::Win68HeMax,
+            Layer::Base,
+            [0x29, 0x01, 0x04, 0xE2, 0xE3, 0x39],
+            unknown_current,
+        );
         assert_eq!(
             e,
             vec![
@@ -1518,14 +1706,123 @@ mod tests {
             ]
         );
         let all = reset_entries(
-            reference_matrix(Model::Win68HeMax)
-                .keys()
-                .map(|(_, _, c)| c),
+            Model::Win68HeMax,
+            Layer::Base,
+            win68_keys(),
+            unknown_current,
         );
-        assert_eq!(all.len(), 67, "68 keys minus Fn");
-        assert!(all
-            .iter()
-            .all(|&(k, l, c)| k != 0x01 && l == Layer::Base && c == u16::from(k)));
+        assert_eq!(all.len(), 65, "68 keys minus Fn, LAlt and LWin");
+        assert!(all.iter().all(|&(k, l, c)| {
+            !matches!(k, 0x01 | 0xE2 | 0xE3) && l == Layer::Base && c == u16::from(k)
+        }));
+    }
+
+    /// The non-transparent codes of the untouched WIN 68 HE MAX factory dump
+    /// (PROTOCOL 7.x finding 16); every other key is 0x0001.
+    const FACTORY_FN1: [(u8, u16); 30] = [
+        (0x04, 0xF101), // A: Win mode
+        (0x13, 0x0047), // P: ScrLk
+        (0x16, 0xF102), // S: Mac mode
+        (0x1E, 0x003A), // 1: F1
+        (0x1F, 0x003B),
+        (0x20, 0x003C),
+        (0x21, 0x003D),
+        (0x22, 0x003E),
+        (0x23, 0x003F),
+        (0x24, 0x0040),
+        (0x25, 0x0041),
+        (0x26, 0x0042),
+        (0x27, 0x0043), // 0: F10
+        (0x29, 0x0035), // Esc: `
+        (0x2C, 0xF100), // Space: factory reset
+        (0x2D, 0x0045), // -: F12
+        (0x2F, 0x004A), // [: Home
+        (0x30, 0x004D), // ]: End
+        (0x33, 0x0046), // ;: PrtSc
+        (0x34, 0x0048), // ': Pause
+        (0x39, 0xF344), // Caps: unknown
+        (0x49, 0xF317), // Ins: light on/off
+        (0x4B, 0xF310), // PgUp: effect +
+        (0x4C, 0xF311), // Del: effect direction
+        (0x4F, 0xF314), // →: speed +
+        (0x50, 0xF315), // ←: speed −
+        (0x51, 0xF313), // ↓: brightness −
+        (0x52, 0xF312), // ↑: brightness +
+        (0xE4, 0xF002), // RCtrl: Fn2 (hold)
+        (0x01, 0x0001), // Fn: transparent (listed to pin the count)
+    ];
+
+    const FACTORY_FN2: [(u8, u16); 10] = [
+        (0x1E, 0x1070),
+        (0x1F, 0x106F),
+        (0x20, 0x6152),
+        (0x21, 0x681B),
+        (0x24, 0x10B6),
+        (0x25, 0x10CD),
+        (0x26, 0x10B5),
+        (0x27, 0x10E2),
+        (0x2D, 0x10EA),
+        (0x2E, 0x10E9),
+    ];
+
+    fn table(t: &[(u8, u16)], key: u8) -> u16 {
+        t.iter()
+            .find(|&&(k, _)| k == key)
+            .map_or(TRANSPARENT, |&(_, c)| c)
+    }
+
+    #[test]
+    fn factory_codes_match_the_win68_dump() {
+        let m = Model::Win68HeMax;
+        for k in win68_keys() {
+            assert_eq!(
+                factory_code(m, Layer::Fn1, k),
+                Some(table(&FACTORY_FN1, k)),
+                "Fn1 0x{k:02X}"
+            );
+            assert_eq!(
+                factory_code(m, Layer::Fn2, k),
+                Some(table(&FACTORY_FN2, k)),
+                "Fn2 0x{k:02X}"
+            );
+            assert_eq!(factory_code(m, Layer::Fn3, k), Some(TRANSPARENT));
+        }
+        assert_eq!(factory_code(m, Layer::Base, 0x01), Some(0xF001));
+        assert_eq!(factory_code(m, Layer::Base, 0x04), Some(0x0004));
+        assert_eq!(factory_code(m, Layer::Base, 0xE4), Some(0x00E4));
+        // Win and Alt swap with the OS mode: no fixed default.
+        assert_eq!(factory_code(m, Layer::Base, 0xE2), None);
+        assert_eq!(factory_code(m, Layer::Base, 0xE3), None);
+        // The WIN 60 Fn layers were never dumped.
+        for l in [Layer::Fn1, Layer::Fn2, Layer::Fn3] {
+            assert_eq!(factory_code(Model::Win60HeMax, l, 0x04), None);
+            assert!(!reset_supported(Model::Win60HeMax, l));
+            assert!(reset_supported(m, l));
+        }
+        assert!(reset_supported(Model::Win60HeMax, Layer::Base));
+    }
+
+    #[test]
+    fn fn_layer_reset_writes_the_factory_table() {
+        let m = Model::Win68HeMax;
+        let fn1 = reset_entries(m, Layer::Fn1, win68_keys(), unknown_current);
+        assert_eq!(fn1.len(), 68, "every key, the Fn key included");
+        for &(k, l, c) in &fn1 {
+            assert_eq!(l, Layer::Fn1);
+            assert_eq!(c, table(&FACTORY_FN1, k), "0x{k:02X}");
+        }
+        // Keys already at their factory code are left out.
+        let cur = |k: u8| match k {
+            0x04 => Some(0xF101),
+            0x05 => Some(0x0001),
+            0x06 => Some(0x0004),
+            _ => None,
+        };
+        let e = reset_entries(m, Layer::Fn1, [0x04, 0x05, 0x06], cur);
+        assert_eq!(e, vec![(0x06, Layer::Fn1, 0x0001)]);
+        let fn3 = reset_entries(m, Layer::Fn3, win68_keys(), unknown_current);
+        assert!(fn3.iter().all(|&(_, l, c)| l == Layer::Fn3 && c == 0x0001));
+        assert!(reset_entries(Model::Win60HeMax, Layer::Fn2, [0x04], unknown_current).is_empty());
     }
 
     // ---- names and picker
@@ -1546,6 +1843,54 @@ mod tests {
         assert_eq!(code_name(0x0000), "Kosong");
         assert_eq!(code_name(0x10E9), "Volume +");
         assert_eq!(code_name(0x0004), "A");
+        // Unknown codes from the factory Fn tables.
+        assert_eq!(code_name(0x6152), "Kode 0x6152");
+        assert_eq!(code_name(0xF344), "Kode 0xF344");
+    }
+
+    #[test]
+    fn transparent_and_fn_hold_codes_have_their_real_names() {
+        // 0x0001 is "follow Base" on the Fn layers, never a Fn key.
+        assert_eq!(code_name(TRANSPARENT), "Ikut Base");
+        assert_eq!(short_code_name(TRANSPARENT), "Ikut Base");
+        assert_eq!(picker_label(TRANSPARENT), "Ikut Base (transparan)");
+        assert_eq!(code_name(0xF001), "Fn1 (tahan)");
+        assert_eq!(code_name(0xF002), "Fn2 (tahan)");
+        assert_eq!(code_name(0xF003), "Fn3 (tahan)");
+        assert_eq!(short_code_name(0xF002), "Fn2");
+        assert_eq!(picker_label(0xF001), "Fn1 (tahan)");
+        assert_eq!(picker_label(0x0004), "A");
+    }
+
+    #[test]
+    fn the_picker_offers_follow_base_only_on_fn_layers() {
+        let special = PickerState {
+            category: Some(Category::Special),
+            ..PickerState::default()
+        };
+        let has = |layer: Option<Layer>, code: u16| {
+            picker_codes(&special, layer).iter().any(|k| k.code == code)
+        };
+        for l in [Layer::Fn1, Layer::Fn2, Layer::Fn3] {
+            assert!(has(Some(l), TRANSPARENT), "{l:?}");
+        }
+        assert!(!has(Some(Layer::Base), TRANSPARENT));
+        assert!(!has(None, TRANSPARENT), "not a key function elsewhere");
+        for l in [None, Some(Layer::Base), Some(Layer::Fn1)] {
+            assert!(has(l, 0xF001) && has(l, 0xF002) && has(l, 0xF003));
+        }
+        let search = PickerState {
+            search: "transparan".into(),
+            ..PickerState::default()
+        };
+        assert_eq!(
+            picker_codes(&search, Some(Layer::Fn2))
+                .iter()
+                .map(|k| k.code)
+                .collect::<Vec<_>>(),
+            vec![TRANSPARENT]
+        );
+        assert!(picker_codes(&search, Some(Layer::Base)).is_empty());
     }
 
     #[test]
@@ -1571,7 +1916,7 @@ mod tests {
         let mut seen = 0;
         for c in CATEGORIES {
             st.category = Some(c);
-            seen += picker_codes(&st).len();
+            seen += picker_codes(&st, Some(Layer::Fn1)).len();
         }
         assert_eq!(seen, keycodes::all().iter().filter(|k| pickable(k)).count());
     }
@@ -1582,30 +1927,31 @@ mod tests {
             search: "volume".into(),
             ..PickerState::default()
         };
-        let found: Vec<u16> = picker_codes(&st).iter().map(|k| k.code).collect();
+        let found: Vec<u16> = picker_codes(&st, None).iter().map(|k| k.code).collect();
         assert!(found.contains(&0x10E9) && found.contains(&0x10EA));
         st.search = "0x0029".into();
-        assert!(picker_codes(&st).iter().any(|k| k.code == 0x29));
+        assert!(picker_codes(&st, None).iter().any(|k| k.code == 0x29));
         st.search = "zzzzzz".into();
-        assert!(picker_codes(&st).is_empty());
+        assert!(picker_codes(&st, None).is_empty());
         st.search.clear();
         st.category = Some(Category::Mouse);
-        assert_eq!(picker_codes(&st).len(), 9);
+        assert_eq!(picker_codes(&st, None).len(), 9);
     }
 
     // ---- decoration
 
     #[test]
     fn decoration_marks_lock_pending_and_changed_keys() {
-        let lock = decoration(Layer::Base, 0x01, Some(0x01), None);
+        let decoration = |l, k, c, p| decoration(Model::Win68HeMax, l, k, c, p);
+        let lock = decoration(Layer::Base, 0x01, Some(0xF001), None);
         assert_eq!(lock.label2.as_deref(), Some(t::LOCKED_BADGE));
         assert!(lock.stroke.is_some() && lock.fill.is_none());
         // The Fn key on Fn1 is an ordinary key.
         assert_eq!(
-            decoration(Layer::Fn1, 0x01, Some(0), None),
+            decoration(Layer::Fn1, 0x01, Some(TRANSPARENT), None),
             KeyDecoration::default()
         );
-        let pend = decoration(Layer::Fn1, 0x1A, Some(0), Some(0x52));
+        let pend = decoration(Layer::Fn1, 0x1A, Some(TRANSPARENT), Some(0x52));
         assert_eq!(pend.label2.as_deref(), Some("↑"));
         assert_eq!(pend.stroke, Some(color::ACCENT));
         // Base: default code shows nothing; a changed one shows its name.
@@ -1619,15 +1965,34 @@ mod tests {
                 .as_deref(),
             Some("B")
         );
-        // Fn layer: empty follows Base and shows nothing.
+        // Win and Alt read as either code on Base (they swap with the OS).
+        for (k, c) in [(0xE2, 0xE3), (0xE3, 0xE2), (0xE2, 0xE2)] {
+            assert_eq!(
+                decoration(Layer::Base, k, Some(c), None),
+                KeyDecoration::default()
+            );
+        }
+        // Fn layer: transparent follows Base and shows nothing.
         assert_eq!(
-            decoration(Layer::Fn2, 0x04, Some(0), None),
+            decoration(Layer::Fn2, 0x04, Some(TRANSPARENT), None),
             KeyDecoration::default()
         );
         assert_eq!(
             decoration(Layer::Fn2, 0x04, None, None),
             KeyDecoration::default()
         );
+        // A factory Fn function is labelled, but not marked as changed.
+        let factory = decoration(Layer::Fn1, 0x52, Some(0xF312), None);
+        assert_eq!(factory.label2.as_deref(), Some("Terang +"));
+        assert_eq!(factory.stroke, None);
+        // A user change on a Fn layer is labelled and marked.
+        let changed = decoration(Layer::Fn1, 0x04, Some(0x0005), None);
+        assert_eq!(changed.label2.as_deref(), Some("B"));
+        assert!(changed.stroke.is_some());
+        // 0x0000 is not transparent: shown as empty and marked.
+        let empty = decoration(Layer::Fn3, 0x04, Some(0), None);
+        assert_eq!(empty.label2.as_deref(), Some("Kosong"));
+        assert!(empty.stroke.is_some());
     }
 
     // ---- jobs
@@ -1793,7 +2158,12 @@ mod tests {
             0x05 => Some(0x06),
             _ => None,
         };
-        let e = reset_entries_skipping([0x04, 0x05, 0x06, 0x01], cur);
+        let e = reset_entries(
+            Model::Win68HeMax,
+            Layer::Base,
+            [0x04, 0x05, 0x06, 0x01],
+            cur,
+        );
         assert_eq!(
             e,
             vec![(0x05, Layer::Base, 0x05), (0x06, Layer::Base, 0x06)],
@@ -1903,6 +2273,30 @@ mod tests {
             data: &data,
         };
         f(&ctx)
+    }
+
+    #[test]
+    fn reset_on_fn1_sends_the_factory_table_for_that_layer() {
+        use crate::app::test_support::*;
+        use crate::worker::ConnectionStatus;
+        let worker = offline_worker();
+        worker.inject_status(ConnectionStatus::Connected(snapshot68()));
+        let mut page = Page {
+            layer: Layer::Fn1,
+            ..Page::default()
+        };
+        page.changes.queue(Layer::Fn1, &[0x04], 0x0005, none);
+        page.changes.queue(Layer::Fn2, &[0x04], 0x0005, none);
+        with_ctx(&worker, |ctx| page.apply_reset(ctx));
+        let (sent, kind) = page.last_sent.clone().expect("a reset was sent");
+        assert_eq!(kind, Sent::Reset);
+        assert_eq!(sent.len(), 68);
+        assert!(sent.contains(&(0x04, Layer::Fn1, 0xF101)));
+        assert!(sent.contains(&(0xE4, Layer::Fn1, 0xF002)));
+        assert!(sent.contains(&(0x05, Layer::Fn1, TRANSPARENT)));
+        assert!(sent.iter().all(|&(_, l, _)| l == Layer::Fn1));
+        // Only the reset layer's pending changes are dropped.
+        assert_eq!(page.changes.entries(), vec![(0x04, Layer::Fn2, 0x0005)]);
     }
 
     #[test]
