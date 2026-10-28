@@ -1260,6 +1260,12 @@ impl Page {
             }
         };
 
+        let hint = if self.layer == Layer::Base {
+            t::HINT_BASE
+        } else {
+            t::HINT_FN
+        };
+        let mut hint_inline = true;
         ui.horizontal(|ui| {
             ui.set_min_height(40.0);
             ui.label(RichText::new(t::LAYER).color(color::MUTED));
@@ -1270,15 +1276,18 @@ impl Page {
             if self.layer != old {
                 self.confirm_reset = false;
             }
-            ui.label(
-                RichText::new(if self.layer == Layer::Base {
-                    t::HINT_BASE
-                } else {
-                    t::HINT_FN
-                })
-                .font(font::small())
-                .color(color::MUTED),
-            );
+            // The hint goes beside the layers only when it fits left of the
+            // reset button, else on its own row below (never under it).
+            let measure = |text: &str, f: egui::FontId| {
+                ui.fonts(|fo| fo.layout_no_wrap(text.to_string(), f, color::TEXT).size().x)
+            };
+            let button_w = measure(t::RESET, font::body()) + 2.0 * ui.spacing().button_padding.x;
+            hint_inline =
+                measure(hint, font::small()) + button_w + 3.0 * ui.spacing().item_spacing.x
+                    <= ui.available_width();
+            if hint_inline {
+                ui.label(RichText::new(hint).font(font::small()).color(color::MUTED));
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let supported = reset_supported(model, self.layer);
                 let enabled = self.editable(ctx) && supported;
@@ -1296,6 +1305,13 @@ impl Page {
                 }
             });
         });
+        if !hint_inline {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(RichText::new(hint).font(font::small()).color(color::MUTED))
+                    .wrap(),
+            );
+        }
         if self.confirm_reset {
             ui.add_space(8.0);
             Card::new()
@@ -1511,20 +1527,31 @@ impl Page {
                 ui.horizontal(|ui| {
                     let original = code_of(&self.codes, layer, first);
                     let new = self.changes.get(layer, first);
-                    cap_tile(
-                        ui,
-                        t::ORIGINAL,
-                        &original
-                            .map_or(t::UNREAD.to_string(), |c| layer_short_code_name(layer, c)),
-                        false,
-                    );
+                    // "Ikut Base" on a Fn layer: the tile shows the key it
+                    // falls through to, the caption says why.
+                    let follows = |c: Option<u16>| layer != Layer::Base && c == Some(TRANSPARENT);
+                    let legend = openhe_proto::keycodes::legend(first).to_string();
+                    let follow_caption = short_code_name(TRANSPARENT);
+                    let (text, caption) = if follows(original) {
+                        (legend.clone(), follow_caption.as_str())
+                    } else {
+                        (
+                            original
+                                .map_or(t::UNREAD.to_string(), |c| layer_short_code_name(layer, c)),
+                            t::ORIGINAL,
+                        )
+                    };
+                    cap_tile(ui, caption, &text, false);
                     ui.label(RichText::new("→").font(font::title()).color(color::MUTED));
-                    cap_tile(
-                        ui,
-                        t::NEW,
-                        &new.map_or(t::UNCHANGED.to_string(), short_code_name),
-                        new.is_some(),
-                    );
+                    let (text, caption) = if follows(new) {
+                        (legend, follow_caption.as_str())
+                    } else {
+                        (
+                            new.map_or(t::UNCHANGED.to_string(), short_code_name),
+                            t::NEW,
+                        )
+                    };
+                    cap_tile(ui, caption, &text, new.is_some());
                 });
             });
             ui.add_space(10.0);
