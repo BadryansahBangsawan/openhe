@@ -35,6 +35,19 @@ impl World {
         !self.first(label).accesskit_node().is_disabled()
     }
 
+    /// How many nodes have `role`.
+    pub fn role_count(&self, role: Role) -> usize {
+        self.h.query_all_by_role(role).count()
+    }
+
+    /// Focuses the last text field and replaces its text (then Enter).
+    pub fn type_in_last_field(&mut self, text: &str) {
+        let n = self.role_count(Role::TextInput);
+        assert!(n > 0, "no text field; on screen: {:?}", self.labels());
+        self.click_role(Role::TextInput, n - 1);
+        self.replace_text(text);
+    }
+
     /// How many nodes are labelled exactly `label`.
     pub fn h_count(&self, label: &str) -> usize {
         self.h.query_all_by_label(label).count()
