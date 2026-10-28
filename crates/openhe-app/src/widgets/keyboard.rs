@@ -6,7 +6,7 @@
 //! per-key packet), which is what [`Selection`] stores.
 
 use crate::i18n;
-use crate::theme::{color, line, size};
+use crate::theme::{color, font, line, size};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontFamily, FontId, Id, Pos2, Rect, Response, Sense,
     StrokeKind, Ui, Vec2,
@@ -204,6 +204,16 @@ impl Selection {
     pub fn codes(&self) -> Vec<u8> {
         self.keys.iter().copied().collect()
     }
+
+    /// Selected codes in reading order of `matrix` (row by row, left to
+    /// right), e.g. W, A, S, D; codes not in the matrix are left out.
+    pub fn codes_in(&self, matrix: &Matrix) -> Vec<u8> {
+        matrix
+            .keys()
+            .map(|(_, _, c)| c)
+            .filter(|c| self.keys.contains(c))
+            .collect()
+    }
     pub fn as_set(&self) -> &BTreeSet<u8> {
         &self.keys
     }
@@ -304,6 +314,29 @@ pub fn legend_list(codes: &[u8], max: usize) -> String {
 
 // ------------------------------------------------------------------ widget
 
+/// Unit vector for the arrow keys (drawn as shapes, so they render even
+/// when no installed font has the arrow glyphs).
+fn arrow_dir(code: u8) -> Option<Vec2> {
+    match code {
+        0x4F => Some(egui::vec2(1.0, 0.0)),
+        0x50 => Some(egui::vec2(-1.0, 0.0)),
+        0x51 => Some(egui::vec2(0.0, 1.0)),
+        0x52 => Some(egui::vec2(0.0, -1.0)),
+        _ => None,
+    }
+}
+
+fn paint_arrow(p: &egui::Painter, center: Pos2, len: f32, dir: Vec2, c: Color32) {
+    let tip = center + dir * (len / 2.0);
+    let tail = center - dir * (len / 2.0);
+    let side = egui::vec2(-dir.y, dir.x) * (len * 0.32);
+    let back = tip - dir * (len * 0.38);
+    let stroke = line(1.6, c);
+    p.line_segment([tail, tip], stroke);
+    p.line_segment([tip, back + side], stroke);
+    p.line_segment([tip, back - side], stroke);
+}
+
 /// Per-key extras drawn by the page.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeyDecoration {
@@ -380,6 +413,7 @@ impl KeyboardView {
         let id = Id::new(self.id_salt).with("drag-origin");
 
         // ---- interaction
+        let mut drag_rect = None;
         if self.enabled {
             let additive = ui.input(|i| i.modifiers.shift || i.modifiers.command);
             if response.drag_started() {
@@ -393,14 +427,7 @@ impl KeyboardView {
                 if let (Some(a), Some(b)) = (start, response.interact_pointer_pos()) {
                     let area = Rect::from_two_pos(to_units(a), to_units(b));
                     selection.update_drag(keys_in_rect(lay, area));
-                    let r = Rect::from_two_pos(a, b);
-                    ui.painter().rect(
-                        r,
-                        CornerRadius::same(4),
-                        color::ACCENT_SOFT,
-                        line(1.0, color::ACCENT),
-                        StrokeKind::Inside,
-                    );
+                    drag_rect = Some(Rect::from_two_pos(a, b));
                 }
             }
             if response.drag_stopped() {
@@ -432,8 +459,8 @@ impl KeyboardView {
             StrokeKind::Inside,
         );
         let gap = (unit * 0.09).clamp(3.0, 6.0);
-        let fs = (unit * 0.22).clamp(10.0, 13.5);
-        let fs2 = (unit * 0.19).clamp(9.0, 12.0);
+        let fs = (unit * 0.26).clamp(10.0, 14.0);
+        let fs2 = (unit * 0.235).clamp(9.0, 12.5);
         let dim = |c: Color32| {
             if self.enabled {
                 c
@@ -475,13 +502,23 @@ impl KeyboardView {
                 (unit * 0.12).clamp(4.0, 8.0),
             );
             let text_c = if selected { color::ACCENT } else { color::TEXT };
-            painter.text(
-                r.min + pad,
-                Align2::LEFT_TOP,
-                keycodes::legend(k.code),
-                FontId::new(fs, FontFamily::Proportional),
-                dim(text_c),
-            );
+            if let Some(dir) = arrow_dir(k.code) {
+                paint_arrow(
+                    &painter,
+                    r.min + pad + egui::vec2(fs * 0.45, fs * 0.6),
+                    fs * 0.8,
+                    dir,
+                    dim(text_c),
+                );
+            } else {
+                painter.text(
+                    r.min + pad,
+                    Align2::LEFT_TOP,
+                    keycodes::legend(k.code),
+                    font::bold(fs),
+                    dim(text_c),
+                );
+            }
             if let Some(l2) = &deco.label2 {
                 let c = if selected {
                     color::ACCENT
@@ -505,6 +542,15 @@ impl KeyboardView {
                 painter.rect_filled(brect, CornerRadius::same(4), dim(c.gamma_multiply(0.18)));
                 painter.galley(brect.min + egui::vec2(3.0, 1.0), galley, *c);
             }
+        }
+        if let Some(r) = drag_rect {
+            painter.rect(
+                r,
+                CornerRadius::same(4),
+                color::ACCENT_SOFT,
+                line(1.0, color::ACCENT),
+                StrokeKind::Inside,
+            );
         }
         if !lay.tested {
             painter.text(
@@ -629,7 +675,7 @@ mod tests {
         assert_eq!(key_at(&l, egui::pos2(14.9, 0.5)), Some(0x2A)); // Backspace (13..15)
         assert_eq!(key_at(&l, egui::pos2(5.0, 4.5)), Some(0x2C)); // Space
         assert_eq!(key_at(&l, egui::pos2(16.5, 0.5)), None);
-        // A rectangle from the middle of W to the middle of D: W E S D (and A? no).
+        // A rectangle over the middle of Q..E and A..D.
         let area = Rect::from_two_pos(egui::pos2(2.0, 1.5), egui::pos2(3.9, 2.5));
         let mut hit = keys_in_rect(&l, area);
         hit.sort();
@@ -682,6 +728,7 @@ mod tests {
         assert_eq!(s.len(), 68);
         s.select_wasd(&m);
         assert_eq!(s.codes(), vec![0x04, 0x07, 0x16, 0x1A]);
+        assert_eq!(s.codes_in(&m), WASD.to_vec(), "reading order: W, A, S, D");
         s.select_letters(&m);
         assert_eq!(s.len(), 26);
         s.clear();

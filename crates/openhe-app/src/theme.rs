@@ -93,11 +93,19 @@ impl Default for Theme {
 pub mod font {
     use eframe::egui::{FontFamily, FontId};
 
+    /// The bold family installed by [`super::apply`] (a system bold face
+    /// when one is found, else egui's default font).
+    pub fn bold_family() -> FontFamily {
+        FontFamily::Name(super::BOLD_FAMILY.into())
+    }
+    pub fn bold(size: f32) -> FontId {
+        FontId::new(size, bold_family())
+    }
     pub fn title() -> FontId {
-        FontId::new(22.0, FontFamily::Proportional)
+        bold(22.0)
     }
     pub fn heading() -> FontId {
-        FontId::new(17.0, FontFamily::Proportional)
+        bold(17.0)
     }
     pub fn body() -> FontId {
         FontId::new(14.0, FontFamily::Proportional)
@@ -113,9 +121,81 @@ pub mod font {
     }
 }
 
-/// Installs the dark visuals and text styles on `ctx`.
+/// Name of the bold font family (see [`font::bold_family`]).
+pub const BOLD_FAMILY: &str = "bold";
+
+/// System fonts used when present: regular, then bold. They are read from
+/// the user's own system at startup and never shipped; egui's bundled fonts
+/// stay as fallbacks for missing glyphs.
+#[cfg(target_os = "macos")]
+const SYSTEM_FONTS: (&[&str], &[&str]) = (
+    &["/System/Library/Fonts/Supplemental/Arial.ttf"],
+    &["/System/Library/Fonts/Supplemental/Arial Bold.ttf"],
+);
+#[cfg(target_os = "windows")]
+const SYSTEM_FONTS: (&[&str], &[&str]) = (
+    &["C:\\Windows\\Fonts\\segoeui.ttf"],
+    &[
+        "C:\\Windows\\Fonts\\seguisb.ttf",
+        "C:\\Windows\\Fonts\\segoeuib.ttf",
+    ],
+);
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const SYSTEM_FONTS: (&[&str], &[&str]) = (
+    &[
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ],
+    &[
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    ],
+);
+
+fn first_readable(paths: &[&str]) -> Option<Vec<u8>> {
+    paths.iter().find_map(|p| std::fs::read(p).ok())
+}
+
+/// Installs fonts: a system sans as the proportional face when available,
+/// and the [`BOLD_FAMILY`] family (always defined, so bold text never
+/// panics even without system fonts).
+pub fn install_fonts(ctx: &egui::Context) {
+    use eframe::egui::{FontData, FontDefinitions};
+    use std::sync::Arc;
+    let mut defs = FontDefinitions::default();
+    let (regular, bold) = SYSTEM_FONTS;
+    if let Some(bytes) = first_readable(regular) {
+        defs.font_data
+            .insert("system".into(), Arc::new(FontData::from_owned(bytes)));
+        defs.families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "system".into());
+    }
+    let mut bold_list = defs
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(bytes) = first_readable(bold) {
+        defs.font_data
+            .insert("system-bold".into(), Arc::new(FontData::from_owned(bytes)));
+        bold_list.insert(0, "system-bold".into());
+    }
+    defs.families
+        .insert(FontFamily::Name(BOLD_FAMILY.into()), bold_list);
+    ctx.set_fonts(defs);
+}
+
+/// Installs the fonts, dark visuals and text styles on `ctx`. Call once at
+/// startup (and in UI tests) before drawing.
 pub fn apply(ctx: &egui::Context) {
     use color::*;
+    install_fonts(ctx);
     let mut v = Visuals::dark();
     v.panel_fill = BG;
     v.window_fill = PANEL;
@@ -171,6 +251,7 @@ pub fn apply(ctx: &egui::Context) {
         s.spacing.button_padding = egui::vec2(14.0, 7.0);
         s.spacing.interact_size.y = 30.0;
         s.interaction.selectable_labels = false;
+        s.spacing.scroll = egui::style::ScrollStyle::floating();
     });
 }
 
