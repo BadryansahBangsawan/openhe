@@ -10,7 +10,7 @@
 //! re-reads the key, its SOCD partner(s) and their settings, so the screen
 //! never shows stale badges.
 
-use super::remap::{code_field, code_name};
+use super::remap::{code_field, code_name, FN_KEY};
 use crate::app::{page_with_right_panel, AppCtx};
 use crate::i18n;
 use crate::theme::{color, font, line, size};
@@ -83,7 +83,6 @@ mod strings {
 
     pub const SOCD_PAIR: &str = "Pasangan tombol";
     pub const SOCD_PICK: &str = "Pilih di keyboard";
-    pub const SOCD_PICKING: &str = "Klik tombol pasangan di keyboard…";
     pub const SOCD_NO_PARTNER: &str = "belum dipilih";
     pub const SOCD_MODE: &str = "Jika keduanya ditekan";
     pub const SOCD_LAST: &str = "Yang terakhir ditekan menang";
@@ -120,6 +119,25 @@ mod strings {
     pub const V_SOCD_PARTNER: &str = "Pilih tombol pasangan di keyboard.";
     pub const V_SOCD_SAME: &str = "Pasangan harus tombol yang berbeda.";
     pub const V_SOCD_DELAY: &str = "Jeda SOCD harus antara 0 dan 50.";
+    pub const V_FN_KEY: &str = "Tombol Fn tidak bisa diberi fungsi lanjutan.";
+    pub const V_SOCD_FN: &str = "Tombol Fn tidak bisa jadi pasangan SOCD.";
+    pub const SOCD_PICKING_NOT_FN: &str = "Klik tombol pasangan di keyboard (bukan Fn)…";
+    pub const WARN_FUNC: &str = "Fungsi";
+    pub const WARN_ON_KEY: &str = "di tombol";
+    pub const WARN_REMOVED: &str = "akan dihapus.";
+    pub const MACRO_NAME: &str = "Macro";
+
+    // Table descriptions.
+    pub const D_ACTUATION: &str = "aktuasi";
+    pub const D_MM: &str = "mm";
+    pub const D_MS: &str = "ms";
+    pub const D_TAP: &str = "Ketuk";
+    pub const D_HOLD: &str = "tahan";
+    pub const D_TGL_ONCE: &str = "Ketuk sekali";
+    pub const D_TGL_KEPT: &str = "tetap tertekan";
+    pub const D_TGL_AGAIN: &str = "ketuk lagi = lepas";
+    pub const D_RELEASE: &str = "Lepas";
+
     pub const V_SOCD_OUTPUT: &str = "Pilih tombol yang dikirim untuk kedua sisi.";
 }
 use strings as t;
@@ -417,6 +435,10 @@ impl Editor {
     /// The config the form describes, or the Indonesian reason it cannot be
     /// sent. Everything `set_advanced` would reject is caught here first.
     pub fn build(&self) -> Result<AdvancedConfig, String> {
+        if self.key == FN_KEY {
+            // Firmware behaviour of a function on the Fn key is unknown.
+            return Err(t::V_FN_KEY.into());
+        }
         match self.func {
             Func::Dks => self.build_dks(),
             Func::Mt => {
@@ -494,6 +516,9 @@ impl Editor {
         };
         if partner == self.key {
             return Err(t::V_SOCD_SAME.into());
+        }
+        if partner == FN_KEY {
+            return Err(t::V_SOCD_FN.into());
         }
         if f.delay > MAX_SOCD_DELAY {
             return Err(t::V_SOCD_DELAY.into());
@@ -573,31 +598,46 @@ pub fn describe(cfg: &AdvancedConfig) -> String {
                 .map(|&c| code_name(c))
                 .collect();
             format!(
-                "{} · aktuasi {} mm",
+                "{} · {} {} {}",
                 names.join(" + "),
-                mm_short(d.first_actuation.0)
+                t::D_ACTUATION,
+                mm_short(d.first_actuation.0),
+                t::D_MM
             )
         }
         AdvancedConfig::Mt(m) => format!(
-            "Ketuk = {} · tahan {} ms = {}",
+            "{} = {} · {} {} {} = {}",
+            t::D_TAP,
             code_name(m.tap),
+            t::D_HOLD,
             m.delay_ms,
+            t::D_MS,
             code_name(m.hold)
         ),
         AdvancedConfig::Tgl(g) => format!(
-            "Ketuk sekali = {} tetap tertekan · ketuk lagi = lepas",
-            code_name(g.code)
+            "{} = {} {} · {}",
+            t::D_TGL_ONCE,
+            code_name(g.code),
+            t::D_TGL_KEPT,
+            t::D_TGL_AGAIN
         ),
         AdvancedConfig::Mpt(m) => (0..3)
-            .map(|i| format!("{} mm = {}", mm_short(m.depths[i].0), code_name(m.codes[i])))
+            .map(|i| {
+                format!(
+                    "{} {} = {}",
+                    mm_short(m.depths[i].0),
+                    t::D_MM,
+                    code_name(m.codes[i])
+                )
+            })
             .collect::<Vec<_>>()
             .join(" · "),
         AdvancedConfig::Socd(s) => {
             let (a, b) = (key_name(s.pos1), key_name(s.pos2));
             format!("{a} ↔ {b} · {}", socd_mode_label(s.mode, a, b))
         }
-        AdvancedConfig::End(e) => format!("Lepas = {}", code_name(e.code)),
-        AdvancedConfig::Macro => "Macro".to_string(),
+        AdvancedConfig::End(e) => format!("{} = {}", t::D_RELEASE, code_name(e.code)),
+        AdvancedConfig::Macro => t::MACRO_NAME.to_string(),
         AdvancedConfig::None => String::new(),
     }
 }
@@ -623,10 +663,36 @@ pub enum PartnerPick {
 }
 
 pub fn resolve_partner_pick(main: u8, sel: &BTreeSet<u8>) -> PartnerPick {
-    match sel.iter().find(|&&k| k != main) {
+    match sel.iter().find(|&&k| k != main && k != FN_KEY) {
         Some(&k) => PartnerPick::Partner(k),
         None => PartnerPick::Keep,
     }
+}
+
+/// A warning when the chosen SOCD partner already has another function
+/// (writing the pair replaces it). The partner of the same existing pair is
+/// not a conflict.
+pub fn partner_conflict(
+    snap: &DeviceSnapshot,
+    partner: u8,
+    loaded: &AdvancedConfig,
+) -> Option<String> {
+    if matches!(loaded, AdvancedConfig::Socd(s) if s.pos1 == partner || s.pos2 == partner) {
+        return None;
+    }
+    let adv = snap.keys.get(&partner)?.mode.advanced;
+    let name = match adv {
+        Advanced::None => return None,
+        Advanced::Macro => t::MACRO_NAME,
+        other => Func::of_nibble(other)?.label(),
+    };
+    Some(format!(
+        "{} {name} {} {} {}",
+        t::WARN_FUNC,
+        t::WARN_ON_KEY,
+        key_name(partner),
+        t::WARN_REMOVED
+    ))
 }
 
 // ------------------------------------------------------------- table rows
@@ -1214,7 +1280,7 @@ impl Page {
         } else if self.picking_partner {
             ui.add_space(8.0);
             ui.label(
-                RichText::new(t::SOCD_PICKING)
+                RichText::new(t::SOCD_PICKING_NOT_FN)
                     .font(font::small())
                     .color(Func::Socd.color()),
             );
@@ -1351,6 +1417,10 @@ impl Page {
                 pill(ui, f.label(), f.color());
             }
         });
+        if key == FN_KEY {
+            card::hint(ui, t::V_FN_KEY);
+            return;
+        }
         let editable = self.editable(ctx);
         let Some(editor) = self.editor.as_mut() else {
             ui.add_space(8.0);
@@ -1379,13 +1449,28 @@ impl Page {
         ui.add_space(10.0);
 
         let mut picking = self.picking_partner;
+        let warning = match (editor.func, editor.socd.partner, ctx.snapshot) {
+            (Func::Socd, Some(p), Some(snap)) => partner_conflict(snap, p, &editor.loaded),
+            _ => None,
+        };
         ui.add_enabled_ui(editable, |ui| {
             match editor.func {
                 Func::Dks => dks_editor(ui, &mut editor.dks),
                 Func::Mt => mt_editor(ui, &mut editor.mt),
                 Func::Tgl => tgl_editor(ui, &mut editor.tgl),
                 Func::Mpt => mpt_editor(ui, &mut editor.mpt),
-                Func::Socd => socd_editor(ui, key, &mut editor.socd, &mut picking),
+                Func::Socd => {
+                    socd_editor(ui, key, &mut editor.socd, &mut picking);
+                    if let Some(w) = &warning {
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(w).font(font::small()).color(color::ACCENT),
+                            )
+                            .wrap(),
+                        );
+                    }
+                }
                 Func::End => end_editor(ui, &mut editor.end),
             }
             ui.add_space(16.0);
@@ -1415,7 +1500,7 @@ impl Page {
             ui.add_space(8.0);
         }
         let built = self.editor.as_ref().map(Editor::build);
-        if let Some(Err(msg)) = &built {
+        if let (Some(Err(msg)), false) = (&built, self.key == Some(FN_KEY)) {
             ui.add(
                 egui::Label::new(RichText::new(msg).font(font::small()).color(color::DANGER))
                     .wrap(),
@@ -2706,5 +2791,68 @@ mod tests {
             page.editor.as_mut().unwrap().func = f;
             frame(&mut page, 2);
         }
+    }
+
+    #[test]
+    fn the_fn_key_cannot_get_a_function_or_be_a_socd_partner() {
+        let fn_key = FN_KEY;
+        for f in FUNCS {
+            let mut e = Editor::new(fn_key, &AdvancedConfig::None);
+            e.func = f;
+            e.dks.codes[0] = 4;
+            e.dks.flags[0][0] = true;
+            e.mt = MtForm {
+                hold: 4,
+                tap: 5,
+                delay_ms: 200,
+            };
+            e.tgl.code = 4;
+            e.end.code = 4;
+            e.socd.partner = Some(0x04);
+            assert_eq!(e.build(), Err(t::V_FN_KEY.to_string()), "{f:?}");
+        }
+        let mut e = Editor::new(0x04, &AdvancedConfig::None);
+        e.func = Func::Socd;
+        e.socd.partner = Some(FN_KEY);
+        assert_eq!(e.build(), Err(t::V_SOCD_FN.to_string()));
+        // Clicking Fn while picking a partner is ignored.
+        let s = |v: &[u8]| v.iter().copied().collect::<BTreeSet<u8>>();
+        assert_eq!(resolve_partner_pick(0x04, &s(&[FN_KEY])), PartnerPick::Keep);
+        assert_eq!(
+            resolve_partner_pick(0x04, &s(&[FN_KEY, 0x07])),
+            PartnerPick::Partner(0x07)
+        );
+    }
+
+    #[test]
+    fn a_partner_with_another_function_is_warned_about() {
+        let s = snap(&[
+            (0x07, Advanced::Mt),
+            (0x16, Advanced::Macro),
+            (0x04, Advanced::Socd),
+        ]);
+        let none = AdvancedConfig::None;
+        assert_eq!(
+            partner_conflict(&s, 0x07, &none).as_deref(),
+            Some("Fungsi MT di tombol D akan dihapus.")
+        );
+        assert_eq!(
+            partner_conflict(&s, 0x16, &none).as_deref(),
+            Some("Fungsi Macro di tombol S akan dihapus.")
+        );
+        assert_eq!(partner_conflict(&s, 0x05, &none), None);
+        // The partner of the pair being edited is not a conflict.
+        let pair = AdvancedConfig::Socd(Socd {
+            pos1: 0x04,
+            pos2: 0x07,
+            key1: 4,
+            key2: 7,
+            bind_values: false,
+            mode: SocdMode::LastInput,
+            delay: 0,
+        });
+        let s2 = snap(&[(0x04, Advanced::Socd), (0x07, Advanced::Socd)]);
+        assert_eq!(partner_conflict(&s2, 0x07, &pair), None);
+        assert!(partner_conflict(&s2, 0x07, &none).is_some());
     }
 }

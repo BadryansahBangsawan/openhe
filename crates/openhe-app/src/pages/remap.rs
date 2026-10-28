@@ -54,7 +54,13 @@ mod strings {
     pub const KEY_PREFIX: &str = "Tombol";
     pub const LAYER_WORD: &str = "layer";
     pub const NOW_SENDS: &str = "sekarang mengirim";
-    pub const ORIGINAL: &str = "Asli";
+    pub const ORIGINAL: &str = "Sekarang";
+    pub const DEFAULT_IS: &str = "Bawaan";
+    pub const FN_PLUS: &str = "Fn +";
+    pub const KEYS_SELECTED: &str = "tombol dipilih";
+    pub const UNREAD: &str = "…";
+    pub const UNKNOWN_CODE: &str = "Kode";
+    pub const RESET_NOTHING: &str = "Semua tombol di layer Base sudah memakai fungsi bawaan.";
     pub const NEW: &str = "Baru";
     pub const UNCHANGED: &str = "—";
     pub const LOCKED: &str =
@@ -212,7 +218,7 @@ fn abbreviate(label: &str) -> String {
 }
 
 fn unknown(code: u16) -> String {
-    format!("Kode 0x{code:04X}")
+    format!("{} 0x{code:04X}", t::UNKNOWN_CODE)
 }
 
 /// Full name of a keycode for lists and tooltips. Never an "i18n:" token;
@@ -251,16 +257,23 @@ pub fn pickable(k: &KeyCode) -> bool {
         && !matches!(k.code, 0x0032 | 0x0064 | 0x00C7 | 0x00C8)
 }
 
+/// The hex digits of a query that looks like a hex code: "0x…" or at least
+/// three hex digits. A short "e" or "ab" is a name search, not a hex one.
+fn hex_query(q: &str) -> Option<&str> {
+    let digits = q.strip_prefix("0x").unwrap_or(q);
+    let is_hex = !digits.is_empty() && digits.chars().all(|c| c.is_ascii_hexdigit());
+    (is_hex && (q.starts_with("0x") || digits.len() >= 3)).then_some(digits)
+}
+
 /// Search match on the Indonesian name, the vendor label or the hex code.
 pub fn picker_matches(k: &KeyCode, query: &str) -> bool {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return true;
     }
-    let q_hex = q.trim_start_matches("0x");
     code_name(k.code).to_lowercase().contains(&q)
         || k.label.to_lowercase().contains(&q)
-        || format!("{:04x}", k.code).contains(q_hex)
+        || hex_query(&q).is_some_and(|h| format!("{:04x}", k.code).contains(h))
 }
 
 // ------------------------------------------------------- pending changes
@@ -341,8 +354,18 @@ impl Changes {
 
 /// "Kembalikan ke bawaan": every key's own default code on Base, except Fn.
 pub fn reset_entries(keys: impl IntoIterator<Item = u8>) -> Vec<(u8, Layer, u16)> {
+    reset_entries_skipping(keys, |_| None)
+}
+
+/// Like [`reset_entries`], but leaves out keys whose current Base code
+/// (`current`, when known) already is their default.
+pub fn reset_entries_skipping(
+    keys: impl IntoIterator<Item = u8>,
+    current: impl Fn(u8) -> Option<u16>,
+) -> Vec<(u8, Layer, u16)> {
     keys.into_iter()
         .filter(|&k| !is_locked(Layer::Base, k))
+        .filter(|&k| current(k) != Some(u16::from(k)))
         .map(|k| (k, Layer::Base, u16::from(k)))
         .collect()
 }
@@ -658,6 +681,9 @@ pub struct Page {
     picker: PickerState,
     /// Codes read from the keyboard, by layer index, then default key code.
     codes: BTreeMap<u8, BTreeMap<u8, u16>>,
+    /// Layers whose codes were read completely. A map in `codes` alone does
+    /// not count: after a partial read or a patch it may be incomplete.
+    loaded: BTreeSet<u8>,
     changes: Changes,
     read: Option<ReadReq>,
     /// Layers whose read failed; not retried until the data reloads.
@@ -668,6 +694,8 @@ pub struct Page {
     error: Option<String>,
     error_technical: Option<String>,
     applied: bool,
+    /// A neutral note for the right panel (e.g. nothing to reset).
+    notice: Option<&'static str>,
     confirm_reset: bool,
     /// Worker generation and profile the cache belongs to.
     seen: Option<(u64, u8)>,
@@ -680,6 +708,7 @@ impl Default for Page {
             selection: Selection::default(),
             picker: PickerState::default(),
             codes: BTreeMap::new(),
+            loaded: BTreeSet::new(),
             changes: Changes::default(),
             read: None,
             read_failed: BTreeSet::new(),
@@ -689,6 +718,7 @@ impl Default for Page {
             error: None,
             error_technical: None,
             applied: false,
+            notice: None,
             confirm_reset: false,
             seen: None,
         }
@@ -783,7 +813,10 @@ impl Page {
                     map.insert(k, c);
                 }
                 match read.error {
-                    None => self.read_error = None,
+                    None => {
+                        self.loaded.insert(layer as u8);
+                        self.read_error = None;
+                    }
                     Some(e) => {
                         self.read_failed.insert(layer as u8);
                         self.read_error = Some((
@@ -805,8 +838,7 @@ impl Page {
         let sent = self.last_sent.clone().map(|(e, _)| e).unwrap_or_default();
         let fx = apply_effects(&sent, result);
         if fx.invalidate {
-            self.codes.clear();
-            self.read_failed.clear();
+            self.clear_cache();
         }
         for (k, l, c) in &fx.patch {
             self.codes.entry(*l as u8).or_default().insert(*k, *c);
@@ -823,12 +855,30 @@ impl Page {
         // On failure the pending changes stay, so "Coba lagi" resends them.
     }
 
+    /// The layer is not completely loaded and its last read did not fail.
+    fn wants_read(&self, layer: Layer) -> bool {
+        let li = layer as u8;
+        !self.loaded.contains(&li) && !self.read_failed.contains(&li)
+    }
+
+    /// "Coba lagi" after a failed read: the layer is read again.
+    fn retry_read(&mut self) {
+        self.read_error = None;
+        self.read_failed.remove(&(self.layer as u8));
+    }
+
+    /// Forgets every layer read so far.
+    fn clear_cache(&mut self) {
+        self.codes.clear();
+        self.loaded.clear();
+        self.read_failed.clear();
+    }
+
     /// Drops stale data after a reload or profile change, then reads the
-    /// open layer when it is not cached yet.
+    /// open layer when it is not completely loaded.
     fn sync(&mut self, ctx: &AppCtx) {
         let Some(snap) = ctx.snapshot else {
-            self.codes.clear();
-            self.read_failed.clear();
+            self.clear_cache();
             self.confirm_reset = false;
             self.seen = None;
             return;
@@ -837,8 +887,7 @@ impl Page {
         let generation = ctx.worker.generation();
         match self.seen {
             Some((g, p)) if g != generation || p != snap.profile => {
-                self.codes.clear();
-                self.read_failed.clear();
+                self.clear_cache();
                 self.read_error = None;
                 if p != snap.profile {
                     self.changes.clear();
@@ -847,11 +896,9 @@ impl Page {
             _ => {}
         }
         self.seen = Some((generation, snap.profile));
-        let li = self.layer as u8;
         if self.read.is_none()
             && self.pending.is_none()
-            && !self.codes.contains_key(&li)
-            && !self.read_failed.contains(&li)
+            && self.wants_read(self.layer)
             && ctx.can_write()
         {
             let keys: Vec<u8> = snap.matrix.keys().map(|(_, _, c)| c).collect();
@@ -867,6 +914,7 @@ impl Page {
     }
 
     fn submit(&mut self, ctx: &AppCtx, entries: Vec<(u8, Layer, u16)>, kind: Sent) {
+        self.notice = None;
         self.error = None;
         self.error_technical = None;
         self.applied = false;
@@ -888,9 +936,19 @@ impl Page {
         let Some(snap) = ctx.snapshot else {
             return;
         };
-        let entries = reset_entries(snap.matrix.keys().map(|(_, _, c)| c));
+        let known = self.loaded.contains(&(Layer::Base as u8));
+        let codes = &self.codes;
+        let entries = reset_entries_skipping(snap.matrix.keys().map(|(_, _, c)| c), |k| {
+            known.then(|| code_of(codes, Layer::Base, k)).flatten()
+        });
         self.changes.clear_layer(Layer::Base);
         self.confirm_reset = false;
+        if entries.is_empty() {
+            self.error = None;
+            self.error_technical = None;
+            self.notice = Some(t::RESET_NOTHING);
+            return;
+        }
         self.submit(ctx, entries, Sent::Reset);
     }
 
@@ -918,6 +976,7 @@ impl Page {
         self.changes
             .queue(layer, &keys, code, |l, k| code_of(codes, l, k));
         self.applied = false;
+        self.notice = None;
         self.error = None;
         self.error_technical = None;
     }
@@ -1052,8 +1111,7 @@ impl Page {
             ui.add_space(8.0);
             let retry = self.editable(ctx).then_some(i18n::common::RETRY);
             if card::error_box(ui, t::READ_FAILED, &msg, retry, Some(&tech)) {
-                self.read_error = None;
-                self.read_failed.remove(&(self.layer as u8));
+                self.retry_read();
             }
         }
         ui.add_space(16.0);
@@ -1141,16 +1199,22 @@ impl Page {
         if keys.len() == 1 {
             let now = match code_of(&self.codes, layer, first) {
                 Some(c) => code_name(c),
-                None => "…".to_string(),
+                None => t::UNREAD.to_string(),
             };
             let who = if layer == Layer::Base {
                 keycodes::legend(first).to_string()
             } else {
-                format!("Fn + {}", keycodes::legend(first))
+                format!("{} {}", t::FN_PLUS, keycodes::legend(first))
             };
             card::hint(ui, format!("{who} {} {now}", t::NOW_SENDS));
+            if layer == Layer::Base && !is_locked(layer, first) {
+                card::hint(
+                    ui,
+                    format!("{}: {}", t::DEFAULT_IS, code_name(u16::from(first))),
+                );
+            }
         } else {
-            card::hint(ui, format!("{} tombol dipilih", keys.len()));
+            card::hint(ui, format!("{} {}", keys.len(), t::KEYS_SELECTED));
         }
         if keys.iter().any(|&k| is_locked(layer, k)) {
             card::hint(
@@ -1173,7 +1237,7 @@ impl Page {
                     cap_tile(
                         ui,
                         t::ORIGINAL,
-                        &original.map_or("…".to_string(), short_code_name),
+                        &original.map_or(t::UNREAD.to_string(), short_code_name),
                         false,
                     );
                     ui.label(RichText::new("→").font(font::title()).color(color::MUTED));
@@ -1200,7 +1264,7 @@ impl Page {
         const SHOWN: usize = 8;
         let entries = self.changes.entries();
         for (k, l, c) in entries.iter().take(SHOWN) {
-            let was = code_of(&self.codes, *l, *k).map_or("…".to_string(), code_name);
+            let was = code_of(&self.codes, *l, *k).map_or(t::UNREAD.to_string(), code_name);
             Frame::new()
                 .fill(color::PANEL)
                 .stroke(line(1.0, color::BORDER))
@@ -1243,6 +1307,10 @@ impl Page {
                 self.retry(ctx);
             }
             ui.add_space(8.0);
+        }
+        if let Some(n) = self.notice {
+            card::hint(ui, n);
+            ui.add_space(6.0);
         }
         ui.horizontal(|ui| {
             let discard = egui::Button::new(RichText::new(t::DISCARD).color(color::TEXT))
@@ -1718,6 +1786,37 @@ mod tests {
         assert_eq!(r, Err(Error::Disconnected));
     }
 
+    #[test]
+    fn reset_skips_keys_already_at_their_default() {
+        let cur = |k: u8| match k {
+            0x04 => Some(0x04),
+            0x05 => Some(0x06),
+            _ => None,
+        };
+        let e = reset_entries_skipping([0x04, 0x05, 0x06, 0x01], cur);
+        assert_eq!(
+            e,
+            vec![(0x05, Layer::Base, 0x05), (0x06, Layer::Base, 0x06)],
+            "0x04 is at its default, 0x06 is unknown, Fn is skipped"
+        );
+    }
+
+    #[test]
+    fn hex_search_needs_a_prefix_or_three_digits() {
+        let a = keycodes::lookup(0x000A).unwrap(); // G
+        let e = keycodes::lookup(0x0008).unwrap(); // E
+        assert!(!picker_matches(a, "a"), "a lone hex letter is not a code");
+        assert!(picker_matches(a, "0x000a"));
+        assert!(picker_matches(a, "0x0a"));
+        assert!(picker_matches(a, "000a"));
+        assert!(picker_matches(e, "e"), "still a name search");
+        let b = keycodes::lookup(0x0005).unwrap(); // B
+        assert!(
+            !picker_matches(b, "e"),
+            "no hex match on the single letter e"
+        );
+    }
+
     // ---- page, headless
 
     #[test]
@@ -1782,5 +1881,133 @@ mod tests {
         }
         assert_eq!(page.changes.entries(), vec![(0x1A, Layer::Base, 0x52)]);
         frame(&mut page, 2); // everything renders with pending changes
+    }
+
+    fn with_ctx<R>(worker: &crate::worker::Worker, f: impl FnOnce(&AppCtx) -> R) -> R {
+        use crate::storage::AppData;
+        use crate::theme::Theme;
+        use crate::worker::ConnectionStatus;
+        use std::cell::RefCell;
+        let theme = Theme::default();
+        let data = RefCell::new(AppData::default());
+        let status = worker.status();
+        let ctx = AppCtx {
+            worker,
+            snapshot: match &status {
+                ConnectionStatus::Connected(s) => Some(s),
+                _ => None,
+            },
+            status: &status,
+            busy: false,
+            theme: &theme,
+            data: &data,
+        };
+        f(&ctx)
+    }
+
+    #[test]
+    fn retry_after_a_partial_read_reads_the_layer_again() {
+        let mut page = Page::default();
+        let partial = LayerRead {
+            layer: Layer::Base,
+            codes: vec![(0x04, 0x04)],
+            error: Some(Error::Timeout),
+        };
+        page.finish_read(Layer::Base, Ok(partial));
+        assert!(!page.loaded.contains(&0), "a partial read is not loaded");
+        assert!(page.read_failed.contains(&0));
+        assert!(!page.wants_read(Layer::Base), "no retry loop on its own");
+        assert!(page.read_error.is_some());
+        // The partial codes are still shown.
+        assert_eq!(code_of(&page.codes, Layer::Base, 0x04), Some(0x04));
+        page.retry_read();
+        assert!(page.wants_read(Layer::Base), "Coba lagi queues a new read");
+        assert!(page.read_error.is_none());
+        // A complete read marks the layer loaded.
+        let full = LayerRead {
+            layer: Layer::Base,
+            codes: vec![(0x04, 0x04), (0x05, 0x05)],
+            error: None,
+        };
+        page.finish_read(Layer::Base, Ok(full));
+        assert!(page.loaded.contains(&0) && !page.wants_read(Layer::Base));
+    }
+
+    #[test]
+    fn retry_really_submits_a_read_job() {
+        use crate::app::test_support::*;
+        use crate::worker::ConnectionStatus;
+        let worker = offline_worker();
+        worker.inject_status(ConnectionStatus::Connected(snapshot68()));
+        let mut page = Page::default();
+        page.finish_read(
+            Layer::Base,
+            Ok(LayerRead {
+                layer: Layer::Base,
+                codes: vec![(0x04, 0x04)],
+                error: Some(Error::Timeout),
+            }),
+        );
+        with_ctx(&worker, |c| page.sync(c));
+        assert!(page.read.is_none(), "a failed layer is left alone");
+        page.retry_read();
+        with_ctx(&worker, |c| page.sync(c));
+        assert!(page.read.is_some(), "after the retry a read job is queued");
+    }
+
+    #[test]
+    fn an_apply_into_a_layer_that_was_never_loaded_does_not_mark_it_loaded() {
+        use crate::app::test_support::*;
+        use crate::worker::ConnectionStatus;
+        let worker = offline_worker();
+        worker.inject_status(ConnectionStatus::Connected(snapshot68()));
+        let mut page = Page::default();
+        let entries = vec![(0x1A, Layer::Fn2, 0x52)];
+        page.last_sent = Some((entries.clone(), Sent::Changes));
+        page.changes.queue(Layer::Fn2, &[0x1A], 0x52, none);
+        let ok = ApplyOutcome {
+            write: Ok(()),
+            reread: Vec::new(),
+            reload_error: None,
+        };
+        with_ctx(&worker, |c| page.finish_apply(c, Ok(ok)));
+        assert_eq!(code_of(&page.codes, Layer::Fn2, 0x1A), Some(0x52));
+        assert!(!page.loaded.contains(&2));
+        assert!(
+            page.wants_read(Layer::Fn2),
+            "the layer still gets a full read"
+        );
+        assert!(page.changes.is_empty());
+    }
+
+    #[test]
+    fn a_generation_bump_during_a_pending_apply_leaves_no_loaded_partial_map() {
+        use crate::app::test_support::*;
+        use crate::worker::ConnectionStatus;
+        let worker = offline_worker();
+        worker.inject_status(ConnectionStatus::Connected(snapshot68()));
+        let mut page = Page::default();
+        // Base fully loaded, an apply is in flight.
+        page.loaded.insert(0);
+        page.codes
+            .insert(0, BTreeMap::from([(0x04, 0x04), (0x05, 0x05)]));
+        page.last_sent = Some((vec![(0x04, Layer::Base, 0x06)], Sent::Changes));
+        let gen = worker.generation();
+        page.seen = Some((gen.wrapping_sub(1), 1)); // the snapshot reloaded since
+        with_ctx(&worker, |c| page.sync(c));
+        assert!(page.loaded.is_empty() && page.codes.is_empty());
+        // The apply finishes afterwards and patches into the emptied cache.
+        let ok = ApplyOutcome {
+            write: Ok(()),
+            reread: Vec::new(),
+            reload_error: None,
+        };
+        with_ctx(&worker, |c| page.finish_apply(c, Ok(ok)));
+        assert!(
+            page.loaded.is_empty(),
+            "a patch alone never counts as loaded"
+        );
+        assert!(page.wants_read(Layer::Base));
+        assert_eq!(code_of(&page.codes, Layer::Base, 0x05), None);
     }
 }
