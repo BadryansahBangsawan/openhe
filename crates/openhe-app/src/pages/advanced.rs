@@ -1074,14 +1074,19 @@ impl Page {
                         self.cache.insert(s.pos1, c);
                         self.cache.insert(s.pos2, c);
                     }
-                    if fx.applied {
-                        self.editor = Some(Editor::new(key, &c));
-                    } else if let Some(e) = self.editor.as_mut() {
-                        e.loaded = c;
+                    // The user may have selected another key meanwhile:
+                    // only the applied key's own editor is reloaded.
+                    if self.key == Some(key) {
+                        if fx.applied {
+                            self.editor = Some(Editor::new(key, &c));
+                        } else if let Some(e) = self.editor.as_mut().filter(|e| e.key == key) {
+                            e.loaded = c;
+                        }
                     }
                 }
                 // The keyboard's state is unknown: load the editor again.
-                None => self.editor = None,
+                None if self.key == Some(key) => self.editor = None,
+                None => {}
             }
         }
         if !fx.patch.is_empty() {
@@ -1168,6 +1173,11 @@ impl Page {
                     .is_some_and(|s| s.mode.advanced == c.advanced())
         });
         let nibble = |k: u8| snap.keys.get(&k).map(|s| s.mode.advanced);
+        // Never edit one key with another key's form.
+        if self.editor.as_ref().is_some_and(|e| Some(e.key) != self.key) {
+            self.editor = None;
+            self.picking_partner = false;
+        }
         if let (Some(k), Some(e), false) = (self.key, self.editor.as_ref(), settle) {
             if nibble(k).is_some_and(|n| n != e.loaded.advanced()) {
                 self.editor = None;

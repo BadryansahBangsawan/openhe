@@ -163,3 +163,37 @@ fn macro_key_shows_macro_hint_and_can_be_replaced() {
     w.apply("Terapkan");
     assert_eq!(nibble(&w, G), 5);
 }
+
+/// Selecting another key while an apply runs must not leave the applied
+/// key's form under the new key's title (Terapkan then wrote it there).
+#[test]
+fn selecting_another_key_during_an_apply_keeps_that_keys_own_editor() {
+    let mut w = open(H);
+    w.click("MT");
+    w.pick_code("Kosong", 0, "f1", "F1");
+    w.pick_code("Kosong", 0, "esc", "ESC");
+    w.apply("Terapkan");
+    assert_eq!(w.sim().p().key(H, 9), 0x3A);
+    // G gets MT B/C on a slow keyboard; H is clicked while it is written.
+    w.click_key(G, false);
+    w.frames(3);
+    w.click("MT");
+    w.pick_code("Kosong", 0, "b", "B");
+    w.pick_code("Kosong", 0, "c", "C");
+    w.sim().set_delay = std::time::Duration::from_millis(30);
+    w.click("Terapkan");
+    assert!(w.worker.is_busy());
+    w.click_key(H, false);
+    w.idle();
+    w.sim().set_delay = std::time::Duration::ZERO;
+    w.idle();
+    assert_eq!(w.sim().p().key(G, 9), 0x05, "G written");
+    // The panel edits H with H's own codes.
+    assert!(w.has("F1"), "{:?}", w.labels());
+    assert!(!w.has("B"), "G's form shown for H: {:?}", w.labels());
+    // Applying now leaves H as it was.
+    w.apply("Terapkan");
+    let s = w.sim();
+    assert_eq!(s.p().key(H, 9), 0x3A, "H hold");
+    assert_eq!(s.p().key(H, 10), 0x29, "H tap");
+}
