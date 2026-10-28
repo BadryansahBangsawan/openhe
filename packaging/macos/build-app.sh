@@ -39,9 +39,9 @@ VERSION="${VERSION:-0.1.0}"
 
 if [ "$BUILD" -eq 1 ]; then
     if [ -n "${CARGO_TARGET:-}" ]; then
-        cargo build --release -p openhe-app --target "$CARGO_TARGET"
+        cargo build --locked --release -p openhe-app --target "$CARGO_TARGET"
     else
-        cargo build --release -p openhe-app
+        cargo build --locked --release -p openhe-app
     fi
 fi
 

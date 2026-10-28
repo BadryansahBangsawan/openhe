@@ -7,6 +7,7 @@
 # Env:    OPENHE_VERSION   version string (default: version of crates/openhe-app)
 #         LINUXDEPLOY      path to a linuxdeploy binary (default: `linuxdeploy` on PATH,
 #                          else downloaded to dist/tools/ from the linuxdeploy GitHub releases)
+#         LINUXDEPLOY_VERSION  linuxdeploy release tag to download (default: continuous, see TODO below)
 #
 # udev: an AppImage cannot install files outside itself, so the udev rule is NOT applied by this script.
 # Users install packaging/linux/70-openhe.rules once (see packaging/linux/README.md). The rule is also
@@ -19,7 +20,7 @@ for arg in "$@"; do
     case "$arg" in
         --skip-build) BUILD=0 ;;
         -h | --help)
-            sed -n '2,13p' "$0"
+            sed -n '2,15p' "$0"
             exit 0
             ;;
         *)
@@ -39,7 +40,7 @@ fi
 VERSION="${VERSION:-0.1.0}"
 
 if [ "$BUILD" -eq 1 ]; then
-    cargo build --release -p openhe-app
+    cargo build --locked --release -p openhe-app
 fi
 
 BIN="target/release/openhe-app"
@@ -55,6 +56,10 @@ mkdir -p "$OUT" "$APPDIR/usr/share/openhe"
 cp packaging/linux/70-openhe.rules "$APPDIR/usr/share/openhe/70-openhe.rules"
 
 # linuxdeploy: PATH, $LINUXDEPLOY, or download.
+# TODO: pin LINUXDEPLOY_VERSION to a dated release tag from
+# https://github.com/linuxdeploy/linuxdeploy/releases (not looked up offline, so `continuous` stays for now)
+# and verify the downloaded file's SHA-256 against a value recorded here before running it.
+LINUXDEPLOY_VERSION="${LINUXDEPLOY_VERSION:-continuous}"
 LD="${LINUXDEPLOY:-}"
 if [ -z "$LD" ]; then
     if command -v linuxdeploy > /dev/null 2>&1; then
@@ -64,7 +69,7 @@ if [ -z "$LD" ]; then
         LD="dist/tools/linuxdeploy-x86_64.AppImage"
         if [ ! -x "$LD" ]; then
             curl -fsSL -o "$LD" \
-                "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+                "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/linuxdeploy-x86_64.AppImage"
             chmod +x "$LD"
         fi
     fi

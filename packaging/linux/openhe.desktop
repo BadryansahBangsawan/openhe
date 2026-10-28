@@ -7,6 +7,6 @@ Comment[id]=Atur keyboard AULA WIN 68 HE MAX dan WIN 60 HE MAX
 Exec=openhe-app
 Icon=openhe
 Terminal=false
-Categories=Utility;HardwareSettings;
+Categories=Settings;HardwareSettings;Utility;
 Keywords=keyboard;aula;hall;rapid trigger;actuation;
 StartupWMClass=openhe-app

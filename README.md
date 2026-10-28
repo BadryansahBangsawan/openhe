@@ -11,11 +11,17 @@
 
 # OpenHE (Bahasa Indonesia)
 
-OpenHE adalah aplikasi desktop native, ringan, dan open source untuk mengatur keyboard Hall-effect
-**AULA WIN 68 HE MAX** dan **AULA WIN 60 HE MAX**. Ditulis dengan Rust, berjalan di Windows, Linux, dan macOS,
-bicara langsung ke keyboard lewat USB. Tanpa browser, tanpa akun, tanpa internet.
+OpenHE adalah proyek aplikasi desktop native, ringan, dan open source untuk mengatur keyboard Hall-effect
+**AULA WIN 68 HE MAX** dan **AULA WIN 60 HE MAX**. Ditulis dengan Rust, ditargetkan untuk Windows, Linux, dan
+macOS, bicara langsung ke keyboard lewat USB. Tanpa browser, tanpa akun, tanpa internet.
 
 OpenHE tidak berafiliasi dengan AULA.
+
+> **Status: dalam pengembangan.**
+> - Alat CLI `openhe` sudah berfungsi. Perintah baca-saja (`list`, `info`, `dump`) sudah diverifikasi pada
+>   satu AULA WIN 68 HE MAX sungguhan, dan satu penulisan (`set-actuation`) sudah diverifikasi dan dipulihkan.
+> - Aplikasi GUI (`openhe-app`) sedang dibangun. Halaman-halamannya belum selesai.
+> - Belum ada rilis yang dipublikasikan, dan fitur tulis lainnya belum diuji di perangkat keras.
 
 ## Keyboard yang didukung
 
@@ -24,9 +30,10 @@ OpenHE tidak berafiliasi dengan AULA.
 | AULA WIN 68 HE MAX | `0x1CA2` | `0x1901` |
 | AULA WIN 60 HE MAX | `0x1CA2` | `0x1902` |
 
-## Fitur
+## Fitur (rencana, belum semuanya tersedia)
 
-Semua fitur AULA HUB, kecuali update firmware:
+Targetnya semua fitur AULA HUB kecuali update firmware. Hari ini hanya CLI (lihat di bawah) yang berfungsi;
+sisanya sedang dikerjakan di GUI:
 
 - Performa: titik aktuasi per tombol, rapid trigger (sensitivitas tekan/lepas), deadzone atas dan bawah, tampilan kedalaman tombol langsung
 - Tombol lanjutan: DKS, MT, TGL, MPT, SOCD, END
@@ -37,15 +44,22 @@ Semua fitur AULA HUB, kecuali update firmware:
 - Kalibrasi, reset pabrik (dengan konfirmasi ketik)
 - Ekspor/impor profil ke JSON, pergantian profil otomatis per aplikasi, jalan saat login
 
-Antarmuka berbahasa Indonesia.
+Antarmuka GUI direncanakan berbahasa Indonesia.
 
 ## Instalasi
 
-Unduh versi terbaru dari halaman Releases.
+Rilis belum dipublikasikan. Setelah rilis tersedia di halaman Releases, langkah di bawah berlaku. Sampai saat
+itu, bangun dari source (bagian berikutnya).
 
 **macOS** (11 atau lebih baru): unduh `OpenHE-<versi>-macos-arm64.zip`, buka zip, seret `OpenHE.app` ke
-Applications. Aplikasi hanya ditandatangani ad-hoc. Saat pertama dibuka, klik kanan lalu pilih Buka. Jika
-keyboard tidak terdeteksi, izinkan OpenHE di System Settings, Privacy & Security, Input Monitoring.
+Applications. Aplikasi hanya ditandatangani ad-hoc, jadi Gatekeeper akan memblokir saat pertama dibuka:
+- macOS 14 atau lebih lama: klik kanan `OpenHE.app`, pilih Buka, lalu Buka lagi.
+- macOS 15 atau lebih baru: buka aplikasi sekali (akan ditolak), lalu buka System Settings, Privacy & Security,
+  gulir ke bawah, dan klik "Open Anyway" untuk OpenHE.
+
+Jika keyboard tidak terdeteksi, sebagai langkah pemecahan masalah yang belum terkonfirmasi, coba izinkan
+OpenHE di System Settings, Privacy & Security, Input Monitoring. Catatan protokol menduga izin ini
+kemungkinan besar tidak diperlukan.
 
 **Windows**: unduh `OpenHE-<versi>-windows-x86_64.exe` dan jalankan. Tidak perlu driver atau installer.
 Karena belum ditandatangani, SmartScreen bisa muncul: pilih More info, lalu Run anyway.
@@ -59,11 +73,12 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-Cabut dan colok lagi keyboard. Detail ada di [`packaging/linux/README.md`](packaging/linux/README.md).
+Aturan udev ini juga diperlukan untuk menjalankan CLI hasil build dari source di Linux. Cabut dan colok lagi keyboard. Detail ada di [`packaging/linux/README.md`](packaging/linux/README.md).
 
 ## Build dari source
 
-Butuh Rust stable (1.85 atau lebih baru).
+Butuh Rust stable (1.85 atau lebih baru). Crate `openhe-app` masih dalam pengerjaan; yang sudah ada saat ini
+adalah `openhe-cli`.
 
 ```sh
 git clone <repository-url> openhe
@@ -104,11 +119,12 @@ satu-satunya perintah yang menulis ke keyboard.
 
 - **Update firmware di luar cakupan.** OpenHE tidak pernah mengirim perintah bootloader atau flash.
   Gunakan alat resmi AULA untuk itu.
-- OpenHE menulis pengaturan ke keyboard. Setiap penulisan dibaca ulang untuk verifikasi. Jika gagal, aplikasi
-  membaca ulang keadaan keyboard dan tidak memercayai cache-nya.
+- OpenHE menulis pengaturan ke keyboard. Desainnya: setiap penulisan dibaca ulang untuk verifikasi, dan jika
+  gagal, aplikasi membaca ulang keadaan keyboard dan tidak memercayai cache-nya.
 - Ekspor profil Anda ke JSON sebelum mencoba pengaturan besar. Reset pabrik meminta Anda mengetik `RESET`.
-- Protokol diteliti dari analisis statis aplikasi AULA HUB dan diuji pada keyboard sungguhan, tetapi OpenHE
-  proyek komunitas tanpa jaminan. Pakai dengan risiko sendiri.
+- Protokol diteliti dari analisis statis aplikasi AULA HUB. Sejauh ini baru perintah baca-saja dan satu
+  penulisan aktuasi yang diverifikasi dan dipulihkan pada satu WIN 68 HE MAX; sisanya belum diuji di
+  perangkat keras. OpenHE proyek komunitas tanpa jaminan. Pakai dengan risiko sendiri.
 
 ## Lisensi
 
@@ -120,11 +136,18 @@ satu-satunya perintah yang menulis ke keyboard.
 
 # OpenHE (English)
 
-OpenHE is a lightweight, native, open-source desktop app for configuring the **AULA WIN 68 HE MAX** and
-**AULA WIN 60 HE MAX** Hall-effect keyboards. It is written in Rust, runs on Windows, Linux and macOS, and
-talks to the keyboard directly over USB. No browser, no account, no internet connection.
+OpenHE is a project to build a lightweight, native, open-source desktop app for configuring the
+**AULA WIN 68 HE MAX** and **AULA WIN 60 HE MAX** Hall-effect keyboards. It is written in Rust, targets
+Windows, Linux and macOS, and talks to the keyboard directly over USB. No browser, no account, no internet
+connection.
 
 OpenHE is not affiliated with AULA.
+
+> **Status: in development.**
+> - The `openhe` CLI works today. Its read-only commands (`list`, `info`, `dump`) have been verified on one
+>   real WIN 68 HE MAX, and one write (`set-actuation`) has been verified and restored.
+> - The GUI app (`openhe-app`) is under construction. Its pages are not finished.
+> - No release has been published yet, and the other write features have not been tested on hardware.
 
 ## Supported keyboards
 
@@ -133,9 +156,10 @@ OpenHE is not affiliated with AULA.
 | AULA WIN 68 HE MAX | `0x1CA2` | `0x1901` |
 | AULA WIN 60 HE MAX | `0x1CA2` | `0x1902` |
 
-## Features
+## Features (planned, not all available yet)
 
-Everything in AULA HUB except firmware update:
+The goal is everything in AULA HUB except firmware update. Today only the CLI (see below) works; the rest is
+being built in the GUI:
 
 - Performance: per-key actuation point, rapid trigger (press/release sensitivity), top and bottom deadzones, live key-depth view
 - Advanced keys: DKS, MT, TGL, MPT, SOCD, END
@@ -146,15 +170,21 @@ Everything in AULA HUB except firmware update:
 - Calibration and factory reset (with a typed confirmation)
 - Profile import/export as JSON, automatic per-app profile switching, launch at login
 
-The interface is in Indonesian.
+The GUI is planned to be in Indonesian.
 
 ## Install
 
-Download the latest build from the Releases page.
+No release has been published yet. Once releases are published on the Releases page, the steps below
+apply. Until then, build from source (next section).
 
 **macOS** (11 or newer): download `OpenHE-<version>-macos-arm64.zip`, unzip it and drag `OpenHE.app` to
-Applications. The app is only ad-hoc signed, so on first launch right-click it and choose Open. If the
-keyboard is not detected, allow OpenHE in System Settings, Privacy & Security, Input Monitoring.
+Applications. The app is only ad-hoc signed, so Gatekeeper blocks it on first launch:
+- macOS 14 or older: right-click `OpenHE.app`, choose Open, then Open again.
+- macOS 15 or newer: try to open the app once (it is refused), then go to System Settings, Privacy & Security,
+  scroll down and click "Open Anyway" for OpenHE.
+
+If the keyboard is not detected, an unconfirmed troubleshooting step is to allow OpenHE in System Settings,
+Privacy & Security, Input Monitoring. The protocol notes suggest this permission is probably not needed.
 
 **Windows**: download `OpenHE-<version>-windows-x86_64.exe` and run it. No driver or installer needed. It is
 not code-signed yet, so SmartScreen may warn: choose More info, then Run anyway.
@@ -168,11 +198,12 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-Then unplug and replug the keyboard. More in [`packaging/linux/README.md`](packaging/linux/README.md).
+The rule is also needed to run a CLI built from source on Linux. Then unplug and replug the keyboard. More in [`packaging/linux/README.md`](packaging/linux/README.md).
 
 ## Build from source
 
-You need stable Rust (1.85 or newer).
+You need stable Rust (1.85 or newer). The `openhe-app` crate is still being built; what exists today is
+`openhe-cli`.
 
 ```sh
 git clone <repository-url> openhe
@@ -213,11 +244,13 @@ command that writes to the keyboard.
 
 - **Firmware updates are out of scope.** OpenHE never sends bootloader or flash commands. Use AULA's
   official tool for that.
-- OpenHE writes settings to your keyboard. Every write is read back and verified. After a failed write the
-  app re-reads the keyboard and does not trust its cache.
+- OpenHE writes settings to your keyboard. By design every write is read back and verified, and after a failed
+  write the app re-reads the keyboard and does not trust its cache.
 - Export your profile to JSON before trying large changes. Factory reset asks you to type `RESET`.
-- The protocol was worked out from a static read of the AULA HUB app and checked on real hardware, but
-  OpenHE is a community project with no warranty. Use it at your own risk.
+- The protocol was worked out from a static read of the AULA HUB app. So far only the read-only commands and
+  one actuation write (verified and restored) have been tested on a single WIN 68 HE MAX; the other write
+  features have not been tested on hardware. OpenHE is a community project with no warranty. Use it at your
+  own risk.
 
 ## Docs
 

@@ -61,7 +61,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release -p openhe-app
+        run: cargo build --locked --release -p openhe-app
       - name: Collect executable
         shell: bash
         run: |
