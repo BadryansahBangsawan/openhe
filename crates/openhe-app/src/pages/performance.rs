@@ -364,7 +364,7 @@ impl Page {
         self.pending = None;
         let fx = apply_effects(result);
         if !fx.patch.is_empty() {
-            let fresh = fx.patch;
+            let fresh = fx.patch.clone();
             ctx.worker.patch_snapshot(move |s| {
                 for (k, v) in fresh {
                     s.keys.insert(k, v);
@@ -380,9 +380,33 @@ impl Page {
         if fx.applied {
             self.touched = Touched::default();
             self.clamped = false;
-            self.loaded_from = None; // reload the form from the device
+            self.reload_form(ctx, &fx.patch);
         }
         // On failure the edits stay, so "Coba lagi" resends the same change.
+    }
+
+    /// After a write: loads the form from the values just read back.
+    ///
+    /// `ctx.snapshot` is this frame's copy, taken before the patch above
+    /// reached the worker, while the generation already counts the patch.
+    /// Reloading from that copy (as `sync_form` would) showed the values
+    /// from before the write and then never reloaded, so the fresh values
+    /// are applied to it first. The selection stays the same, so the
+    /// "Tersimpan di keyboard" status stays too.
+    fn reload_form(&mut self, ctx: &AppCtx, fresh: &[(u8, KeySettings)]) {
+        let Some(snap) = ctx.snapshot else {
+            self.loaded_from = None;
+            return;
+        };
+        let mut snap = snap.clone();
+        for &(k, v) in fresh {
+            snap.keys.insert(k, v);
+        }
+        let codes = self.selection.codes_in(&snap.matrix);
+        if let Some(f) = Form::from_keys(&codes, &snap) {
+            self.form = f;
+        }
+        self.loaded_from = Some((self.selection.as_set().clone(), ctx.worker.generation()));
     }
 
     /// Reloads the form when the selection or the device data changed and
