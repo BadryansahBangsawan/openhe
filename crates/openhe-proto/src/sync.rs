@@ -8,6 +8,8 @@ pub struct DeviceInfo {
     pub in_bootloader: bool,
     pub serial: String,
     pub firmware: String,
+    /// On FW App V1.1.3 real hardware this appears truncated or garbled
+    /// (e.g. "Nov 14 5025"); treat it as informational only.
     pub build_date: String,
 }
 

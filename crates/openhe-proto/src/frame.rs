@@ -110,10 +110,12 @@ impl Response {
     }
 
     /// Diagnostic only; replies are never rejected on a checksum mismatch.
+    /// Hardware shows the checksum covers the reply's own CMD byte
+    /// (`raw[2]`, i.e. with the 0x80 bit set).
     pub fn checksum_ok(&self) -> bool {
         let body = self.body();
         let n = body.len().min(MAX_PAYLOAD);
-        checksum(self.len, self.cmd, &body[..n]) == self.raw[3]
+        checksum(self.len, self.raw[2], &body[..n]) == self.raw[3]
     }
 }
 
@@ -248,7 +250,7 @@ mod tests {
     #[test]
     fn checksum_ok_diagnostic() {
         let mut raw = reply(0x81, &[7, 8]);
-        raw[3] = checksum(2, 0x01, &[7, 8]);
+        raw[3] = checksum(2, 0x81, &[7, 8]); // real replies checksum their own CMD|0x80
         assert!(Response::decode(&raw).unwrap().checksum_ok());
         raw[3] ^= 1;
         assert!(!Response::decode(&raw).unwrap().checksum_ok());

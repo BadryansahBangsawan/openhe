@@ -574,15 +574,23 @@ The matrix is **6 rows × 21 columns** (the name "RM6X21" says the same). A 0 me
 | WIN 68 | export `b` (const `o`) | 68 | 15 / 15 / 14 / 14 / 10 |
 | WIN 60 | export `a` (const `l`) | 61 | 14 / 14 / 13 / 12 / 8 |
 
-The legends are not stored in the app; they come from the device's default codes. A conventional 68% layout is [I], so read DEFKEY once to be certain:
+The legends are not stored in the app; they come from the device's default codes. Real WIN 68 HE MAX matrix, read from hardware (FW App V1.1.3; see 7.x). Matrix row 0 is empty, so the drawn rows map to matrix rows 1..5, and the right-hand column is Ins / Del / PgUp / PgDn (not an "extra key" per row):
 
 ```
-R0: Esc 1 2 3 4 5 6 7 8 9 0 - = Backspace(2u) [extra key]
-R1: Tab(1.5u) Q W E R T Y U I O P [ ] \(1.5u) [extra key]
-R2: Caps(1.75u) A S D F G H J K L ; ' Enter(2.25u) [extra key]
-R3: LShift(2.25u) Z X C V B N M , . / RShift(1.75u) Up [extra key]
-R4: LCtrl LWin LAlt Space(6.25u) [RAlt] [Fn] [RCtrl?] Left Down Right
+matrix row 0: (all 00, no keys)
+row 1: 29 1E 1F 20 21 22 23 24 25 26 27 2D 2E 2A 49
+       Esc 1 2 3 4 5 6 7 8 9 0 - = Backspace Insert
+row 2: 2B 14 1A 08 15 17 1C 18 0C 12 13 2F 30 31 4C
+       Tab Q W E R T Y U I O P [ ] \ Delete
+row 3: 39 04 16 07 09 0A 0B 0D 0E 0F 33 34 00 28 4B
+       Caps A S D F G H J K L ; ' (col 12 empty) Enter PgUp
+row 4: E1 00 1D 1B 06 19 05 11 10 36 37 38 E5 52 4E
+       LShift (col 1 empty) Z X C V B N M , . / RShift Up PgDn
+row 5: E0 E3 E2 00 00 00 2C 00 00 E6 01 E4 50 51 4F
+       LCtrl LWin LAlt (3 empty) Space (2 empty) RAlt Fn RCtrl Left Down Right
 ```
+
+Fn = 0x01, RAlt = 0xE6, RCtrl = 0xE4. Columns are unfiltered matrix columns; empty cells are 00.
 
 ### 4.2 Switch (axis) tables [C]
 
@@ -760,18 +768,38 @@ The consumer keys are "0x1000 + consumer usage" [I].
 Suggested safe probes are GETs only: SYNC, DEFKEY, KEY GET, PRGB GET, 0x00 queries 0x21/0x50/0x70/0x25/0x01/0x26. Avoid SET, 0x0C/0x0D, 0x11 and every BL_* command until verified.
 
 1. **Response header byte 0, and the status-byte semantics.** What is R[0] on success, and what is the 0xFF FAIL format?
+   - RESOLVED: R[0] is 0x00 on every reply seen (7.x finding 4). The 0xFF FAIL format was not observed.
 2. **Do all responses use CMD|0x80?** It is confirmed only for five commands.
+   - RESOLVED for the commands probed: SYNC replies 0x81, order (0x00) replies 0x80, KEY 0xA3, DEFKEY 0xAB (finding 2).
 3. **Response layout of CMD 0x00 sub-commands.** `mn()` assumes R[1]=TYPE and R[2]=value. Verify this against a real reply.
+   - RESOLVED: LEN 4, body = [00, TYPE, value, FF] (finding 5).
 4. **RM6X21 multi-report framing.** Do continuation reports really carry no header? Which matrix rows are covered by PART 1 vs 2? What do SUB 3 status bytes mean? Units of SUB 6 calibration data.
 5. **The actual DEFKEY matrix** (key legends per (row, col)) and the code used for the Fn key, for both MAX models.
+   - RESOLVED for WIN 68 HE MAX: see 4.1 and finding 8. The WIN 60 matrix is still unread.
 6. **Firmware precision.** What does PRECISION_STROKE report? Is 0.001 mm actuation and RT resolution honoured (the UI allows it), or is 0.01 effective?
 7. **Win vs Mac tables.** Are the Fn0–Fn3 tables separate per Win/Mac mode? Why does the perf page send SET_MAC/WIN without an argument while `switchSystemMode` sends `[1]`?
 8. **Macro storage.** Can several keys hold different macros, given that the app always writes at addr 256 with id 0? What is the maximum macro length?
 9. **Advanced-key semantics.** MT binding order (hold vs tap). The meaning of the TGL delay. SOCD delay units. DKS phase semantics.
 10. **Polling rate change.** Does it re-enumerate, and how long until the device is usable again?
 11. **Firmware version string format** returned by SYNC. It affects the SOCD packet format choice.
+   - RESOLVED: firmware string is `App V1.1.3` (finding 6), so the new SOCD format (>= 1.0.7) applies.
 12. **RGBNACK (0x47).** Its exact meaning, and whether it is needed before PRGB GET.
 13. **Logo/side light.** Does the WIN 68 HE MAX hardware have a light that LOGORGB 0x19 controls?
 14. **Persistence.** Are settings saved to flash immediately, given that SAVING_PARAMETER 0x02 is never used? KRGB needs the explicit 0xFE commit.
 15. **Bootloader re-enumeration.** Does the bootloader appear with the same VID/PID/usage page? The official updater exe flow is not in this app.
 16. **macOS permissions.** Whether macOS needs Input Monitoring permission to open the 0xFFA0 interface with hidapi. It probably does not, since this is a vendor usage page.
+
+### 7.x Hardware findings (WIN 68 HE MAX, FW App V1.1.3)
+
+Read-only capture over USB on macOS with `openhe --trace info` and `openhe --trace dump --json` (exit 0, 68 keys, 0 read errors). Raw files are in `docs/protocol/captures/` (serial redacted; the redaction rewrote the serial bytes in the SYNC reply, so that one reply's checksum no longer matches).
+
+1. Reply byte 0 is 0x5C, the same magic as requests.
+2. Replies use CMD|0x80: SYNC 0x81, order 0x80, KEY 0xA3, DEFKEY 0xAB.
+3. The reply checksum uses the same formula with the reply's own CMD byte. Example `5C 04 80 14 00 21 01 FF`: (0x35+0x5C+4+0x80+0xFF)&0xFF = 0x14.
+4. R[0] (status) is 0x00 on every reply seen.
+5. Order replies: LEN 4, body = [00, TYPE, value, FF]. QueryWinMode = 1 (Windows mode), Profile = 0, Polling = 0 (8000 Hz).
+6. SYNC reply LEN 0x3C. Body is length-prefixed slots: R[8]=0x10 then the serial R[9..25] (16 ASCII digits); R[25]=0x10 then R[26..42] = "App V1.1.3", NUL NUL, "16:0"; R[42]=0x10 then R[43..] = "Nov 14 5025" followed by binary. The build date looks garbled or truncated (the string probably runs past the 64-byte report); do not rely on it.
+7. KEY GET reply: LEN 0x39, body = [00, key, layout, lo, hi, then filler entries FF FF FF 00 ...].
+8. DEFKEY matrix is 6x21 with row 0 empty; the real keys are in rows 1..5 (see 4.1). Right-hand column is Insert 49 / Delete 4C / PgUp 4B / PgDn 4E; arrows 52/50/51/4F; Fn 01; RAlt E6; RCtrl E4.
+9. Factory defaults for all 68 keys: touch Global, advanced None, actuation 2.000 mm, RT press 0.020 mm, RT release 0.020 mm, top deadzone 0.200 mm, bottom deadzone 0.200 mm, switch 0 (Wing Chun).
+10. Two HID entries on usage page 0xFFA0 share one path (usages 1 and 2); selecting usage 1 opens the right one.
