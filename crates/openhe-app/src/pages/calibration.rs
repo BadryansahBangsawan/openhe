@@ -26,7 +26,7 @@ use crate::i18n;
 use crate::theme::{color, font, line, size};
 use crate::widgets::card::{self, Card};
 use crate::widgets::keyboard::{
-    legend_list, reference_matrix, KeyDecoration, KeyboardView, Selection,
+    legend_list, reference_matrix, KeyDecoration, KeyboardView, Label2, Selection,
 };
 use crate::widgets::slider_mm::mm_short;
 use crate::worker::{DeviceSnapshot, Pending, Worker};
@@ -932,7 +932,7 @@ fn decorate(p: &Progress, code: u8, active: bool, counting: bool) -> KeyDecorati
     }
     if p.done.contains(&code) {
         return KeyDecoration {
-            label2: Some("✔".into()),
+            label2: Some(Label2::colored("✔", color::SUCCESS)),
             fill: Some(color::SUCCESS.gamma_multiply(0.10)),
             stroke: Some(color::SUCCESS.gamma_multiply(0.6)),
             badge: None,

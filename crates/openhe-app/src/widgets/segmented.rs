@@ -67,12 +67,18 @@ impl<'a, T: PartialEq + Copy> Segmented<'a, T> {
         let galleys: Vec<_> = self
             .options
             .iter()
-            .map(|(_, label)| {
+            .map(|(value, label)| {
+                // The selected option is bold, as in the mockups.
+                let font = if *value == *current {
+                    font::bold(font::body().size)
+                } else {
+                    font::body()
+                };
                 WidgetText::from(*label).into_galley(
                     ui,
                     Some(egui::TextWrapMode::Extend),
                     f32::INFINITY,
-                    egui::FontSelection::FontId(font::body()),
+                    egui::FontSelection::FontId(font),
                 )
             })
             .collect();
