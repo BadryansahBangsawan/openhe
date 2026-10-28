@@ -186,3 +186,13 @@ pub mod perf {
     pub const RT_SUMMARY: &str = "RT: lepas setelah naik";
     pub const RT_SUMMARY_PRESS: &str = "tekan lagi setelah turun";
 }
+
+/// Shell texts for keyboard events, the interactive top bar, and the
+/// background profile switcher (Track F).
+pub mod events {
+    pub const PROFILE_SWITCH_FAILED: &str = "Gagal mengganti profil.";
+    pub const MODE_SWITCH_FAILED: &str = "Gagal mengganti mode Win/Mac.";
+    pub const LOCKED_CALIBRATING: &str = "Hentikan kalibrasi dulu";
+    pub const AUTO_SWITCHED: &str = "Profil diganti otomatis untuk";
+    pub const AUTO_SWITCH_FAILED: &str = "Ganti profil otomatis gagal.";
+}

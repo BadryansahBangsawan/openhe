@@ -2,11 +2,12 @@
 
 use crate::i18n;
 use crate::pages;
+use crate::pages::settings::{apply_switch_effects, switch_effects, SwitchOutcome};
 use crate::storage::{AppData, LoadNotice};
 use crate::theme::{self, color, font, line, size, Theme};
 use crate::widgets::card::Card;
 use crate::widgets::segmented::Segmented;
-use crate::worker::{ConnectionStatus, DeviceSnapshot, Worker, WorkerNotice, LOAD_LABEL};
+use crate::worker::{ConnectionStatus, DeviceSnapshot, Pending, Worker, WorkerNotice, LOAD_LABEL};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Mesh, Pos2, Rect, RichText,
     Sense, Ui,
@@ -130,6 +131,23 @@ pub struct OpenHeApp {
     lighting: pages::lighting::Page,
     calibration: pages::calibration::Page,
     settings: pages::settings::Page,
+    /// A profile or Win/Mac switch started from the top bar.
+    switch: Option<TopbarSwitch>,
+    /// An error from the top bar, shown as a dismissable notice.
+    shell_error: Option<(String, Option<String>)>,
+}
+
+/// A running top-bar switch and the value it asked for (shown meanwhile).
+struct TopbarSwitch {
+    pending: Pending<SwitchOutcome>,
+    kind: TopbarAction,
+}
+
+/// What the user picked in the top bar this frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TopbarAction {
+    pub profile: Option<u8>,
+    pub mode: Option<SystemMode>,
 }
 
 impl OpenHeApp {
@@ -162,6 +180,8 @@ impl OpenHeApp {
             lighting: Default::default(),
             calibration: Default::default(),
             settings: Default::default(),
+            switch: None,
+            shell_error: None,
         }
     }
 }
@@ -169,6 +189,18 @@ impl OpenHeApp {
 impl eframe::App for OpenHeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.draw(ctx);
+    }
+
+    /// Never leave the keyboard in calibration mode (it types nothing
+    /// there): stop it and give the stop a moment to go out. The worker's
+    /// calibration guard sends it too if this does not finish in time.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(mut stop) = self.calibration.leave(&self.worker) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+            while stop.poll().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 }
 
@@ -178,7 +210,51 @@ impl OpenHeApp {
     }
 
     pub fn set_page(&mut self, page: PageId) {
+        self.change_page(page);
+    }
+
+    /// Switches pages; leaving Kalibrasi always stops a running calibration.
+    fn change_page(&mut self, page: PageId) {
+        if self.page == PageId::Calibration && page != PageId::Calibration {
+            let _ = self.calibration.leave(&self.worker);
+        }
         self.page = page;
+    }
+
+    /// Polls the top-bar switch job and starts a new one if asked.
+    fn run_topbar(&mut self, action: TopbarAction) {
+        if let Some(sw) = self.switch.as_mut() {
+            if let Some(result) = sw.pending.poll() {
+                let failed = if sw.kind.profile.is_some() {
+                    i18n::events::PROFILE_SWITCH_FAILED
+                } else {
+                    i18n::events::MODE_SWITCH_FAILED
+                };
+                self.shell_error =
+                    apply_switch_effects(&self.worker, switch_effects(result, failed));
+                self.switch = None;
+            }
+        }
+        if self.switch.is_some() {
+            return;
+        }
+        if let Some(idx) = action.profile {
+            self.shell_error = None;
+            self.switch = Some(TopbarSwitch {
+                pending: self.worker.submit("set-profile", move |kb| {
+                    pages::settings::profile_job(kb, idx)
+                }),
+                kind: action,
+            });
+        } else if let Some(mode) = action.mode {
+            self.shell_error = None;
+            self.switch = Some(TopbarSwitch {
+                pending: self.worker.submit("set-system-mode", move |kb| {
+                    pages::settings::system_mode_job(kb, mode)
+                }),
+                kind: action,
+            });
+        }
     }
 
     /// One frame of the whole window.
@@ -197,6 +273,10 @@ impl OpenHeApp {
         };
         let busy = self.worker.is_busy();
         let loading = self.worker.current_job() == Some(LOAD_LABEL);
+        // Drop the top-bar switch state on disconnect (its job fails with
+        // Disconnected and is polled below).
+        self.run_topbar(TopbarAction::default());
+        let calibrating = self.calibration.is_active();
         if busy || snapshot.is_none() {
             // Keep polling pending jobs and the connection state.
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -212,10 +292,15 @@ impl OpenHeApp {
                     .inner_margin(Margin::symmetric(16, 20)),
             )
             .show(ctx, |ui| {
-                sidebar(ui, &mut self.page, &status, loading);
-            })
-            .response
-            .rect;
+                let mut page = self.page;
+                sidebar(ui, &mut page, &status, loading);
+                page
+            });
+        let next_page = side.inner;
+        let side = side.response.rect;
+        if next_page != self.page {
+            self.change_page(next_page);
+        }
 
         let top = egui::TopBottomPanel::top("topbar")
             .exact_height(size::TOPBAR)
@@ -226,10 +311,28 @@ impl OpenHeApp {
                     .inner_margin(Margin::symmetric(size::PAGE_MARGIN as i8, 0)),
             )
             .show(ctx, |ui| {
-                topbar(ui, self.page, snapshot, &self.data.borrow());
-            })
-            .response
-            .rect;
+                let shown = self.switch.as_ref().map(|s| s.kind);
+                let lock = if calibrating {
+                    Some(i18n::events::LOCKED_CALIBRATING)
+                } else {
+                    None
+                };
+                let enabled = !busy && !calibrating;
+                topbar(
+                    ui,
+                    self.page,
+                    snapshot,
+                    &self.data.borrow(),
+                    TopbarState {
+                        enabled,
+                        lock,
+                        shown,
+                    },
+                )
+            });
+        let action = top.inner;
+        let top = top.response.rect;
+        self.run_topbar(action);
         // Rules between sidebar and content, and under the top bar.
         let rules = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Middle,
@@ -244,7 +347,7 @@ impl OpenHeApp {
         );
 
         let worker_notice = snapshot.and(self.worker.notice());
-        if worker_notice.is_some() || self.data_notice.is_some() {
+        if worker_notice.is_some() || self.data_notice.is_some() || self.shell_error.is_some() {
             egui::TopBottomPanel::top("notices")
                 .show_separator_line(false)
                 .frame(Frame::new().fill(color::BG).inner_margin(Margin {
@@ -274,6 +377,11 @@ impl OpenHeApp {
                     if let Some(n) = &self.data_notice {
                         if notice_bar(ui, &data_notice_text(n), i18n::common::DISMISS, true) {
                             self.data_notice = None;
+                        }
+                    }
+                    if let Some((text, _)) = &self.shell_error {
+                        if notice_bar(ui, text, i18n::common::DISMISS, true) {
+                            self.shell_error = None;
                         }
                     }
                 });
@@ -512,7 +620,26 @@ fn device_card_body(ui: &mut Ui, status: &ConnectionStatus, loading: bool) {
 
 // ------------------------------------------------------------------ top bar
 
-fn topbar(ui: &mut Ui, page: PageId, snapshot: Option<&DeviceSnapshot>, data: &AppData) {
+/// How the top bar's switches behave this frame.
+struct TopbarState {
+    /// Idle and allowed to write.
+    enabled: bool,
+    /// Why the switches are locked (shown on hover), if they are.
+    lock: Option<&'static str>,
+    /// A switch in progress: show its target instead of the snapshot.
+    shown: Option<TopbarAction>,
+}
+
+/// The page title, then the profile and Win/Mac switches (right-aligned).
+/// Returns what the user picked; the app runs it as a worker job.
+fn topbar(
+    ui: &mut Ui,
+    page: PageId,
+    snapshot: Option<&DeviceSnapshot>,
+    data: &AppData,
+    state: TopbarState,
+) -> TopbarAction {
+    let mut action = TopbarAction::default();
     ui.horizontal_centered(|ui| {
         ui.label(
             RichText::new(page.title())
@@ -525,16 +652,23 @@ fn topbar(ui: &mut Ui, page: PageId, snapshot: Option<&DeviceSnapshot>, data: &A
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let connected = snapshot.is_some();
-            let mut mode = snapshot.and_then(|s| s.system_mode);
+            let interactive = connected && state.enabled;
+            let shown = state.shown.unwrap_or_default();
+            let current_mode = snapshot.and_then(|s| s.system_mode);
+            let mut mode = shown.mode.map(Some).unwrap_or(current_mode);
             let modes = [
                 (Some(SystemMode::Mac), i18n::topbar::MAC),
                 (Some(SystemMode::Windows), i18n::topbar::WIN),
             ];
-            Segmented::new(&modes)
-                .read_only(true)
+            let mut seg = Segmented::new(&modes)
                 .enabled(connected)
-                .hover_text(i18n::topbar::READ_ONLY_HINT)
-                .show(ui, &mut mode);
+                .read_only(!interactive);
+            if let Some(h) = state.lock {
+                seg = seg.hover_text(h);
+            }
+            if seg.show(ui, &mut mode).changed() && mode != current_mode {
+                action.mode = mode;
+            }
             ui.add_space(12.0);
 
             let labels: Vec<String> = (0..4u8).map(|i| data.profile_label(i)).collect();
@@ -543,15 +677,21 @@ fn topbar(ui: &mut Ui, page: PageId, snapshot: Option<&DeviceSnapshot>, data: &A
                 .enumerate()
                 .map(|(i, l)| (i as u8, l.as_str()))
                 .collect();
-            let mut profile = snapshot.map_or(u8::MAX, |s| s.profile);
-            Segmented::new(&opts)
-                .read_only(true)
+            let current = snapshot.map_or(u8::MAX, |s| s.profile);
+            let mut profile = shown.profile.unwrap_or(current);
+            let mut seg = Segmented::new(&opts)
                 .enabled(connected)
-                .hover_text(i18n::topbar::READ_ONLY_HINT)
-                .show(ui, &mut profile);
+                .read_only(!interactive);
+            if let Some(h) = state.lock {
+                seg = seg.hover_text(h);
+            }
+            if seg.show(ui, &mut profile).changed() && profile != current {
+                action.profile = Some(profile);
+            }
             ui.label(RichText::new(i18n::topbar::PROFILE).color(color::MUTED));
         });
     });
+    action
 }
 
 // --------------------------------------------------------------------- logo
@@ -764,6 +904,34 @@ mod tests {
         })
         .join()
         .expect("bold without theme::apply");
+    }
+
+    #[test]
+    fn a_topbar_profile_switch_runs_a_job_and_reports_failure() {
+        let mut app = OpenHeApp::with_worker(offline_worker(), AppData::default());
+        app.run_topbar(TopbarAction {
+            profile: Some(2),
+            mode: None,
+        });
+        assert!(app.switch.is_some());
+        // A second pick while the first runs is ignored.
+        app.run_topbar(TopbarAction {
+            profile: None,
+            mode: Some(SystemMode::Mac),
+        });
+        assert_eq!(app.switch.as_ref().unwrap().kind.profile, Some(2));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.switch.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            app.run_topbar(TopbarAction::default());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The offline worker fails the job with Disconnected.
+        let (text, _) = app.shell_error.clone().unwrap();
+        assert!(
+            text.starts_with(i18n::events::PROFILE_SWITCH_FAILED),
+            "{text}"
+        );
     }
 
     #[test]

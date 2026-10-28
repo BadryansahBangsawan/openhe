@@ -14,4 +14,15 @@ impl Page {
     pub fn ui(&mut self, ctx: &AppCtx, ui: &mut egui::Ui) {
         super::coming_soon(ctx, ui, i18n::nav::CALIBRATION);
     }
+
+    /// Calibration is starting, running or stopping.
+    pub fn is_active(&self) -> bool {
+        false
+    }
+
+    /// Called when the user leaves the page or the app closes: stops a
+    /// running calibration. Returns the stop job, if one was sent.
+    pub fn leave(&mut self, _worker: &crate::worker::Worker) -> Option<crate::worker::Pending<()>> {
+        None
+    }
 }
