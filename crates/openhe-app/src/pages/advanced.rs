@@ -990,6 +990,8 @@ pub struct Page {
     /// An apply patched the snapshot this frame: skip the staleness checks
     /// once, the new snapshot arrives next frame.
     settle: bool,
+    /// Worker generation the cache was last checked against.
+    seen_generation: Option<u64>,
 }
 
 impl Page {
@@ -1100,6 +1102,24 @@ impl Page {
         self.applied = fx.applied;
     }
 
+    /// Drops everything read from the keyboard when the worker's
+    /// generation moved for any reason other than this page's own apply
+    /// (`settle`): a reload, an import, a keyboard event or another page's
+    /// write may have changed function parameters without changing the
+    /// Mode nibble, and the editor must never send stale parameters back.
+    /// The selection stays; the selected key is read again.
+    fn follow_generation(&mut self, generation: u64, settle: bool) {
+        let moved = self.seen_generation.is_some_and(|g| g != generation);
+        self.seen_generation = Some(generation);
+        if moved && !settle {
+            self.cache.clear();
+            self.read_failed.clear();
+            self.read_error = None;
+            self.editor = None;
+            self.picking_partner = false;
+        }
+    }
+
     fn sync(&mut self, ctx: &AppCtx) {
         let Some(snap) = ctx.snapshot else {
             self.cache.clear();
@@ -1139,6 +1159,7 @@ impl Page {
 
         // Drop what no longer matches the keyboard.
         let settle = std::mem::take(&mut self.settle);
+        self.follow_generation(ctx.worker.generation(), settle);
         self.cache.retain(|k, c| {
             settle
                 || snap
@@ -2738,6 +2759,34 @@ mod tests {
     }
 
     // ---- page, headless
+
+    #[test]
+    fn any_reload_drops_cached_configs_except_the_pages_own_apply() {
+        let mut page = Page::default();
+        let fill = |page: &mut Page| {
+            page.cache.insert(KEY, end_cfg());
+            page.key = Some(KEY);
+            page.editor = Some(Editor::new(KEY, &end_cfg()));
+            page.read_failed.insert(0x05);
+        };
+        fill(&mut page);
+        page.follow_generation(5, false); // first look: nothing to compare
+        assert!(page.cache.contains_key(&KEY));
+        page.follow_generation(5, false);
+        assert!(page.cache.contains_key(&KEY), "same generation");
+        // The page's own apply patched the snapshot: its fresh reads stay.
+        page.follow_generation(6, true);
+        assert!(page.cache.contains_key(&KEY));
+        assert!(page.editor.is_some());
+        // Anything else (a reload, an import, an event, another page's
+        // write): the cached parameters may be stale, so they are read
+        // again before the editor can send them back.
+        page.follow_generation(7, false);
+        assert!(page.cache.is_empty());
+        assert!(page.editor.is_none());
+        assert!(page.read_failed.is_empty());
+        assert_eq!(page.key, Some(KEY), "the selection stays");
+    }
 
     #[test]
     fn the_page_renders_connected_with_badges_and_an_editor() {
