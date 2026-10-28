@@ -189,6 +189,36 @@ fn export_modify_import_round_trip() {
 }
 
 #[test]
+fn import_across_win_and_mac_keeps_alt_and_win_in_place() {
+    // Exported in Mac mode: Base LAlt reads 0xE3 and LWin 0xE2.
+    let sim = Sim::new();
+    {
+        let mut s = sim.state();
+        let p = s.p_mut();
+        p.win = 0;
+        p.keys.insert((0xE2, 0), 0xE3);
+        p.keys.insert((0xE3, 0), 0xE2);
+    }
+    let mut w = World::with(sim, Default::default(), fast_config());
+    let keys: Vec<u8> = w.snapshot().matrix.keys().map(|(_, _, c)| c).collect();
+    let p = w.worker.submit("export", move |kb| export_job(kb, &keys));
+    let json = ProfileFile::from_data(&wait(&mut w, p).unwrap().data).to_json();
+    // Imported on a keyboard in Windows mode.
+    *w.sim().p_mut() = sim::Profile::factory();
+    w.worker.request_reload();
+    w.idle();
+    let data = ProfileFile::from_json(&json)
+        .and_then(|f| f.to_data())
+        .unwrap();
+    let plan = plan_import(&data, &w.snapshot()).unwrap();
+    let p = w.worker.submit("import", move |kb| import_job(kb, &plan));
+    assert!(wait(&mut w, p).unwrap().failed.is_empty());
+    let s = w.sim();
+    assert_eq!(s.p().key(0xE2, 0), 0xE2, "LAlt still Alt in Windows mode");
+    assert_eq!(s.p().key(0xE3, 0), 0xE3, "LWin still Win in Windows mode");
+}
+
+#[test]
 fn import_refuses_0x0001_on_base() {
     let mut w = World::new();
     let keys: Vec<u8> = w.snapshot().matrix.keys().map(|(_, _, c)| c).collect();

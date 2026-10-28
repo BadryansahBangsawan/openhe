@@ -34,6 +34,15 @@ const FN_KEY: u8 = 0x01;
 /// Layer code 0x0001: transparent on the Fn layers, a dead key on Base.
 const TRANSPARENT: u16 = 0x0001;
 
+/// LAlt (0xE2) and LWin (0xE3): their Base codes swap with Win/Mac mode.
+fn is_win_alt(key: u8) -> bool {
+    matches!(key, 0xE2 | 0xE3)
+}
+
+fn is_win_alt_code(code: u16) -> bool {
+    matches!(code, 0x00E2 | 0x00E3)
+}
+
 // ------------------------------------------------------------ device side
 
 /// One key as read from the keyboard.
@@ -714,6 +723,13 @@ pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPl
             }
             if layer == Layer::Base && code == TRANSPARENT {
                 return Err(FileError::TransparentOnBase(k.code));
+            }
+            // LAlt / LWin read as each other's code in Mac mode (finding
+            // 16): a Win/Alt code there depends on the OS mode the file was
+            // exported in, so it is left as this keyboard has it (as the
+            // remap reset does). Any other code on them is a real remap.
+            if layer == Layer::Base && is_win_alt(k.code) && is_win_alt_code(code) {
+                continue;
             }
             plan.layers.push((k.code, layer, code));
         }
