@@ -85,6 +85,22 @@ impl World {
     }
 
     pub fn click_nth(&mut self, label: &str, n: usize) {
+        // A panel may still be settling its height after the last input, so
+        // a node can move by a few points between frames; clicking where it
+        // was a frame ago can miss (seen on the Linux and Windows runners).
+        // Wait until its box is the same on two frames in a row.
+        let rect_of = |w: &World| {
+            w.h.query_all_by_label(label)
+                .nth(n)
+                .and_then(|x| x.accesskit_node().bounding_box())
+        };
+        for _ in 0..30 {
+            let a = rect_of(self);
+            self.frames(1);
+            if a.is_some() && a == rect_of(self) {
+                break;
+            }
+        }
         {
             let all: Vec<_> = self.h.query_all_by_label(label).collect();
             let Some(node) = all.get(n) else {
