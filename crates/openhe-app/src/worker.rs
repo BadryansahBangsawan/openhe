@@ -449,6 +449,12 @@ fn guarded<R>(f: impl FnOnce() -> Result<R, Error>) -> (Result<R, Error>, bool) 
 /// up to 3 × 1 s) plus the shutdown stop.
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
 
+/// How long the shutdown keeps trying to reopen a keyboard that dropped
+/// while the calibration guard was set, so it can send the stop. Short
+/// enough that a stop which then needs all its attempts (3 × 1 s) still
+/// fits in [`SHUTDOWN_WAIT`].
+const SHUTDOWN_RECONNECT: Duration = Duration::from_secs(3);
+
 /// Handle to the worker thread. Dropping it stops the thread after its
 /// current step. Normally it is not joined, so closing the window never
 /// waits on a slow keyboard; while the calibration guard is set it is
@@ -949,12 +955,13 @@ impl<T: Transport + 'static> Worker<T> {
 impl<T: Transport + 'static> Drop for Worker<T> {
     fn drop(&mut self) {
         self.ctl.stop.store(true, Ordering::SeqCst);
-        // Only an open keyboard can be calibrating.
-        if !self.ctl.calibrating.load(Ordering::SeqCst) || !self.is_connected() {
+        if !self.ctl.calibrating.load(Ordering::SeqCst) {
             return;
         }
         // The keyboard may be calibrating (it types nothing then): give the
-        // thread time to finish its job and send the stop.
+        // thread time to finish its job and send the stop. Also while
+        // disconnected: a transient error may have dropped the connection,
+        // and the shutdown reopens the keyboard to stop it.
         if let Some(h) = self.thread.take() {
             let deadline = Instant::now() + SHUTDOWN_WAIT;
             while !h.is_finished() && Instant::now() < deadline {
@@ -1084,11 +1091,38 @@ fn debounce_window(cfg: &WorkerConfig) -> Duration {
 
 /// The handle is gone: leave the keyboard usable (stop a calibration that
 /// may still be running) before the thread ends.
-fn shutdown<T: Transport>(ctl: &Control, kb: Option<&mut Keyboard<T>>) {
+///
+/// Without an open keyboard (the connection dropped, e.g. on a transient
+/// HID error, and the app closed before the reconnect) it keeps trying to
+/// reopen it for up to [`SHUTDOWN_RECONNECT`]; the stop goes out right
+/// after the handshake, so a keyboard in bootloader mode gets nothing.
+fn shutdown<T: Transport>(
+    ctl: &Control,
+    kb: Option<&mut Keyboard<T>>,
+    connect: &mut Connector<T>,
+    cfg: &WorkerConfig,
+) {
+    if !ctl.calibrating.load(Ordering::SeqCst) {
+        return;
+    }
     if let Some(k) = kb {
-        if ctl.calibrating.load(Ordering::SeqCst) {
-            let _ = guarded(|| k.stop_calibration());
+        let _ = guarded(|| k.stop_calibration());
+        return;
+    }
+    let deadline = Instant::now() + SHUTDOWN_RECONNECT;
+    loop {
+        let stopped = guarded(|| {
+            let mut k = connect()?;
+            k.handshake()?;
+            k.stop_calibration()
+        })
+        .0
+        .is_ok();
+        let left = deadline.saturating_duration_since(Instant::now());
+        if stopped || left.is_zero() {
+            return;
         }
+        std::thread::sleep(cfg.retry_interval.min(left).min(Duration::from_millis(100)));
     }
 }
 
@@ -1121,7 +1155,7 @@ fn run<T: Transport>(
     let mut link = 0u64;
     loop {
         if ctl.stop.load(Ordering::SeqCst) {
-            shutdown(&ctl, kb.as_mut());
+            shutdown(&ctl, kb.as_mut(), &mut connect, &cfg);
             return;
         }
         let pause = ctl.reconnect_ms.swap(NO_RECONNECT, Ordering::SeqCst);
@@ -1188,7 +1222,10 @@ fn run<T: Transport>(
                 match rx.recv_timeout(left.min(Duration::from_millis(100))) {
                     Ok(msg) => finish(&ctl, msg.counted, (msg.job)(None)),
                     Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        shutdown(&ctl, None, &mut connect, &cfg);
+                        return;
+                    }
                 }
             }
             continue;
@@ -1226,7 +1263,7 @@ fn run<T: Transport>(
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                shutdown(&ctl, Some(k));
+                shutdown(&ctl, Some(k), &mut connect, &cfg);
                 return;
             }
         }
@@ -2529,6 +2566,57 @@ pub(crate) mod tests {
         // Sent right after the handshake on the new connection (never
         // before it: a keyboard in bootloader mode gets no write at all).
         assert_eq!(writes[stop_at - 1][..4], [0x5C, 0x06, 0x01, 0x97]);
+    }
+
+    /// Scan finding 2: the connection dropped (status Searching) while the
+    /// guard is set, and the app closes before the reconnect. The shutdown
+    /// must still reconnect (bounded) and send the stop.
+    #[test]
+    fn calibration_guard_stops_calibration_when_the_app_closes_while_disconnected() {
+        let log: Arc<Mutex<Vec<[u8; 64]>>> = Arc::default();
+        let (l, plugged) = (log.clone(), Arc::new(AtomicBool::new(true)));
+        let p = plugged.clone();
+        let w = Worker::spawn_with(
+            Box::new(move || {
+                if !p.load(Ordering::SeqCst) {
+                    return Err(Error::Unsupported("no supported keyboard was found".into()));
+                }
+                let mut inner = MockTransport::new();
+                push_handshake(&mut inner);
+                inner.push_reply(order_reply(0x0D, 1)); // stop, if sent
+                push_snapshot_rest(&mut inner, 0);
+                Ok(Keyboard::new(
+                    Probe::logging(inner, l.clone()),
+                    Model::Win68HeMax,
+                ))
+            }),
+            WorkerConfig {
+                retry_interval: Duration::from_millis(200),
+                ..fast()
+            },
+        );
+        wait_for("connect", || w.is_connected());
+        w.set_calibration_guard(true);
+        let unplug = plugged.clone();
+        let mut lost = w.submit("lost", move |kb| {
+            unplug.store(false, Ordering::SeqCst);
+            kb.session_mut()
+                .transport_mut()
+                .inner
+                .fail_with(Error::Disconnected);
+            kb.profile()
+        });
+        assert_eq!(wait_result(&mut lost), Err(Error::Disconnected));
+        assert!(!w.is_connected());
+        // The keyboard comes back shortly after the window closed.
+        let replug = plugged.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            replug.store(true, Ordering::SeqCst);
+        });
+        drop(w);
+        t.join().unwrap();
+        assert!(wrote_stop(&log), "stop sent before drop returned");
     }
 
     const START_CALIBRATION: [u8; 7] = [0x5C, 0x03, 0x00, 0x93, 0x0C, 0xFF, 0xFF];
