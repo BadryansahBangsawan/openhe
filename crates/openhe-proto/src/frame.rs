@@ -141,6 +141,18 @@ impl Request {
     ///   already waiting is drained before the write; for the rest the
     ///   consumers skip frames that do not fit the matrix
     ///   (`TravelFrame::fits`).
+    /// - Krgb: R[1] is the key (`payload[1]`) for a SET or GET (PROTOCOL
+    ///   3.8: the SET reply echoes `[st, key, R, G, B]`); the commit
+    ///   (`[01, FE, ...]`) matches on the command only.
+    /// - MacroMode GET: R[1] is the key (PROTOCOL 3.7; read back on
+    ///   hardware, 7.x finding 24). A SET matches on the command only: its
+    ///   reply layout is not documented.
+    ///
+    /// MPT, TGL and END replies are not matched here: their R[1] = key is
+    /// inferred from the vendor parsers, not documented, so the device
+    /// layer checks it after the call and reports a mismatch as `Io`.
+    /// SOCD replies carry the pair (`pos1`, `pos2`), not the requested key,
+    /// and PRGB replies carry no key at all.
     ///
     /// A payload too short to carry those fields never matches.
     pub fn expects(&self, resp: &Response) -> bool {
@@ -154,6 +166,18 @@ impl Request {
             Cmd::Key => p.get(1..3).is_some_and(|kl| body[1..3] == *kl),
             Cmd::DefKey => p.get(1).is_some_and(|&row| body[1] == row),
             Cmd::Rm6x21 => p.first().is_some_and(|&sub| body[1] == sub),
+            // The KRGB commit [01, FE, ...] is a marker, not a key: its
+            // reply layout is unknown, so it matches on the command only.
+            Cmd::Krgb => match p.get(..2) {
+                Some(&[0x01, 0xFE]) => true,
+                Some(&[_, key]) => body[1] == key,
+                _ => false,
+            },
+            Cmd::MacroMode => match p.get(..2) {
+                Some(&[0x00, key]) => body[1] == key,
+                Some(_) => true,
+                None => false,
+            },
             _ => true,
         }
     }
@@ -240,6 +264,45 @@ mod tests {
         raw[2] = cmd_byte;
         raw[4..4 + body.len()].copy_from_slice(body);
         raw
+    }
+
+    /// KRGB (SET and GET) and MACRO_MODE GET replies carry the key at
+    /// R[1] (PROTOCOL 3.7, 3.8; MACRO_MODE GET read back on hardware,
+    /// finding 24): a reply for another key is not the answer. The KRGB
+    /// commit and the MACRO_MODE SET keep matching on the command only.
+    #[test]
+    fn krgb_and_macro_mode_get_replies_match_on_the_key() {
+        let krgb = |flag: u8, key: u8| Request {
+            cmd: Cmd::Krgb,
+            payload: vec![flag, key, 1, 2, 3],
+        };
+        let resp = |cmd: u8, key: u8| Response::decode(&reply(cmd, &[0, key, 1, 2, 3])).unwrap();
+        for flag in [0, 1] {
+            assert!(krgb(flag, 0x0A).expects(&resp(0xAA, 0x0A)));
+            assert!(!krgb(flag, 0x0A).expects(&resp(0xAA, 0x0B)));
+        }
+        let commit = krgb(1, 0xFE);
+        assert!(commit.expects(&resp(0xAA, 0x00)));
+        let get = Request {
+            cmd: Cmd::MacroMode,
+            payload: {
+                let mut p = vec![0u8; 11];
+                p[1] = 0x0A;
+                p
+            },
+        };
+        assert!(get.expects(&resp(0xA1, 0x0A)));
+        assert!(!get.expects(&resp(0xA1, 0x0B)));
+        let set = Request {
+            cmd: Cmd::MacroMode,
+            payload: vec![1, 0x0A, 0, 0, 2, 0, 1, 0, 100, 0, 0],
+        };
+        assert!(set.expects(&resp(0xA1, 0x0B)));
+        let short = Request {
+            cmd: Cmd::Krgb,
+            payload: vec![0],
+        };
+        assert!(!short.expects(&resp(0xAA, 0x00)));
     }
 
     #[test]

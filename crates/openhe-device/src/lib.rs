@@ -15,7 +15,7 @@ pub use keyboard::performance::PerformanceChange;
 pub use keyboard::system::{DeviceEvent, WriteOutcome};
 pub use keyboard::{KeySettings, Keyboard};
 pub use session::Session;
-pub use transport::{MockTransport, Transport};
+pub use transport::{MockTransport, TimedTransport, Transport};
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum Error {

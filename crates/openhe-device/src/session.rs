@@ -94,6 +94,17 @@ impl<T: Transport> Session<T> {
         }
     }
 
+    /// Waits `quiet`, then drains whatever arrived into the event queue, so
+    /// a late reply to an earlier request (or an echo) cannot answer the
+    /// next one. Nothing is written. For read-backs whose reply cannot be
+    /// told apart from the late reply by its bytes (PRGB, where the SET
+    /// reply, the GET reply and the keyboard's own lighting report all use
+    /// 0x98).
+    pub fn settle(&mut self, quiet: Duration) -> Result<(), Error> {
+        std::thread::sleep(quiet);
+        self.drain()
+    }
+
     fn drain_into(&mut self, out: &mut Vec<Response>) -> Result<(), Error> {
         while let Some(raw) = self.t.read(0)? {
             if let Ok(resp) = Response::decode(&raw) {
