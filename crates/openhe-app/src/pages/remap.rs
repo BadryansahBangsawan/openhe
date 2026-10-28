@@ -180,6 +180,15 @@ pub fn category_name(c: Category) -> &'static str {
 fn indonesian(code: u16) -> Option<(&'static str, &'static str)> {
     Some(match code {
         TRANSPARENT => (t::FOLLOW_BASE, t::FOLLOW_BASE),
+        // Left and right modifiers share a vendor label: say which side.
+        0x00E0 => ("Ctrl kiri", "Ctrl"),
+        0x00E1 => ("Shift kiri", "Shift"),
+        0x00E2 => ("Alt kiri", "Alt"),
+        0x00E3 => ("Win kiri", "Win"),
+        0x00E4 => ("Ctrl kanan", "Ctrl"),
+        0x00E5 => ("Shift kanan", "Shift"),
+        0x00E6 => ("Alt kanan", "Alt"),
+        0x00E7 => ("Win kanan", "Win"),
         0xF001 => ("Fn1 (tahan)", "Fn1"),
         0xF002 => ("Fn2 (tahan)", "Fn2"),
         0xF003 => ("Fn3 (tahan)", "Fn3"),
@@ -1933,6 +1942,20 @@ mod tests {
         // Unknown codes from the factory Fn tables.
         assert_eq!(code_name(0x6152), "Kode 0x6152");
         assert_eq!(code_name(0xF344), "Kode 0xF344");
+    }
+
+    /// Left and right modifiers carry the same vendor label ("Ctrl"), so
+    /// the picker showed two identical "Ctrl" chips (and the pending list
+    /// "Caps → Ctrl" for either). Full names say which side; key caps keep
+    /// the short label.
+    #[test]
+    fn left_and_right_modifiers_have_distinct_names() {
+        let names: Vec<String> = (0xE0..=0xE7).map(code_name).collect();
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), 8, "{names:?}");
+        assert_eq!(code_name(0xE0), "Ctrl kiri");
+        assert_eq!(code_name(0xE4), "Ctrl kanan");
+        assert_eq!(short_code_name(0xE4), "Ctrl");
     }
 
     #[test]

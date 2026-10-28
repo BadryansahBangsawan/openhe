@@ -2349,7 +2349,7 @@ mod tests {
             tap: 0x29,
             delay_ms: 200,
         });
-        assert_eq!(describe(&mt), "Ketuk = ESC · tahan 200 ms = Ctrl");
+        assert_eq!(describe(&mt), "Ketuk = ESC · tahan 200 ms = Ctrl kiri");
         let socd = AdvancedConfig::Socd(Socd {
             pos1: 0x04,
             pos2: 0x07,
