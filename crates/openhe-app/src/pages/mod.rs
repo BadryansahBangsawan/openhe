@@ -10,6 +10,7 @@ pub mod macros;
 pub mod performance;
 pub mod remap;
 pub mod settings;
+pub mod templates;
 
 use crate::app::AppCtx;
 use crate::i18n;
