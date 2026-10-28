@@ -766,6 +766,9 @@ fn nav_item(ui: &mut Ui, text: &str, active: bool) -> egui::Response {
         egui::FontId::proportional(15.0),
         text_color,
     );
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, text)
+    });
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

@@ -1194,6 +1194,14 @@ impl Page {
                     egui::vec2(w, 72.0),
                 );
                 let resp = ui.interact(rect, ui.id().with(("profile-card", i)), Sense::click());
+                resp.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::SelectableLabel,
+                        can,
+                        is_active,
+                        format!("{} {}", t::PROFILE, i + 1),
+                    )
+                });
                 let (fill, stroke) = if is_active {
                     (color::ACCENT_SOFT, color::ACCENT)
                 } else if resp.hovered() && can {

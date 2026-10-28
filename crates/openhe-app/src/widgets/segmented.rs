@@ -120,6 +120,15 @@ impl<'a, T: PartialEq + Copy> Segmented<'a, T> {
                 },
             );
             let selected = *value == *current;
+            let label = self.options[i].1;
+            seg_resp.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::SelectableLabel,
+                    interactive,
+                    selected,
+                    label,
+                )
+            });
             if seg_resp.clicked() && !selected {
                 *current = *value;
                 response.mark_changed();

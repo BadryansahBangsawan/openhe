@@ -1663,6 +1663,14 @@ fn table_row(ui: &mut Ui, row: &Row, selected: bool, enabled: bool) -> bool {
         Some(AdvancedConfig::Socd(s)) => format!("{} ↔ {}", key_name(s.pos1), key_name(s.pos2)),
         _ => key_name(row.key).to_string(),
     };
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            enabled,
+            selected,
+            format!("{name} · {}", row.func.label()),
+        )
+    });
     p.text(
         egui::pos2(cols.key, cy),
         Align2::LEFT_CENTER,
