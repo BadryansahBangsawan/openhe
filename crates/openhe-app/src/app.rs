@@ -747,7 +747,7 @@ fn sidebar(ui: &mut Ui, page: &mut PageId, status: &ConnectionStatus, loading: b
 
 fn nav_item(ui: &mut Ui, text: &str, active: bool) -> egui::Response {
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), Sense::click());
     let fill = if active {
         Color32::from_rgb(0x2A, 0x21, 0x12)
     } else if resp.hovered() {
@@ -769,7 +769,11 @@ fn nav_item(ui: &mut Ui, text: &str, active: bool) -> egui::Response {
         egui::pos2(rect.left() + 36.0, rect.center().y),
         Align2::LEFT_CENTER,
         text,
-        egui::FontId::proportional(15.0),
+        if active {
+            font::bold(14.0)
+        } else {
+            egui::FontId::proportional(14.0)
+        },
         text_color,
     );
     resp.widget_info(|| {
@@ -853,6 +857,20 @@ struct TopbarState {
     shown: Option<TopbarAction>,
 }
 
+/// Longest profile label in the top bar ("1 · " included).
+const TOPBAR_PROFILE_CHARS: usize = 14;
+
+/// `s` cut to `max` characters, with "…" when cut.
+pub fn elide_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.truncate(out.trim_end().len());
+    out.push('…');
+    out
+}
+
 /// The page title, then the profile and Win/Mac switches (right-aligned).
 /// Returns what the user picked; the app runs it as a worker job.
 fn topbar(
@@ -864,15 +882,6 @@ fn topbar(
 ) -> TopbarAction {
     let mut action = TopbarAction::default();
     ui.horizontal_centered(|ui| {
-        ui.label(
-            RichText::new(page.title())
-                .font(font::title())
-                .color(color::TEXT)
-                .strong(),
-        );
-        ui.add_space(6.0);
-        ui.label(RichText::new(page.subtitle()).color(color::MUTED));
-
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let connected = snapshot.is_some();
             let interactive = connected && state.enabled;
@@ -894,7 +903,11 @@ fn topbar(
             }
             ui.add_space(12.0);
 
-            let labels: Vec<String> = (0..4u8).map(|i| data.profile_label(i)).collect();
+            // Long profile names are shortened so the bar never runs into
+            // the title (names may be 24 characters).
+            let labels: Vec<String> = (0..4u8)
+                .map(|i| elide_chars(&data.profile_label(i), TOPBAR_PROFILE_CHARS))
+                .collect();
             let opts: Vec<(u8, &str)> = labels
                 .iter()
                 .enumerate()
@@ -912,6 +925,23 @@ fn topbar(
                 action.profile = Some(profile);
             }
             ui.label(RichText::new(i18n::topbar::PROFILE).color(color::MUTED));
+            ui.add_space(16.0);
+            // The title, then the subtitle cut to the room that is left.
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(page.title())
+                            .font(font::title())
+                            .color(color::TEXT)
+                            .strong(),
+                    )
+                    .extend(),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(RichText::new(page.subtitle()).color(color::MUTED)).truncate(),
+                );
+            });
         });
     });
     action

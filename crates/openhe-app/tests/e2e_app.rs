@@ -13,6 +13,30 @@ fn saved() -> AppData {
 }
 
 #[test]
+fn long_profile_names_never_run_into_the_top_bar_title() {
+    let mut data = AppData::default();
+    data.profile_names = [
+        "Kerja kantor harian",
+        "Gaming kompetitif",
+        "Menulis dokumen",
+        "Desain grafis",
+    ]
+    .map(String::from);
+    let mut w = World::with(Sim::new(), data, fast_config());
+    w.page("Macro");
+    w.h.set_size(eframe::egui::vec2(1280.0, 800.0));
+    w.frames(5);
+    let subtitle = w.rect("Rekam urutan tombol, pasang ke tombol mana saja");
+    let profil = w.rect("Profil");
+    assert!(
+        subtitle.right() <= profil.left(),
+        "subtitle {subtitle:?} runs under the profile switch at {profil:?}"
+    );
+    // A shortened name keeps its number to click.
+    assert!(w.has_text("1 · Kerja"), "{:?}", w.labels());
+}
+
+#[test]
 fn a_profile_name_typed_just_before_closing_is_saved() {
     let mut w = World::new();
     w.page("Pengaturan");

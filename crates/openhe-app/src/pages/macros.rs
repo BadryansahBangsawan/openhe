@@ -58,6 +58,8 @@ mod strings {
     pub const RECORDING: &str =
         "Merekam. Tekan tombol di keyboard komputer; pencet Berhenti kalau selesai.";
     pub const RECORD_APPENDS: &str = "Hasil rekaman ditambahkan di akhir langkah.";
+    pub const RECORD_TIMING: &str =
+        "Jeda direkam per frame layar (sekitar 16 ms), jadi tombol yang ditekan sangat cepat bisa tercatat 0 ms. Ubah jedanya di tabel kalau perlu lebih tepat.";
     pub const RECORD_FULL: &str = "Batas 255 langkah tercapai; rekaman dihentikan.";
     pub const RECORD_INTERRUPTED: &str = "Rekaman dihentikan karena halaman ditinggalkan.";
     pub const ADD_STEP: &str = "+ Tambah langkah";
@@ -120,6 +122,8 @@ mod strings {
     pub const BINDING_FAILED: &str = "Gagal membaca macro di tombol ini";
     pub const WARN_REPLACE: &str =
         "Peringatan: memasang macro baru bisa menggantikan macro di tombol lain. Perilaku ini belum diuji di keyboard sungguhan.";
+    pub const WARN_SHORT: &str =
+        "Belum diuji di keyboard sungguhan: macro lain bisa tergantikan, dan arti jeda belum pasti.";
     pub const WARN_DELAY: &str =
         "Arti jeda (sebelum atau sesudah langkah) belum diuji di keyboard sungguhan.";
 
@@ -141,7 +145,8 @@ mod strings {
 // ------------------------------------------------------------ key mapping
 
 /// The HID key code (PROTOCOL 4.3) of an egui key, `None` for keys the
-/// recorder cannot map (clipboard pseudo-keys, F25..F35, browser keys).
+/// recorder cannot map (the Copy/Cut/Paste pseudo-keys, F25..F35, browser
+/// keys). Clipboard shortcuts arrive as events instead: see [`Clip`].
 pub fn hid_code(key: Key) -> Option<u16> {
     use Key::*;
     Some(match key {
@@ -250,6 +255,58 @@ pub fn mods_of(m: &Modifiers) -> Mods {
 
 // --------------------------------------------------------------- recorder
 
+/// A clipboard shortcut. egui-winit turns its key press into
+/// `Event::Copy`, `Event::Cut` or `Event::Paste` and sends no key event for
+/// it (Ctrl/Cmd + C, X, V; on Windows also Ctrl+Insert, Shift+Delete and
+/// Shift+Insert). Only the release arrives as a key event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clip {
+    Copy,
+    Cut,
+    Paste,
+}
+
+const HID_C: u16 = 0x06;
+const HID_X: u16 = 0x1B;
+const HID_V: u16 = 0x19;
+const HID_INSERT: u16 = 0x49;
+const HID_DELETE: u16 = 0x4C;
+
+impl Clip {
+    /// The keys that can make this shortcut.
+    fn keys(self) -> [u16; 2] {
+        match self {
+            Clip::Copy => [HID_C, HID_INSERT],
+            Clip::Cut => [HID_X, HID_DELETE],
+            Clip::Paste => [HID_V, HID_INSERT],
+        }
+    }
+
+    /// The most likely key under `m`; the release corrects it.
+    fn guess(self, m: &Modifiers) -> u16 {
+        let k = self.keys();
+        // Shift without Ctrl/Cmd is Windows' Shift+Delete / Shift+Insert.
+        if self != Clip::Copy && m.shift && !m.command {
+            k[1]
+        } else {
+            k[0]
+        }
+    }
+
+    /// The shortcut a key `code` makes under `m`, if any.
+    fn of(code: u16, m: &Modifiers) -> Option<Clip> {
+        match code {
+            HID_C if m.command => Some(Clip::Copy),
+            HID_X if m.command => Some(Clip::Cut),
+            HID_V if m.command => Some(Clip::Paste),
+            HID_INSERT if m.ctrl => Some(Clip::Copy),
+            HID_INSERT if m.shift => Some(Clip::Paste),
+            HID_DELETE if m.shift => Some(Clip::Cut),
+            _ => None,
+        }
+    }
+}
+
 /// What a finished recording holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recording {
@@ -261,6 +318,13 @@ pub struct Recording {
 /// Turns key events into macro actions. The delay of an action is the time
 /// until the next recorded action ("jeda setelahnya"), measured between the
 /// timestamps passed in (seconds); the last action has delay 0.
+///
+/// egui gives events no timestamps of their own, only the frame time, so
+/// delays come in frame steps (~16 ms) and events of one frame get 0 ms
+/// between them (the UI says so, `strings::RECORD_TIMING`). Modifiers are
+/// not key events in egui either: those that change within one frame are
+/// recorded in the order Ctrl, Shift, Alt, GUI, but always before the key
+/// event that carries them.
 #[derive(Debug)]
 pub struct Recorder {
     actions: Vec<MacroAction>,
@@ -271,6 +335,9 @@ pub struct Recorder {
     /// Most actions this recording may hold, releases of held keys
     /// included.
     room: usize,
+    /// Presses recorded from a clipboard event: the action index, the
+    /// shortcut, and the guessed key that its release may correct.
+    clips: Vec<(usize, Clip, u16)>,
 }
 
 impl Default for Recorder {
@@ -282,6 +349,7 @@ impl Default for Recorder {
             mods: Mods::default(),
             skipped: Vec::new(),
             room: MAX_ACTIONS,
+            clips: Vec::new(),
         }
     }
 }
@@ -401,8 +469,39 @@ impl Recorder {
                 return;
             }
             self.press(code, t);
-        } else if let Some(p) = self.held.iter().position(|c| *c == code) {
+            return;
+        }
+        // The release of a clipboard shortcut names the real key.
+        if !self.held.contains(&code) {
+            if let Some(i) = self.clips.iter().position(|c| c.1.keys().contains(&code)) {
+                let (at, _, guess) = self.clips[i];
+                if let Some(h) = self.held.iter_mut().find(|h| **h == guess) {
+                    *h = code;
+                    self.actions[at].code = code;
+                }
+            } else if Clip::of(code, modifiers).is_some() {
+                // A paste with an empty clipboard sends no event at all for
+                // the press: record it now.
+                self.press(code, t);
+            }
+        }
+        self.clips.retain(|c| self.actions[c.0].code != code);
+        if let Some(p) = self.held.iter().position(|c| *c == code) {
             self.release(p, t);
+        }
+    }
+
+    /// A clipboard event (the press of its shortcut key); `modifiers` are
+    /// the ones down in that frame.
+    pub fn clipboard(&mut self, clip: Clip, modifiers: &Modifiers, t: f64) {
+        self.modifiers(mods_of(modifiers), t);
+        let code = clip.guess(modifiers);
+        let held = clip.keys().iter().any(|k| self.held.contains(k));
+        if held {
+            return; // OS key repeat
+        }
+        if self.press(code, t) {
+            self.clips.push((self.actions.len() - 1, clip, code));
         }
     }
 
@@ -812,6 +911,10 @@ pub struct Page {
     binding_for: Option<(u8, u64)>,
     binding_pending: Option<Pending<Option<MacroBinding>>>,
     bind_pending: Option<Pending<BindOutcome>>,
+    /// The key the running bind goes to (its result belongs to it).
+    bind_key: Option<u8>,
+    /// The last bind sent, for "Coba lagi"; forgotten when the selected
+    /// macro changes or is edited.
     last_bind: Option<(u8, SavedMacro)>,
     failure: Option<Failure>,
     bound: bool,
@@ -843,6 +946,7 @@ impl Default for Page {
             binding_for: None,
             binding_pending: None,
             bind_pending: None,
+            bind_key: None,
             last_bind: None,
             failure: None,
             bound: false,
@@ -874,6 +978,7 @@ impl Page {
 
     pub fn ui(&mut self, ctx: &AppCtx, ui: &mut Ui) {
         self.sync_selection(ctx);
+        self.forget_stale_bind(ctx);
         self.record_frame(ctx, ui);
         self.poll(ctx);
         self.start_reads(ctx);
@@ -902,6 +1007,19 @@ impl Page {
             Some(i) if i < n => Some(i),
             _ => Some(0),
         };
+    }
+
+    /// The last bind's result and "Coba lagi" are about one macro: once
+    /// another macro is selected, or this one is edited, they go.
+    fn forget_stale_bind(&mut self, ctx: &AppCtx) {
+        let Some((_, sent)) = &self.last_bind else {
+            return;
+        };
+        if self.current(ctx).as_ref() != Some(sent) {
+            self.last_bind = None;
+            self.bound = false;
+            self.failure = None;
+        }
     }
 
     fn current(&self, ctx: &AppCtx) -> Option<SavedMacro> {
@@ -989,6 +1107,15 @@ impl Page {
             {
                 rec.key(*key, *physical_key, *pressed, *repeat, modifiers, time);
             }
+            let clip = match e {
+                Event::Copy => Some(Clip::Copy),
+                Event::Cut => Some(Clip::Cut),
+                Event::Paste(_) => Some(Clip::Paste),
+                _ => None,
+            };
+            if let Some(clip) = clip {
+                rec.clipboard(clip, &modifiers, time);
+            }
         }
         rec.modifiers(mods_of(&modifiers), time);
         let full = rec.is_full();
@@ -1038,15 +1165,16 @@ impl Page {
             if let Some(r) = p.poll() {
                 self.bind_pending = None;
                 let fx = bind_effects(r);
-                let target = self.target;
-                if let (Some(key), Some(s)) = (target, fx.patch) {
+                // The result is the bound key's, whatever is selected now.
+                let key = self.bind_key.take();
+                if let (Some(key), Some(s)) = (key, fx.patch) {
                     ctx.worker.patch_snapshot(move |snap| {
                         snap.keys.insert(key, s);
                     });
                 }
                 match fx.binding {
-                    Some(b) => self.binding = Some(Ok(b)),
-                    None => self.binding_for = None, // read again
+                    Some(b) if key == self.target => self.binding = Some(Ok(b)),
+                    _ => self.binding_for = None, // read again
                 }
                 // Binding over a function also changed its SOCD partner (and
                 // the job re-reads only the target): read everything again.
@@ -1058,7 +1186,9 @@ impl Page {
                     text,
                     technical: fx.technical,
                 });
-                self.bound = fx.bound;
+                // "Terpasang" only while the bound macro is still the one
+                // shown.
+                self.bound = fx.bound && self.last_bind.is_some();
             }
         }
     }
@@ -1101,6 +1231,7 @@ impl Page {
         self.bind_replaces = ctx
             .snapshot
             .is_some_and(|s| replaced_function(s, key).is_some());
+        self.bind_key = Some(key);
         self.last_bind = Some((key, m.clone()));
         let actions = m.to_actions();
         let (mode, repeat, interval) = (m.play_mode(), m.repeat_count(), m.interval_ms);
@@ -1214,59 +1345,86 @@ impl Page {
         });
     }
 
+    /// "Rekam"/"Berhenti" and "+ Tambah langkah", in a right-to-left
+    /// layout.
+    fn record_buttons(&mut self, ctx: &AppCtx, ui: &mut Ui, m: &mut SavedMacro, recording: bool) {
+        let (label, fill, stroke) = if recording {
+            (strings::STOP, color::DANGER, color::DANGER)
+        } else {
+            (strings::RECORD, color::DANGER_SOFT, color::DANGER)
+        };
+        let text_color = if recording {
+            color::ON_ACCENT
+        } else {
+            color::DANGER
+        };
+        let rec = egui::Button::new(
+            RichText::new(format!("● {label}"))
+                .color(text_color)
+                .strong(),
+        )
+        .fill(fill)
+        .stroke(line(1.0, stroke))
+        .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
+        .min_size(egui::vec2(0.0, 36.0));
+        if ui.add(rec).clicked() {
+            let time = ui.input(|i| i.time);
+            if recording {
+                self.stop_recording(ctx, time, false);
+                // `m` was read before the recording was stored.
+                if let Some(fresh) = self.current(ctx) {
+                    *m = fresh;
+                }
+            } else {
+                self.start_recording(time, m.actions.len());
+            }
+        }
+        let add = egui::Button::new(strings::ADD_STEP)
+            .fill(color::BG)
+            .stroke(line(1.0, color::BORDER_STRONG))
+            .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
+            .min_size(egui::vec2(0.0, 36.0));
+        if ui.add_enabled(!recording, add).clicked() {
+            self.adding = !self.adding;
+        }
+    }
+
     fn editor_header(&mut self, ctx: &AppCtx, ui: &mut Ui, m: &mut SavedMacro) {
         let recording = self.recording();
-        ui.horizontal(|ui| {
+        // Name and buttons share a row only when both fit; in a narrow
+        // window the buttons get a row of their own.
+        let wide = ui.available_width() >= 620.0;
+        if wide {
+            ui.horizontal(|ui| {
+                ui.add_enabled(
+                    !recording,
+                    egui::TextEdit::singleline(&mut m.name)
+                        .hint_text(strings::NAME_HINT)
+                        .font(font::heading())
+                        .desired_width(ui.available_width() - 300.0),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.record_buttons(ctx, ui, m, recording);
+                });
+            });
+        } else {
             ui.add_enabled(
                 !recording,
                 egui::TextEdit::singleline(&mut m.name)
                     .hint_text(strings::NAME_HINT)
                     .font(font::heading())
-                    .desired_width(ui.available_width() - 270.0),
+                    .desired_width(ui.available_width() - 12.0),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (label, fill, stroke) = if recording {
-                    (strings::STOP, color::DANGER, color::DANGER)
-                } else {
-                    (strings::RECORD, color::DANGER_SOFT, color::DANGER)
-                };
-                let text_color = if recording {
-                    color::ON_ACCENT
-                } else {
-                    color::DANGER
-                };
-                let rec = egui::Button::new(
-                    RichText::new(format!("● {label}"))
-                        .color(text_color)
-                        .strong(),
-                )
-                .fill(fill)
-                .stroke(line(1.0, stroke))
-                .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
-                .min_size(egui::vec2(0.0, 36.0));
-                if ui.add(rec).clicked() {
-                    let time = ui.input(|i| i.time);
-                    if recording {
-                        self.stop_recording(ctx, time, false);
-                        // `m` was read before the recording was stored.
-                        if let Some(fresh) = self.current(ctx) {
-                            *m = fresh;
-                        }
-                    } else {
-                        self.start_recording(time, m.actions.len());
-                    }
-                }
-                let add = egui::Button::new(strings::ADD_STEP)
-                    .fill(color::BG)
-                    .stroke(line(1.0, color::BORDER_STRONG))
-                    .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
-                    .min_size(egui::vec2(0.0, 36.0));
-                if ui.add_enabled(!recording, add).clicked() {
-                    self.adding = !self.adding;
-                }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.record_buttons(ctx, ui, m, recording);
+                });
             });
-        });
-        ui.horizontal(|ui| {
+        }
+        // The totals, then the library actions; they wrap instead of
+        // drawing over each other.
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!(
                     "{} {} {} · {} {}",
@@ -1279,40 +1437,39 @@ impl Page {
                 .font(font::small())
                 .color(color::MUTED),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let idle = !recording;
-                if text_button(
-                    ui,
-                    self.confirm_delete,
-                    strings::DELETE,
-                    strings::DELETE_CONFIRM,
-                    idle,
-                ) {
-                    if self.confirm_delete {
-                        let mut lib = ctx.data.borrow_mut();
-                        if let Some(i) = self.selected {
-                            self.selected = library_delete(&mut lib.macros, i);
-                        }
-                        drop(lib);
-                        self.confirm_delete = false;
-                        self.persist(ctx);
-                    } else {
-                        self.confirm_delete = true;
-                    }
+            ui.add_space(12.0);
+            let idle = !recording;
+            if text_button(ui, false, strings::CLEAR, "", idle && !m.actions.is_empty()) {
+                m.actions.clear();
+                self.step_sel = None;
+            }
+            if text_button(ui, false, strings::DUPLICATE, "", idle) {
+                if let Some(i) = self.selected {
+                    let new = library_duplicate(&mut ctx.data.borrow_mut().macros, i);
+                    self.selected = new.or(self.selected);
+                    self.confirm_delete = false;
+                    self.persist(ctx);
                 }
-                if text_button(ui, false, strings::DUPLICATE, "", idle) {
+            }
+            if text_button(
+                ui,
+                self.confirm_delete,
+                strings::DELETE,
+                strings::DELETE_CONFIRM,
+                idle,
+            ) {
+                if self.confirm_delete {
+                    let mut lib = ctx.data.borrow_mut();
                     if let Some(i) = self.selected {
-                        let new = library_duplicate(&mut ctx.data.borrow_mut().macros, i);
-                        self.selected = new.or(self.selected);
-                        self.confirm_delete = false;
-                        self.persist(ctx);
+                        self.selected = library_delete(&mut lib.macros, i);
                     }
+                    drop(lib);
+                    self.confirm_delete = false;
+                    self.persist(ctx);
+                } else {
+                    self.confirm_delete = true;
                 }
-                if text_button(ui, false, strings::CLEAR, "", idle && !m.actions.is_empty()) {
-                    m.actions.clear();
-                    self.step_sel = None;
-                }
-            });
+            }
         });
         if recording {
             ui.add_space(6.0);
@@ -1475,10 +1632,12 @@ impl Page {
                             key_chip(ui, &code_label(m.actions[i].code));
                             delay_box(ui, &mut m.actions[i].delay_ms, editable);
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
+                                ui.spacing_mut().item_spacing.x = 8.0;
                                 let small = |t: &str| {
-                                    egui::Button::new(RichText::new(t).color(color::MUTED))
-                                        .frame(false)
+                                    egui::Button::new(
+                                        RichText::new(t).font(font::bold(14.0)).color(color::MUTED),
+                                    )
+                                    .frame(false)
                                 };
                                 if ui
                                     .add_enabled(editable && i > 0, small("↑"))
@@ -1523,7 +1682,7 @@ impl Page {
                     });
                 if recording {
                     ui.add_space(8.0);
-                    card::hint(ui, strings::RECORD_APPENDS);
+                    card::hint(ui, strings::RECORD_TIMING);
                 }
                 card::hint(ui, strings::DELAY_HINT);
             });
@@ -1615,9 +1774,6 @@ impl Page {
         self.target_row(ctx, ui);
         ui.add_space(6.0);
         self.binding_row(ctx, ui);
-        ui.add_space(12.0);
-        card::hint(ui, strings::WARN_REPLACE);
-        card::hint(ui, strings::WARN_DELAY);
     }
 
     fn target_row(&mut self, ctx: &AppCtx, ui: &mut Ui) {
@@ -1651,7 +1807,10 @@ impl Page {
                         let b = egui::Button::new(RichText::new(label).color(color::ACCENT))
                             .frame(false);
                         if ui
-                            .add_enabled(ctx.connected() && !self.recording(), b)
+                            .add_enabled(
+                                ctx.connected() && !self.recording() && self.bind_pending.is_none(),
+                                b,
+                            )
                             .clicked()
                         {
                             self.picking = true;
@@ -1698,6 +1857,22 @@ impl Page {
     }
 
     fn apply_area(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        // Both "untested" warnings, short, right above the button (the full
+        // text on hover), so the scroll area never cuts them off.
+        ui.add(
+            egui::Label::new(
+                RichText::new(strings::WARN_SHORT)
+                    .font(font::small())
+                    .color(color::MUTED),
+            )
+            .sense(Sense::hover()),
+        )
+        .on_hover_text(format!(
+            "{}\n\n{}",
+            strings::WARN_REPLACE,
+            strings::WARN_DELAY
+        ));
+        ui.add_space(8.0);
         let idle = ctx.can_write() && !self.job_pending() && !self.recording();
         if let Some(f) = self.failure.clone() {
             let retry = (idle && self.last_bind.is_some()).then_some(i18n::common::RETRY);
@@ -1797,6 +1972,9 @@ impl Page {
             });
         if !open {
             self.picking = false;
+        }
+        if self.bind_pending.is_some() {
+            picked = None; // the target stays put until the bind is done
         }
         if let Some(k) = picked {
             self.picking = false;
@@ -2186,6 +2364,77 @@ mod tests {
             ]
         );
         assert!(rec.skipped.is_empty());
+    }
+
+    #[test]
+    fn clipboard_shortcuts_are_recorded_as_the_key() {
+        // egui sends Copy instead of the C press; the release is a key event.
+        let mut r = Recorder::new();
+        r.modifiers(mods_of(&ctrl()), 1.0);
+        r.clipboard(Clip::Copy, &ctrl(), 1.02);
+        r.clipboard(Clip::Copy, &ctrl(), 1.05); // OS key repeat
+        r.key(Key::C, Some(Key::C), false, false, &ctrl(), 1.10);
+        r.modifiers(mods_of(&NONE), 1.15);
+        assert_eq!(
+            r.finish(1.15).actions,
+            vec![
+                mac(0xE0, true, 20),
+                mac(0x06, true, 80),
+                mac(0x06, false, 50),
+                mac(0xE0, false, 0),
+            ]
+        );
+        // Windows Ctrl+Insert also arrives as Copy: the release names the key.
+        let mut r = Recorder::new();
+        r.clipboard(Clip::Copy, &ctrl(), 0.0);
+        r.key(Key::Insert, Some(Key::Insert), false, false, &ctrl(), 0.1);
+        let codes: Vec<(u16, bool)> = r
+            .finish(0.2)
+            .actions
+            .iter()
+            .map(|a| (a.code, a.down))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![(0xE0, true), (0x49, true), (0x49, false), (0xE0, false)]
+        );
+        // Shift+Delete (Windows cut) is guessed as Delete straight away.
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        };
+        let mut r = Recorder::new();
+        r.clipboard(Clip::Cut, &shift, 0.0);
+        assert_eq!(r.actions()[1], mac(0x4C, true, 0));
+        // A layout without Latin letters: the release carries the physical key.
+        let mut r = Recorder::new();
+        r.clipboard(Clip::Paste, &ctrl(), 0.0);
+        r.key(Key::V, Some(Key::V), false, false, &ctrl(), 0.1);
+        assert_eq!(r.actions()[1], mac(0x19, true, 100));
+        assert_eq!(r.actions()[2], mac(0x19, false, 0));
+    }
+
+    #[test]
+    fn a_paste_with_an_empty_clipboard_is_still_recorded() {
+        // egui sends nothing for the press then; only the release arrives.
+        let mut r = Recorder::new();
+        r.modifiers(mods_of(&ctrl()), 0.0);
+        r.key(Key::V, Some(Key::V), false, false, &ctrl(), 0.1);
+        r.modifiers(mods_of(&NONE), 0.2);
+        let codes: Vec<(u16, bool)> = r
+            .finish(0.2)
+            .actions
+            .iter()
+            .map(|a| (a.code, a.down))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![(0xE0, true), (0x19, true), (0x19, false), (0xE0, false)]
+        );
+        // A stray release without the shortcut modifier is still ignored.
+        let mut r = Recorder::new();
+        r.key(Key::V, Some(Key::V), false, false, &NONE, 0.1);
+        assert!(r.is_empty());
     }
 
     #[test]
@@ -2864,7 +3113,8 @@ mod tests {
             modifiers: mods,
         };
         let frames = [
-            (1.00, vec![key(Key::C, true, ctrl())], ctrl()),
+            // egui-winit turns the Ctrl+C press into Event::Copy.
+            (1.00, vec![Event::Copy], ctrl()),
             (1.10, vec![key(Key::C, false, ctrl())], ctrl()),
             (1.15, vec![], Modifiers::NONE),
         ];

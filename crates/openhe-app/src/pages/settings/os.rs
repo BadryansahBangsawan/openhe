@@ -2,7 +2,9 @@
 //! watcher for per-app profile switching, and launch at login. Both are
 //! optional (off by default) and never touch the keyboard themselves.
 
+use std::ffi::OsString;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -96,22 +98,69 @@ fn foreground_app(me: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The program the autostart entry starts. Inside a Linux AppImage the
+/// executable runs from a temporary mount (`/tmp/.mount_XXXX/...`) that
+/// changes on every run; the AppImage itself is in `$APPIMAGE`.
+fn launch_path(exe: PathBuf, appimage: Option<OsString>, linux: bool) -> PathBuf {
+    match appimage {
+        Some(p) if linux && !p.is_empty() => PathBuf::from(p),
+        _ => exe,
+    }
+}
+
+fn auto_launch() -> Result<auto_launch::AutoLaunch, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = launch_path(exe, std::env::var_os("APPIMAGE"), cfg!(target_os = "linux"));
+    let path = exe
+        .to_str()
+        .ok_or_else(|| "executable path is not UTF-8".to_string())?;
+    auto_launch::AutoLaunchBuilder::new()
+        .set_app_name(crate::i18n::common::APP_NAME)
+        .set_app_path(path)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// Turns launch at login on or off for the running executable (a
 /// LaunchAgent on macOS, the Run registry key on Windows, an XDG autostart
 /// entry on Linux). The error text is technical (English).
 pub fn set_launch_at_login(on: bool) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let path = exe
-        .to_str()
-        .ok_or_else(|| "executable path is not UTF-8".to_string())?;
-    let auto = auto_launch::AutoLaunchBuilder::new()
-        .set_app_name(crate::i18n::common::APP_NAME)
-        .set_app_path(path)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let auto = auto_launch()?;
     if !on && !auto.is_enabled().unwrap_or(true) {
         return Ok(()); // nothing to remove
     }
     let r = if on { auto.enable() } else { auto.disable() };
     r.map_err(|e| e.to_string())
+}
+
+/// Whether the OS has an autostart entry for OpenHE (a file or registry
+/// value check); `None` when it cannot be read.
+pub fn launch_at_login_enabled() -> Option<bool> {
+    auto_launch().ok()?.is_enabled().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_appimage_starts_from_its_own_path_not_the_mount() {
+        let mount = PathBuf::from("/tmp/.mount_OpenHEx1/usr/bin/openhe");
+        let image = OsString::from("/home/u/Apps/OpenHE.AppImage");
+        assert_eq!(
+            launch_path(mount.clone(), Some(image), true),
+            PathBuf::from("/home/u/Apps/OpenHE.AppImage")
+        );
+        // Not an AppImage, or not Linux: the executable itself.
+        assert_eq!(launch_path(mount.clone(), None, true), mount);
+        assert_eq!(
+            launch_path(mount.clone(), Some(OsString::new()), true),
+            mount
+        );
+        let exe = PathBuf::from("/Applications/OpenHE.app/Contents/MacOS/openhe");
+        assert_eq!(
+            launch_path(exe.clone(), Some(OsString::from("/x.AppImage")), false),
+            exe
+        );
+    }
 }

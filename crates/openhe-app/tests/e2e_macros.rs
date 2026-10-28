@@ -5,6 +5,7 @@
 mod support;
 use eframe::egui::{Key, Modifiers};
 use openhe_app::storage::AppData;
+use support::sim::Reject;
 use support::*;
 
 const G: u8 = 0x0A;
@@ -173,4 +174,72 @@ fn the_fn_key_cannot_be_a_target() {
     pick_target(&mut w, 0x01);
     assert!(w.has_text("Tombol Fn tidak bisa diberi macro."));
     assert!(!w.enabled("Pasang ke tombol"));
+}
+
+#[test]
+fn a_key_picked_during_a_bind_does_not_take_its_result() {
+    let mut w = recorded();
+    pick_target(&mut w, G);
+    w.idle();
+    // A slow keyboard: the bind is still running when the picker is used.
+    w.sim().set_delay = std::time::Duration::from_millis(150);
+    w.click("Ganti");
+    w.click("Pasang ke tombol");
+    assert!(w.has_text("Memasang"), "{:?}", w.labels());
+    assert!(!w.enabled("Ganti"), "the target can change mid-bind");
+    // The picker window was already open: a pick is ignored.
+    w.click_key(0x0B, false);
+    w.until("bind done", 20, |w| w.has("Macro terpasang di keyboard"));
+    w.sim().set_delay = std::time::Duration::ZERO;
+    w.idle();
+    let snap = w.snapshot();
+    assert_eq!(
+        snap.keys[&G].mode.advanced,
+        openhe_proto::key::Advanced::Macro
+    );
+    assert_eq!(
+        snap.keys[&0x0B].mode.advanced,
+        openhe_proto::key::Advanced::None,
+        "G's result was written onto H"
+    );
+}
+
+#[test]
+fn switching_or_editing_the_macro_forgets_the_last_bind() {
+    let mut w = recorded();
+    pick_target(&mut w, G);
+    w.idle();
+    w.apply("Pasang ke tombol");
+    assert!(w.has("Macro terpasang di keyboard"), "{:?}", w.labels());
+    // Another macro: the "bound" note was about the first one.
+    w.click("+ Baru");
+    w.frames(2);
+    assert!(!w.has("Macro terpasang di keyboard"), "{:?}", w.labels());
+
+    // A failed bind, then the macro is edited: no retry of the old copy.
+    w.click("Macro baru");
+    w.sim().rejects.push(Reject {
+        cmd: 0x20,
+        sets_only: true,
+        at: vec![],
+        times: 1,
+    });
+    w.click("Pasang ke tombol");
+    w.until("bind failed", 20, |w| w.has("Coba lagi"));
+    let n = w.h_count("×");
+    w.click_nth("×", n - 1);
+    w.click_nth("×", n - 2);
+    w.frames(2);
+    assert!(!w.has("Coba lagi"), "a retry would send the old macro");
+}
+
+#[test]
+fn the_recorder_says_its_delays_are_frame_steps() {
+    let mut w = World::new();
+    w.page("Macro");
+    w.click("+ Baru");
+    w.click("● Rekam");
+    // egui stamps events per frame, not per key: the UI says so.
+    assert!(w.has_text("per frame layar"), "{:?}", w.labels());
+    w.click("● Berhenti");
 }

@@ -231,3 +231,38 @@ fn import_refuses_0x0001_on_base() {
     assert!(text.contains("0x0001"), "{text}");
     assert_eq!(w.sim().set_count(), 0);
 }
+
+#[test]
+fn launch_at_login_shows_the_os_state_not_the_saved_flag() {
+    // The data file says "on", but the (test) home has no autostart entry,
+    // e.g. after a recovered data file or a moved app.
+    let mut data = openhe_app::storage::AppData::default();
+    data.launch_at_login = true;
+    let mut w = World::with(Sim::new(), data, fast_config());
+    w.page("Pengaturan");
+    // Checkboxes: per-app switching, then launch at login.
+    assert_eq!(
+        w.role_count(eframe::egui::accesskit::Role::CheckBox),
+        2,
+        "{:?}",
+        w.labels()
+    );
+    assert!(!w.role_checked(eframe::egui::accesskit::Role::CheckBox, 1));
+}
+
+#[test]
+fn a_restart_result_goes_once_the_profile_changes_elsewhere() {
+    let mut w = settings();
+    let c = w.worker.connects();
+    let r = w.rect("Profil 3");
+    w.click_at(r.left_top() + eframe::egui::vec2(20.0, 12.0));
+    reconnected(&mut w, c);
+    let done = "Keyboard tersambung lagi dengan Profil 3.";
+    assert!(w.has_text(done), "{:?}", w.labels());
+    // Back to profile 1 from the top bar: the card's note is stale.
+    let c = w.worker.connects();
+    w.click("1");
+    reconnected(&mut w, c);
+    assert_eq!(w.sim().profile, 0);
+    assert!(!w.has_text(done), "{:?}", w.labels());
+}

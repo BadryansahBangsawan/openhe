@@ -25,7 +25,7 @@ use crate::worker::{Debounce, DeviceSnapshot, Pending, WorkerHandle};
 use eframe::egui::{self, Align, Align2, CornerRadius, Layout, Rect, RichText, Sense, Ui};
 use openhe_device::{Error, Keyboard, Transport, WriteOutcome};
 use openhe_proto::{PollingRate, SystemMode};
-use os::{set_launch_at_login, ForegroundWatcher};
+use os::{launch_at_login_enabled, set_launch_at_login, ForegroundWatcher};
 use profile_file::{
     export_job, import_job, plan_import, Exported, FileError, ImportPlan, ImportReport, ImportStep,
     ProfileData, ProfileFile,
@@ -776,6 +776,9 @@ pub struct Page {
     restart: RestartRun,
     /// What the last restart flow was for (its status shows there).
     last_restart: Option<RestartKind>,
+    /// Profile and polling rate when the last restart's result was first
+    /// shown (see [`Page::forget_stale_restart`]).
+    restart_seen: Option<(u8, PollingRate)>,
     /// Polling segment shown while a change is under way.
     polling_target: Option<PollingRate>,
     transfer: Transfer,
@@ -786,6 +789,9 @@ pub struct Page {
     /// The saved "per-app switching on" was looked at (once per run).
     auto_restored: bool,
     app_error: Option<String>,
+    /// Launch at login as the OS has it (read once, and after a change);
+    /// the outer `None` is "not read yet", the inner one "unreadable".
+    login_os: Option<Option<bool>>,
     new_rule: (String, u8),
     reset_open: bool,
     reset_text: String,
@@ -799,6 +805,7 @@ impl Default for Page {
             switch_error: None,
             restart: RestartRun::default(),
             last_restart: None,
+            restart_seen: None,
             polling_target: None,
             transfer: Transfer::Idle,
             auto_enabled: false,
@@ -806,6 +813,7 @@ impl Default for Page {
             auto: Arc::default(),
             auto_restored: false,
             app_error: None,
+            login_os: None,
             new_rule: (String::new(), 0),
             reset_open: false,
             reset_text: String::new(),
@@ -834,6 +842,7 @@ impl Page {
             }
         }
         self.restart.pump(ctx.worker, ctx.snapshot, now);
+        self.forget_stale_restart(ctx.snapshot);
         if !self.restart.is_busy() {
             self.polling_target = None;
         } else {
@@ -953,6 +962,29 @@ impl Page {
                 };
                 self.auto_enabled = true;
             }
+        }
+    }
+
+    /// A finished restart's "✔ … Profil 3" / "… 1000 Hz" describes the
+    /// keyboard as it was then: once the profile or polling rate changes
+    /// elsewhere (top bar, keyboard, per-app rule) the note goes.
+    fn forget_stale_restart(&mut self, snapshot: Option<&DeviceSnapshot>) {
+        if !matches!(self.restart.state, Restart::Done(_) | Restart::Failed(..)) {
+            self.restart_seen = None;
+            return;
+        }
+        let Some(s) = snapshot else {
+            return;
+        };
+        let now = (s.profile, s.polling);
+        match self.restart_seen {
+            None => self.restart_seen = Some(now),
+            Some(then) if then != now => {
+                self.restart.state = Restart::Idle;
+                self.last_restart = None;
+                self.restart_seen = None;
+            }
+            Some(_) => {}
         }
     }
 
@@ -1460,9 +1492,14 @@ impl Page {
                 self.rules_editor(ctx, ui);
             }
             setting_row(ui, t::LOGIN, None, true, |ui| {
-                let mut on = ctx.data.borrow().launch_at_login;
+                // The OS entry is the truth (the saved flag can be stale
+                // after a recovered data file); the flag is the fallback.
+                let os = *self.login_os.get_or_insert_with(launch_at_login_enabled);
+                let mut on = os.unwrap_or(ctx.data.borrow().launch_at_login);
                 if toggle(ui, &mut on, true).changed() {
-                    match set_launch_at_login(on) {
+                    let r = set_launch_at_login(on);
+                    self.login_os = None; // read again
+                    match r {
                         Ok(()) => {
                             ctx.data.borrow_mut().launch_at_login = on;
                             if ctx.save_data().is_err() {
@@ -1476,7 +1513,15 @@ impl Page {
                 }
             });
             setting_row(ui, t::LANGUAGE, None, true, |ui| {
-                ui.add_enabled(false, egui::Button::new(t::LANGUAGE_ID));
+                // One language: a read-only field, not a greyed-out button.
+                egui::Frame::new()
+                    .fill(color::BG)
+                    .stroke(line(1.0, color::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
+                    .inner_margin(egui::Margin::symmetric(14, 6))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(t::LANGUAGE_ID).color(color::TEXT));
+                    });
             });
             setting_row(ui, t::THEME, None, false, |ui| {
                 let themes = [
@@ -1553,7 +1598,9 @@ impl Page {
             .as_ref()
             .map(ForegroundWatcher::seen)
             .unwrap_or_default();
+        let now = Instant::now();
         let mut changed = false;
+        let mut typed = false;
         let mut remove = None;
         egui::Frame::new()
             .inner_margin(egui::Margin {
@@ -1589,7 +1636,11 @@ impl Page {
                                     .desired_width(200.0)
                                     .hint_text(t::AUTO_APP_HINT),
                             );
-                            changed |= r.lost_focus();
+                            // Like profile names: the switcher gets every
+                            // keystroke, the file is saved after a pause, on
+                            // leaving the field, or when the app closes.
+                            typed |= r.changed();
+                            changed |= self.name_edited(r.changed(), r.lost_focus(), now);
                             let mut p = (*profile).min(3);
                             if Segmented::new(&opts)
                                 .height(30.0)
@@ -1634,12 +1685,12 @@ impl Page {
                 });
                 card::hint(ui, t::AUTO_SESSION);
             });
-        if changed {
+        if changed || typed {
             self.auto
                 .set_rules(ctx.data.borrow().app_profile_rules.clone());
-            if ctx.save_data().is_err() {
-                self.app_error = Some(t::SAVE_FAILED.to_string());
-            }
+        }
+        if changed && ctx.save_data().is_err() {
+            self.app_error = Some(t::SAVE_FAILED.to_string());
         }
     }
 
@@ -1760,15 +1811,26 @@ fn setting_row(
     rule: bool,
     right: impl FnOnce(&mut Ui),
 ) {
+    // The control first (from the right), then the title and hint in the
+    // room left of it: a long hint wraps instead of running under the
+    // control.
     let r = ui
         .horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(title).color(color::TEXT));
-                if let Some(h) = hint {
-                    ui.label(RichText::new(h).font(font::small()).color(color::MUTED));
-                }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                right(ui);
+                ui.add_space(16.0);
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    ui.label(RichText::new(title).color(color::TEXT));
+                    if let Some(h) = hint {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(h).font(font::small()).color(color::MUTED),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
             });
-            ui.with_layout(Layout::right_to_left(Align::Center), right);
         })
         .response;
     if rule {
@@ -1782,14 +1844,19 @@ fn setting_row(
 }
 
 fn danger_button(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(RichText::new(text).color(color::DANGER).strong())
-            .fill(color::BG)
-            .stroke(line(1.0, color::DANGER.gamma_multiply(0.7)))
-            .corner_radius(CornerRadius::same(size::CONTROL_RADIUS + 2))
-            .min_size(egui::vec2(ui.available_width(), 40.0)),
-    )
+    // Full width with the text centred (egui left-aligns a button's text
+    // when it is only stretched by `min_size`).
+    ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(RichText::new(text).color(color::DANGER).strong())
+                .fill(color::BG)
+                .stroke(line(1.0, color::DANGER.gamma_multiply(0.7)))
+                .corner_radius(CornerRadius::same(size::CONTROL_RADIUS + 2))
+                .min_size(egui::vec2(ui.available_width(), 40.0)),
+        )
+    })
+    .inner
 }
 
 #[cfg(test)]
@@ -2387,6 +2454,70 @@ mod tests {
         page.name_edited(true, false, t0);
         assert!(page.name_edited(false, true, t0));
         assert!(!page.names_due(t0 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn typed_rule_names_reach_the_switcher_and_are_saved_on_close() {
+        use crate::app::test_support::offline_worker;
+        use crate::storage::AppData;
+        use egui_kittest::kittest::Queryable;
+        use std::cell::RefCell;
+        struct S {
+            page: Page,
+            w: crate::worker::Worker,
+            data: RefCell<AppData>,
+            theme: crate::theme::Theme,
+            status: crate::worker::ConnectionStatus,
+        }
+        let mut d = AppData::default();
+        d.app_profile_rules.push(("Valorant".into(), 1));
+        d.set_save_blocked(true); // never touch the real data file
+        let state = S {
+            page: Page {
+                auto_enabled: true, // rules editor without a watcher
+                ..Page::default()
+            },
+            w: offline_worker(),
+            data: RefCell::new(d),
+            theme: crate::theme::Theme::default(),
+            status: crate::worker::ConnectionStatus::Searching,
+        };
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 1400.0))
+            .build_ui_state(
+                |ui, s: &mut S| {
+                    let ctx = AppCtx {
+                        worker: &s.w,
+                        snapshot: None,
+                        status: &s.status,
+                        busy: false,
+                        theme: &s.theme,
+                        data: &s.data,
+                    };
+                    s.page.ui(&ctx, ui);
+                },
+                state,
+            );
+        h.run_steps(2);
+        macro_rules! field {
+            () => {
+                h.query_by(|n| {
+                    n.role() == egui::accesskit::Role::TextInput
+                        && n.value().is_some_and(|v| v.starts_with("Valorant"))
+                })
+                .expect("rule field")
+            };
+        }
+        field!().focus();
+        h.run_steps(2);
+        field!().type_text("X");
+        h.run_steps(2);
+        let s = h.state_mut();
+        assert_eq!(s.data.borrow().app_profile_rules[0].0, "ValorantX");
+        // The switcher uses the name while the field still has focus...
+        assert_eq!(s.page.auto.rules(), vec![("ValorantX".to_string(), 1)]);
+        // ...and closing the app now saves it.
+        assert!(s.page.take_unsaved_names());
     }
 
     #[test]

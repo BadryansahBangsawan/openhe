@@ -39,7 +39,7 @@ fn reading_uses_the_len15_get_and_shows_the_keyboard_state() {
         "{:?}",
         w.labels()
     );
-    assert!(w.has_text("=4 / 5"), "{:?}", w.labels());
+    assert!(w.has_text("=80%"), "{:?}", w.labels());
 }
 
 #[test]
@@ -115,14 +115,14 @@ fn a_lighting_change_on_another_profile_is_read_after_the_switch() {
     let mut w = World::with(sim, Default::default(), fast_config());
     w.page("Lampu");
     w.idle();
-    assert!(w.has_text("=4 / 5"));
+    assert!(w.has_text("=80%"));
     w.click("3"); // top bar profile 3
     w.until("profile 3 loaded", 20, |w| {
         w.worker.snapshot().is_some_and(|s| s.profile == 2) && !w.worker.is_restarting()
     });
     w.idle();
     w.frames(5);
-    assert!(w.has_text("=1 / 5"), "{:?}", w.labels());
+    assert!(w.has_text("=20%"), "{:?}", w.labels());
 }
 
 #[test]
@@ -139,5 +139,39 @@ fn a_keyboard_that_ignores_rgbnack_still_shows_its_lighting() {
         "{:?}",
         w.labels()
     );
-    assert!(w.has_text("=4 / 5"), "{:?}", w.labels());
+    assert!(w.has_text("=80%"), "{:?}", w.labels());
+}
+
+fn switch_to_profile_3(w: &mut World) {
+    w.click("3"); // top bar profile 3
+    w.until("profile 3 loaded", 20, |w| {
+        w.worker.snapshot().is_some_and(|s| s.profile == 2) && !w.worker.is_restarting()
+    });
+    w.idle();
+    w.frames(5);
+}
+
+#[test]
+fn unsent_effect_edits_are_dropped_on_a_profile_switch() {
+    let mut w = lampu();
+    w.click("Statis");
+    assert!(w.has_text("Perubahan belum dikirim"), "{:?}", w.labels());
+    switch_to_profile_3(&mut w);
+    // Profile 3 shows its own lighting, not profile 1's unsent edits.
+    assert!(!w.has_text("Perubahan belum dikirim"), "{:?}", w.labels());
+    assert!(w.has_text("Belum ada perubahan"), "{:?}", w.labels());
+    assert!(!w.enabled("Terapkan ke keyboard"));
+}
+
+#[test]
+fn unsent_key_paint_is_dropped_on_a_profile_switch() {
+    let mut w = lampu();
+    w.click("Warna per tombol");
+    w.idle();
+    w.click_key(0x1A, false);
+    w.type_in_last_field("#FF8000");
+    w.click("Cat tombol terpilih");
+    assert!(w.has_text("1 tombol berubah"), "{:?}", w.labels());
+    switch_to_profile_3(&mut w);
+    assert!(w.has_text("0 tombol berubah"), "{:?}", w.labels());
 }
