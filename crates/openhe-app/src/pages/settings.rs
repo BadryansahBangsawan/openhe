@@ -18,7 +18,7 @@ use crate::widgets::card::{self, Card};
 use crate::widgets::keyboard::legend_list;
 use crate::widgets::segmented::Segmented;
 use crate::widgets::toggle::toggle;
-use crate::worker::{DeviceSnapshot, Pending, WorkerHandle};
+use crate::worker::{Debounce, DeviceSnapshot, Pending, WorkerHandle};
 use eframe::egui::{self, Align, Align2, CornerRadius, Layout, Rect, RichText, Sense, Ui};
 use openhe_device::{Error, Keyboard, Transport, WriteOutcome};
 use openhe_proto::{PollingRate, SystemMode};
@@ -675,8 +675,14 @@ pub fn import_result_text(r: &Result<ImportReport, Error>) -> (bool, String) {
     }
 }
 
+/// Profile names are saved this long after the last keystroke (and at once
+/// when the field loses focus).
+pub const NAME_SAVE_DELAY: Duration = Duration::from_millis(800);
+
 pub struct Page {
     switch: Option<(Pending<SwitchOutcome>, &'static str)>,
+    /// A profile name changed and is not saved yet.
+    name_save: Debounce,
     switch_error: Option<(String, Option<String>)>,
     restart: Restart,
     restart_job: Option<Pending<WriteOutcome>>,
@@ -699,6 +705,7 @@ impl Default for Page {
     fn default() -> Self {
         Page {
             switch: None,
+            name_save: Debounce::new(NAME_SAVE_DELAY),
             switch_error: None,
             restart: Restart::Idle,
             restart_job: None,
@@ -753,6 +760,12 @@ impl Page {
         }
         self.poll_transfer(ctx);
 
+        if self.names_due(now) && ctx.save_data().is_err() {
+            self.app_error = Some(t::SAVE_FAILED.to_string());
+        }
+        if self.name_save.is_pending() {
+            egui_ctx.request_repaint_after(NAME_SAVE_DELAY);
+        }
         // The switcher itself runs on the watcher thread; the UI only says
         // what it holds switches back with and shows failures.
         self.auto.set_ui_lock(locked || self.auto_locked());
@@ -862,6 +875,25 @@ impl Page {
     /// "Terapkan" (a switch would change the profile it was planned for).
     fn auto_locked(&self) -> bool {
         !self.idle() || matches!(self.transfer, Transfer::Planned { .. })
+    }
+
+    /// A profile name field this frame: `changed` (typed) or `lost_focus`.
+    /// True when the names should be saved now (the field was left); typing
+    /// saves after a pause (see [`Page::names_due`]).
+    fn name_edited(&mut self, changed: bool, lost_focus: bool, now: Instant) -> bool {
+        if lost_focus {
+            self.name_save.cancel();
+            return true;
+        }
+        if changed {
+            self.name_save.bump(now);
+        }
+        false
+    }
+
+    /// True (once) when typed names have waited [`NAME_SAVE_DELAY`].
+    fn names_due(&mut self, now: Instant) -> bool {
+        self.name_save.take_due(now)
     }
 
     /// Nothing of this page is running on the keyboard.
@@ -1089,7 +1121,8 @@ impl Page {
                         .text_color(color::TEXT)
                         .char_limit(24),
                 );
-                if edit.lost_focus() || (edit.changed() && !edit.has_focus()) {
+                let left = edit.lost_focus() || (edit.changed() && !edit.has_focus());
+                if self.name_edited(edit.changed(), left, Instant::now()) {
                     save = true;
                 }
                 drop(data);
@@ -2097,6 +2130,23 @@ mod tests {
             changed: false,
         };
         assert!(page.auto_locked());
+    }
+
+    #[test]
+    fn profile_names_are_saved_shortly_after_typing() {
+        let t0 = Instant::now();
+        let mut page = Page::default();
+        // Typing: saved once the user pauses, not on every key.
+        assert!(!page.name_edited(true, false, t0));
+        assert!(!page.names_due(t0 + Duration::from_millis(100)));
+        assert!(!page.name_edited(true, false, t0 + Duration::from_millis(200)));
+        assert!(!page.names_due(t0 + NAME_SAVE_DELAY));
+        assert!(page.names_due(t0 + Duration::from_millis(200) + NAME_SAVE_DELAY));
+        assert!(!page.names_due(t0 + Duration::from_secs(10)), "saved once");
+        // Leaving the field saves at once (and nothing is left pending).
+        page.name_edited(true, false, t0);
+        assert!(page.name_edited(false, true, t0));
+        assert!(!page.names_due(t0 + Duration::from_secs(10)));
     }
 
     #[test]
