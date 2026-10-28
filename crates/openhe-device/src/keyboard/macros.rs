@@ -9,7 +9,7 @@
 //! may overwrite the first one's actions on the keyboard. Test this on
 //! hardware before building a UI that promises it.
 
-use crate::{Error, Keyboard, Transport};
+use crate::{AdvancedConfig, Error, Keyboard, Transport};
 use openhe_proto::key::{Advanced, KeyMode, KeyParam};
 use openhe_proto::macros::{self, MacroAction, MacroError, PlayMode};
 
@@ -28,7 +28,11 @@ impl<T: Transport> Keyboard<T> {
     /// 1. validate (1..=255 actions, delays and `interval_ms` below 2^24,
     ///    `repeat >= 1`; `Error::InvalidInput`, before any I/O);
     /// 2. read the key's Mode (a read only; an unknown Mode is an `Error::Io`
-    ///    before anything is written);
+    ///    before anything is written). When the key holds another advanced
+    ///    function (DKS, MT, TGL, MPT, END or SOCD), clear it first with
+    ///    `set_advanced(key, AdvancedConfig::None)`, which also clears the
+    ///    old partner of a SOCD pair, so no partner is left half-bound; then
+    ///    read the Mode again;
     /// 3. write the MACRO data packets (at most 9 actions each, address from 256);
     /// 4. write Mode as `(touch << 4) | 6`, keeping the key's current touch mode
     ///    and high byte, verified by a read-back;
@@ -53,7 +57,11 @@ impl<T: Transport> Keyboard<T> {
         let packets = macros::data_packets(actions)?;
         let mode_req = macros::mode_set(key, actions.len() as u8, mode, repeat, interval_ms)?;
 
-        let current = self.macro_key_mode(key)?;
+        let mut current = self.macro_key_mode(key)?;
+        if !matches!(current.advanced, Advanced::None | Advanced::Macro) {
+            self.set_advanced(key, &AdvancedConfig::None)?;
+            current = self.macro_key_mode(key)?;
+        }
         let bound = KeyMode {
             advanced: Advanced::Macro,
             ..current
@@ -203,9 +211,10 @@ mod tests {
 
     #[test]
     fn mode_write_keeps_touch_mode_and_high_byte() {
-        // Current Mode: touch RapidTrigger (2), advanced DKS (1), high byte 0x07.
-        let current = KeyMode::from_u16(0x0721).unwrap().to_u16();
-        assert_eq!(current, 0x0721);
+        // Current Mode: touch RapidTrigger (2), no function, high byte 0x07.
+        // (A key with another function is cleared first; see below.)
+        let current = KeyMode::from_u16(0x0720).unwrap().to_u16();
+        assert_eq!(current, 0x0720);
         let new = 0x0726; // touch 2, advanced Macro, high 7
         let mut m = MockTransport::new();
         queue_bind(&mut m, current, 1, 1, new);
@@ -216,6 +225,91 @@ mod tests {
         );
         let w = k.session_mut().transport().written();
         assert_eq!(payload(&w[2]), [0x01, KEY, 0x08, 0x26, 0x07]);
+    }
+
+    /// A SOCD pair (4, 7), as `socd_get` reports it from either key.
+    fn socd_pair_reply() -> [u8; 64] {
+        reply(0x2C, &[0, 4, 7, 4, 0, 7, 0, 1, 2, 50, 0])
+    }
+
+    #[test]
+    fn binding_over_a_socd_key_clears_the_pair_first() {
+        // Key 4 is in a SOCD pair with key 7 (Mode 0x0018: Single + SOCD).
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x04, 8, 0x0018)); // bind: Mode read
+        m.push_reply(key_reply(0x04, 8, 0x0018)); // clear: Mode read
+        m.push_reply(socd_pair_reply()); // clear: its partner is 7
+        m.push_reply(key_reply(0x04, 8, 0x0018)); // clear: re-read key 4
+        m.push_reply(key_reply(0x07, 8, 0x0328)); // clear: re-read partner
+        m.push_reply(key_reply(0x04, 8, 0x0010)); // clear: Mode SET echo
+        m.push_reply(key_reply(0x04, 8, 0x0010)); // clear: read-backs
+        m.push_reply(key_reply(0x07, 8, 0x0320));
+        m.push_reply(key_reply(0x04, 8, 0x0010)); // bind: Mode re-read
+        m.push_reply(data_reply());
+        m.push_reply(key_reply(0x04, 8, 0x0016)); // Mode SET echo
+        m.push_reply(key_reply(0x04, 8, 0x0016)); // read-back
+        m.push_reply(reply(
+            0x21,
+            &macros::mode_set(0x04, 1, PlayMode::Once, 1, 100)
+                .unwrap()
+                .payload,
+        ));
+        m.push_reply(reply(
+            0x21,
+            &macros::mode_set(0x04, 1, PlayMode::Once, 1, 100)
+                .unwrap()
+                .payload,
+        ));
+        let mut k = kb(m);
+        assert_eq!(
+            k.bind_macro(0x04, &[act(4, true, 0)], PlayMode::Once, 1, 100),
+            Ok(())
+        );
+        let w = k.session_mut().transport().written().to_vec();
+        // The pair is cleared before any macro data goes out: key 4 and its
+        // partner 7 lose the SOCD nibble (touch mode and high byte kept).
+        let clear = w
+            .iter()
+            .position(|f| payload(f) == [0x01, 0x04, 8, 0x10, 0x00, 0x07, 8, 0x20, 0x03])
+            .expect("SOCD pair cleared");
+        let data = w.iter().position(|f| f[2] == 0x20).expect("macro data");
+        assert!(clear < data);
+        // Then key 4 gets the macro nibble on its current touch mode.
+        assert!(w.iter().any(|f| payload(f) == [0x01, 0x04, 8, 0x16, 0x00]));
+    }
+
+    #[test]
+    fn binding_over_another_function_clears_it_first() {
+        // Key with MT (nibble 3): cleared, then bound.
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(KEY, 8, 0x0003)); // bind: Mode read
+        m.push_reply(key_reply(KEY, 8, 0x0003)); // clear: Mode read
+        m.push_reply(key_reply(KEY, 8, 0x0003)); // clear: re-read
+        m.push_reply(key_reply(KEY, 8, 0x0000)); // clear: SET echo
+        m.push_reply(key_reply(KEY, 8, 0x0000)); // clear: read-back
+        queue_bind(&mut m, 0x0000, 1, 1, 0x0006);
+        let mut k = kb(m);
+        assert_eq!(
+            k.bind_macro(KEY, &[act(4, true, 0)], PlayMode::WhileHeld, 2, 100),
+            Ok(())
+        );
+        let w = k.session_mut().transport().written();
+        assert_eq!(payload(&w[3]), [0x01, KEY, 0x08, 0x00, 0x00]); // cleared
+        assert!(w
+            .iter()
+            .any(|f| payload(f) == [0x01, KEY, 0x08, 0x06, 0x00]));
+    }
+
+    #[test]
+    fn rebinding_a_macro_key_does_not_clear_it() {
+        let mut m = MockTransport::new();
+        queue_bind(&mut m, 0x0006, 1, 1, 0x0006);
+        let mut k = kb(m);
+        assert_eq!(
+            k.bind_macro(KEY, &[act(4, true, 0)], PlayMode::WhileHeld, 2, 100),
+            Ok(())
+        );
+        assert_eq!(k.session_mut().transport().written().len(), 6);
     }
 
     #[test]
