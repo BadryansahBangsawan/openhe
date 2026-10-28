@@ -31,9 +31,12 @@
 //!   change or a factory reset, when the keyboard re-enumerates) and connects
 //!   again after a pause.
 //! - [`Worker::set_calibration_guard`]: while set, a keyboard that is
-//!   (re)connected, or still open when the app closes, is sent
-//!   `stop_calibration` first, so a lost connection never leaves the keyboard
-//!   stuck in calibration mode (where it types nothing).
+//!   (re)connected is sent `stop_calibration` right after its handshake
+//!   (never to a keyboard in bootloader mode), and one still open when the
+//!   app closes is sent it too, so a lost connection never leaves the
+//!   keyboard stuck in calibration mode (where it types nothing). The app
+//!   treats a set guard as "calibrating": writes stay locked until a stop
+//!   worked.
 //!
 //! The transport is a type parameter with a connector closure, so tests drive
 //! the worker with `MockTransport`; the app uses the `HidTransport` default.
@@ -637,7 +640,7 @@ impl<T: Transport + 'static> Worker<T> {
     }
 
     /// While `on`, the worker sends `stop_calibration` to any keyboard it
-    /// (re)connects to before reading it, and to the open keyboard when the
+    /// (re)connects to, right after the handshake, and to the open keyboard when the
     /// worker shuts down. The calibration page sets it before starting and
     /// clears it once a stop succeeded. Cleared by the worker after it sent
     /// the stop on a reconnect.
@@ -706,7 +709,18 @@ impl<T: Transport + 'static> Drop for Worker<T> {
 pub fn load_snapshot<T: Transport>(
     kb: &mut Keyboard<T>,
 ) -> Result<(DeviceSnapshot, Vec<(u8, Error)>), Error> {
+    load_snapshot_then(kb, |_| {})
+}
+
+/// [`load_snapshot`], running `after_handshake` once the handshake has
+/// accepted the keyboard (so never on a keyboard in bootloader mode) and
+/// before anything else is read.
+pub fn load_snapshot_then<T: Transport>(
+    kb: &mut Keyboard<T>,
+    after_handshake: impl FnOnce(&mut Keyboard<T>),
+) -> Result<(DeviceSnapshot, Vec<(u8, Error)>), Error> {
     let info = kb.handshake()?;
+    after_handshake(kb);
     let system_mode = kb.system_mode()?;
     let profile = kb.profile()?;
     let polling = kb.polling_rate()?;
@@ -843,13 +857,18 @@ fn run<T: Transport>(
                 match guarded(&mut connect).0 {
                     Ok(mut k) => {
                         ctl.set_current(Some(LOAD_LABEL));
-                        if ctl.calibrating.load(Ordering::SeqCst)
-                            && guarded(|| k.stop_calibration()).0.is_ok()
-                        {
-                            // A stop that failed is tried again next connect.
-                            ctl.calibrating.store(false, Ordering::SeqCst);
-                        }
-                        let (loaded, _) = guarded(|| load_snapshot(&mut k));
+                        // The guard's stop goes out right after the
+                        // handshake, so a keyboard in bootloader mode is
+                        // never written to. A stop that failed is tried
+                        // again next connect.
+                        let stop_owed = |k: &mut Keyboard<T>| {
+                            if ctl.calibrating.load(Ordering::SeqCst)
+                                && guarded(|| k.stop_calibration()).0.is_ok()
+                            {
+                                ctl.calibrating.store(false, Ordering::SeqCst);
+                            }
+                        };
+                        let (loaded, _) = guarded(|| load_snapshot_then(&mut k, stop_owed));
                         ctl.set_current(None);
                         match loaded {
                             Ok((snap, skipped)) => {
@@ -1050,7 +1069,17 @@ pub(crate) mod tests {
 
     /// Every reply `load_snapshot` needs, in order, with `profile`.
     pub(crate) fn push_snapshot(m: &mut MockTransport, profile: u8) {
+        push_handshake(m);
+        push_snapshot_rest(m, profile);
+    }
+
+    /// The handshake (SYNC) reply that starts every load.
+    pub(crate) fn push_handshake(m: &mut MockTransport) {
         m.push_reply(reply(0x01, &[(25, &[3]), (26, b"App")]));
+    }
+
+    /// The replies of a load after its handshake.
+    pub(crate) fn push_snapshot_rest(m: &mut MockTransport, profile: u8) {
         m.push_reply(order_reply(0x21, 1));
         m.push_reply(order_reply(0x70, profile));
         m.push_reply(order_reply(0x50, 0));
@@ -1839,8 +1868,9 @@ pub(crate) mod tests {
         let w = Worker::spawn_with(
             Box::new(move || {
                 let mut inner = MockTransport::new();
+                push_handshake(&mut inner);
                 inner.push_reply(order_reply(0x0D, 1)); // stop, if sent
-                push_snapshot(&mut inner, 0);
+                push_snapshot_rest(&mut inner, 0);
                 Ok(Keyboard::new(
                     Probe {
                         inner,
@@ -1863,8 +1893,52 @@ pub(crate) mod tests {
             .iter()
             .position(|w| w[..7] == STOP_CALIBRATION)
             .expect("stop sent");
-        // Sent first on the new connection, before the handshake.
-        assert_eq!(writes[stop_at + 1][..4], [0x5C, 0x06, 0x01, 0x97]);
+        // Sent right after the handshake on the new connection (never
+        // before it: a keyboard in bootloader mode gets no write at all).
+        assert_eq!(writes[stop_at - 1][..4], [0x5C, 0x06, 0x01, 0x97]);
+    }
+
+    #[test]
+    fn calibration_guard_never_writes_to_a_bootloader_keyboard() {
+        let log: Arc<Mutex<Vec<[u8; 64]>>> = Arc::default();
+        let (l, plugged) = (log.clone(), Arc::new(AtomicBool::new(false)));
+        let tries = Arc::new(AtomicUsize::new(0));
+        let (p, t) = (plugged.clone(), tries.clone());
+        let w = Worker::spawn_with(
+            Box::new(move || {
+                if !p.load(Ordering::SeqCst) {
+                    return Err(Error::Unsupported("no supported keyboard was found".into()));
+                }
+                t.fetch_add(1, Ordering::SeqCst);
+                let mut inner = MockTransport::new();
+                inner.push_reply(reply(0x01, &[(7, &[1])])); // bootloader
+                inner.push_reply(order_reply(0x0D, 1)); // stop, if sent
+                Ok(Keyboard::new(
+                    Probe::logging(inner, l.clone()),
+                    Model::Win68HeMax,
+                ))
+            }),
+            fast(),
+        );
+        w.set_calibration_guard(true);
+        plugged.store(true, Ordering::SeqCst);
+        wait_for("bootloader seen", || {
+            w.status() == ConnectionStatus::Error(i18n::error::BOOTLOADER.into())
+                && tries.load(Ordering::SeqCst) >= 2
+        });
+        assert!(
+            !wrote_stop(&log),
+            "no stop to a keyboard in bootloader mode"
+        );
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|w| w[..4] == [0x5C, 0x06, 0x01, 0x97]));
+        assert!(
+            w.calibration_guard(),
+            "still owed once a real keyboard is back"
+        );
     }
 
     #[test]

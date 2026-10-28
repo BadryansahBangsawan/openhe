@@ -79,6 +79,9 @@ mod strings {
     pub const STOP_FAILED: &str =
         "Keyboard belum menjawab perintah berhenti; mungkin masih dalam mode kalibrasi (tidak bisa mengetik).";
     pub const STOP_AGAIN: &str = "Hentikan lagi";
+    /// Technical detail when the worker's stop on reconnect did not work.
+    pub const RECONNECT_STOP_TECH: &str =
+        "stop_calibration after reconnecting failed (calibration guard still set)";
 }
 use strings as t;
 
@@ -371,11 +374,21 @@ impl Lifecycle {
 
     /// After a failed stop: try again.
     pub fn retry_stop(&mut self) -> Option<Cmd> {
-        if self.phase == Phase::Idle && matches!(self.outcome, Some(Outcome::StopFailed(_))) {
-            self.phase = Phase::Stopping(StopReason::Cancelled);
-            return Some(Cmd::Stop);
+        if matches!(self.outcome, Some(Outcome::StopFailed(_))) {
+            return self.stop_owed();
         }
         None
+    }
+
+    /// A stop the keyboard may still need although nothing runs here (the
+    /// worker's calibration guard is still set, e.g. after a failed stop or
+    /// a reconnect whose stop failed). Only while idle.
+    pub fn stop_owed(&mut self) -> Option<Cmd> {
+        if self.phase != Phase::Idle {
+            return None;
+        }
+        self.phase = Phase::Stopping(StopReason::Cancelled);
+        Some(Cmd::Stop)
     }
 
     fn stop_with(&mut self, reason: StopReason) -> Option<Cmd> {
@@ -485,6 +498,36 @@ impl Page {
             .then(|| worker.submit("calibration-stop-exit", |kb| kb.stop_calibration()))
     }
 
+    /// The shell's "Hentikan kalibrasi": the worker's calibration guard is
+    /// set while nothing runs here, so the keyboard may still be
+    /// calibrating. Sends a stop (picked up by [`Page::pump`], which clears
+    /// the guard once it worked). False when nothing was sent.
+    pub fn stop_owed<T: Transport + 'static>(&mut self, worker: &Worker<T>) -> bool {
+        if !worker.calibration_guard() {
+            return false;
+        }
+        let cmd = self.life.stop_owed();
+        let sent = cmd.is_some();
+        self.exec(worker, cmd);
+        sent
+    }
+
+    /// The connection came back while the last calibration ended as
+    /// `Interrupted`: if the worker's calibration guard is still set, its
+    /// stop on reconnect did not work, so the keyboard may still be
+    /// calibrating. That is a failed stop (with "Hentikan lagi"), not an
+    /// interruption that has been taken care of.
+    fn after_reconnect(&mut self, connected: bool, connects: u64, guard: bool) {
+        if self.life.outcome == Some(Outcome::Interrupted)
+            && self.life.phase == Phase::Idle
+            && connected
+            && connects != self.connects_at_start
+            && guard
+        {
+            self.life.outcome = Some(Outcome::StopFailed(t::RECONNECT_STOP_TECH.to_string()));
+        }
+    }
+
     /// Called when the user leaves the page: stops a running calibration
     /// (the result is picked up by [`Page::pump`]).
     pub fn leave(&mut self, worker: &Worker) {
@@ -494,7 +537,12 @@ impl Page {
 
     /// Runs every frame, whichever page is shown: collects finished jobs,
     /// notices a lost connection and sends the next poll.
-    pub fn pump(&mut self, worker: &Worker, snapshot: Option<&DeviceSnapshot>, ui: &egui::Context) {
+    pub fn pump<T: Transport + 'static>(
+        &mut self,
+        worker: &Worker<T>,
+        snapshot: Option<&DeviceSnapshot>,
+        ui: &egui::Context,
+    ) {
         let now = Instant::now();
         if let Some(r) = self.start.as_mut().and_then(Pending::poll) {
             self.start = None;
@@ -531,6 +579,11 @@ impl Page {
             self.start = None;
             self.poll = None;
         }
+        self.after_reconnect(
+            snapshot.is_some(),
+            worker.connects(),
+            worker.calibration_guard(),
+        );
         let cmd = self.life.tick(now);
         self.exec(worker, cmd);
         if self.life.is_active() {
@@ -556,7 +609,7 @@ impl Page {
         }
     }
 
-    fn exec(&mut self, worker: &Worker, cmd: Option<Cmd>) {
+    fn exec<T: Transport + 'static>(&mut self, worker: &Worker<T>, cmd: Option<Cmd>) {
         match cmd {
             None => {}
             Some(Cmd::Start) => {
@@ -764,7 +817,8 @@ impl Page {
                 card::hint(ui, text);
             }
             Outcome::StopFailed(tech) => {
-                let retry = ctx.can_write().then_some(t::STOP_AGAIN);
+                // Not `can_write`: that stays false while the guard is set.
+                let retry = (ctx.connected() && !ctx.busy).then_some(t::STOP_AGAIN);
                 if card::error_box(ui, t::FAILED, t::STOP_FAILED, retry, Some(&tech)) {
                     let cmd = self.life.retry_stop();
                     self.exec(ctx.worker, cmd);
@@ -1265,6 +1319,55 @@ mod tests {
         let mut page = Page::default();
         assert!(page.exit_stop(&w).is_none());
         assert!(!crate::worker::tests::wrote_stop(&log));
+    }
+
+    #[test]
+    fn a_reconnect_whose_stop_failed_is_a_failed_stop_not_an_interruption() {
+        let mut page = Page::default();
+        page.life.start();
+        page.connects_at_start = 1;
+        page.life.started(Ok(()), Instant::now());
+        page.life.connection_lost();
+        assert_eq!(page.life.outcome, Some(Outcome::Interrupted));
+        // Still disconnected, or reconnected with the stop done: as is.
+        page.after_reconnect(false, 1, true);
+        page.after_reconnect(true, 2, false);
+        assert_eq!(page.life.outcome, Some(Outcome::Interrupted));
+        // Reconnected, but the worker's stop did not work (guard still set).
+        page.after_reconnect(true, 2, true);
+        assert!(
+            matches!(page.life.outcome, Some(Outcome::StopFailed(_))),
+            "{:?}",
+            page.life.outcome
+        );
+        // ... which offers "Hentikan lagi".
+        assert_eq!(page.life.retry_stop(), Some(Cmd::Stop));
+    }
+
+    #[test]
+    fn a_stop_owed_from_any_page_clears_the_guard() {
+        use crate::app::test_support::offline_worker;
+        let (w, log) = logged_worker();
+        let ctx = egui::Context::default();
+        let snap = snapshot68();
+        let mut page = Page::default();
+        // The guard is set but nothing runs (e.g. a stop that failed after
+        // a reconnect): the shell's "Hentikan kalibrasi" sends a stop.
+        w.set_calibration_guard(true);
+        assert!(page.stop_owed(&w));
+        assert!(page.is_active(), "stopping");
+        assert!(!page.stop_owed(&w), "one stop at a time");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while page.is_active() {
+            assert!(Instant::now() < deadline);
+            page.pump(&w, Some(&snap), &ctx);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(crate::worker::tests::wrote_stop(&log));
+        assert!(!w.calibration_guard(), "cleared once the stop worked");
+        // Without a guard there is nothing to stop.
+        let off = offline_worker();
+        assert!(!Page::default().stop_owed(&off));
     }
 
     #[test]

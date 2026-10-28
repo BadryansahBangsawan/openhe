@@ -193,6 +193,9 @@ pub mod events {
     pub const PROFILE_SWITCH_FAILED: &str = "Gagal mengganti profil.";
     pub const MODE_SWITCH_FAILED: &str = "Gagal mengganti mode Win/Mac.";
     pub const LOCKED_CALIBRATING: &str = "Hentikan kalibrasi dulu";
+    pub const CALIBRATION_OWED: &str =
+        "Keyboard mungkin masih dalam mode kalibrasi (tidak bisa mengetik). Perubahan dikunci sampai kalibrasi dihentikan.";
+    pub const STOP_CALIBRATION: &str = "Hentikan kalibrasi";
     pub const AUTO_SWITCHED: &str = "Profil diganti otomatis untuk";
     pub const AUTO_SWITCH_FAILED: &str = "Ganti profil otomatis gagal.";
 }

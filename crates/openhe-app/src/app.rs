@@ -59,9 +59,12 @@ impl AppCtx<'_> {
         self.snapshot.is_some()
     }
 
-    /// Connected and idle: write buttons may be enabled.
+    /// Connected, idle and not calibrating: write buttons may be enabled.
+    /// While the worker's calibration guard is set the keyboard may still
+    /// be in calibration mode (also after a stop that failed), so nothing
+    /// is written until a stop worked.
     pub fn can_write(&self) -> bool {
-        self.snapshot.is_some() && !self.busy
+        self.snapshot.is_some() && !self.busy && !self.worker.calibration_guard()
     }
 
     pub fn save_data(&self) -> std::io::Result<()> {
@@ -218,6 +221,20 @@ impl OpenHeApp {
         self.change_page(page);
     }
 
+    /// The keyboard may be calibrating: the Kalibrasi page is running one,
+    /// or the worker's calibration guard is still set (a stop that failed,
+    /// a reconnect whose stop failed). Writes, the top bar and automatic
+    /// profile switches stay locked meanwhile.
+    pub fn calibrating(&self) -> bool {
+        self.calibration.is_active() || self.worker.calibration_guard()
+    }
+
+    /// The guard is set but no calibration runs on the page: the shell
+    /// shows a banner with "Hentikan kalibrasi".
+    pub fn stop_owed(&self) -> bool {
+        self.worker.calibration_guard() && !self.calibration.is_active()
+    }
+
     /// Switches pages; leaving Kalibrasi always stops a running calibration.
     fn change_page(&mut self, page: PageId) {
         if self.page == PageId::Calibration && page != PageId::Calibration {
@@ -301,7 +318,8 @@ impl OpenHeApp {
         // Calibration jobs are collected whichever page is shown, so a stop
         // sent on leaving the page is always seen through.
         self.calibration.pump(&self.worker, snapshot, ctx);
-        let calibrating = self.calibration.is_active();
+        let calibrating = self.calibrating();
+        let stop_owed = self.stop_owed();
         if busy || snapshot.is_none() {
             // Keep polling pending jobs and the connection state.
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -372,7 +390,11 @@ impl OpenHeApp {
         );
 
         let worker_notice = snapshot.and(self.worker.notice());
-        if worker_notice.is_some() || self.data_notice.is_some() || self.shell_error.is_some() {
+        if worker_notice.is_some()
+            || self.data_notice.is_some()
+            || self.shell_error.is_some()
+            || stop_owed
+        {
             egui::TopBottomPanel::top("notices")
                 .show_separator_line(false)
                 .frame(Frame::new().fill(color::BG).inner_margin(Margin {
@@ -382,6 +404,16 @@ impl OpenHeApp {
                     bottom: 0,
                 }))
                 .show(ctx, |ui| {
+                    if stop_owed
+                        && notice_bar(
+                            ui,
+                            i18n::events::CALIBRATION_OWED,
+                            i18n::events::STOP_CALIBRATION,
+                            snapshot.is_some() && !busy,
+                        )
+                    {
+                        self.calibration.stop_owed(&self.worker);
+                    }
                     if let Some(n) = &worker_notice {
                         // Skipped keys stay skipped on a reload: offer to
                         // hide the notice instead (it comes back if other
@@ -956,6 +988,37 @@ mod tests {
             text.starts_with(i18n::events::PROFILE_SWITCH_FAILED),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_set_calibration_guard_locks_writes_app_wide() {
+        let w = offline_worker();
+        w.inject_status(ConnectionStatus::Connected(snapshot68()));
+        let app = OpenHeApp::with_worker(w, AppData::default());
+        let snap = snapshot68();
+        let status = app.worker.status();
+        let ctx = AppCtx {
+            worker: &app.worker,
+            snapshot: Some(&snap),
+            status: &status,
+            busy: false,
+            theme: &app.theme,
+            data: &app.data,
+        };
+        assert!(ctx.can_write());
+        assert!(!app.calibrating());
+        assert!(!app.stop_owed());
+        // A stop that failed (page idle, guard still set): the keyboard may
+        // still be calibrating, so every page and the top bar stay locked
+        // and the shell offers "Hentikan kalibrasi".
+        app.worker.set_calibration_guard(true);
+        assert!(!ctx.can_write());
+        assert!(app.calibrating());
+        assert!(app.stop_owed());
+        let egui_ctx = egui::Context::default();
+        theme::apply(&egui_ctx);
+        let mut app = app;
+        run_frames(&egui_ctx, 2, |c| app.draw(c));
     }
 
     #[test]
