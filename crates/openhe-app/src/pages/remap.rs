@@ -311,15 +311,21 @@ pub const FN2_HOLD: u16 = 0xF002;
 
 /// The pending Fn1 changes would remove the last Fn2 (tahan) from the Fn1
 /// layer (`fn1`: the codes read), leaving no way into Fn2 from there.
+///
+/// Keys whose Fn1 code was not read (a partial read) may hold Fn2 (tahan)
+/// themselves, so replacing one of them counts as possibly removing it
+/// unless a known Fn2 (tahan) stays on the layer.
 pub fn loses_fn2_access(fn1: &BTreeMap<u8, u16>, changes: &Changes) -> bool {
     let had = fn1.values().any(|&c| c == FN2_HOLD);
     let mut after = fn1.clone();
+    let mut unread_replaced = false;
     for (k, l, c) in changes.entries() {
         if l == Layer::Fn1 {
+            unread_replaced |= !fn1.contains_key(&k) && c != FN2_HOLD;
             after.insert(k, c);
         }
     }
-    had && !after.values().any(|&c| c == FN2_HOLD)
+    (had || unread_replaced) && !after.values().any(|&c| c == FN2_HOLD)
 }
 
 /// `key` holds the only Fn2 (tahan) of the Fn1 layer (`fn1`).
@@ -340,8 +346,7 @@ pub fn picker_label(code: u16) -> String {
 /// Codes offered by the picker: reserved placeholders ("-"), the unnamed
 /// non-US keys and the two codes with no known meaning are hidden.
 pub fn pickable(k: &KeyCode) -> bool {
-    !is_placeholder(k)
-        && !matches!(k.code, 0x0032 | 0x0064 | 0x00C7 | 0x00C8)
+    !is_placeholder(k) && !matches!(k.code, 0x0032 | 0x0064 | 0x00C7 | 0x00C8)
 }
 
 /// The hex digits of a query that looks like a hex code: "0x…" or at least
@@ -1543,7 +1548,9 @@ impl Page {
             }
             ui.add_space(8.0);
         }
-        if let Some(fn1) = self.codes.get(&(Layer::Fn1 as u8)) {
+        let no_codes = BTreeMap::new();
+        let fn1 = self.codes.get(&(Layer::Fn1 as u8)).unwrap_or(&no_codes);
+        {
             if loses_fn2_access(fn1, &self.changes) {
                 ui.add(egui::Label::new(RichText::new(t::LOSES_FN2).color(color::DANGER)).wrap());
                 ui.add_space(6.0);
@@ -1997,6 +2004,28 @@ mod tests {
         assert!(!loses_fn2_access(&none_map, &Changes::default()));
         assert!(is_only_fn2_hold(&fn1, 0xE4));
         assert!(!is_only_fn2_hold(&fn1, 0x04));
+    }
+
+    /// A partly read Fn1: the key that was not read may be the one holding
+    /// Fn2 (tahan), so replacing it is warned about unless a known Fn2
+    /// (tahan) stays.
+    #[test]
+    fn replacing_an_unread_fn1_key_warns_conservatively() {
+        let partial: BTreeMap<u8, u16> = [(0x04, 0xF101)].into();
+        let mut c = Changes::default();
+        c.queue(Layer::Fn1, &[0xE4], 0x0005, none);
+        assert!(loses_fn2_access(&partial, &c), "unread RCtrl replaced");
+        assert!(
+            loses_fn2_access(&BTreeMap::new(), &c),
+            "nothing read at all"
+        );
+        // Putting Fn2 (tahan) on an unread key is no loss.
+        let mut put = Changes::default();
+        put.queue(Layer::Fn1, &[0xE4], 0xF002, none);
+        assert!(!loses_fn2_access(&partial, &put));
+        // A known Fn2 (tahan) elsewhere keeps the way in.
+        let with: BTreeMap<u8, u16> = [(0x04, 0xF101), (0x39, 0xF002)].into();
+        assert!(!loses_fn2_access(&with, &c));
     }
 
     #[test]

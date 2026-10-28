@@ -1,8 +1,8 @@
 //! UI queries and input for [`World`]: by AccessKit label, value or role.
 
 use super::{collect, World};
-use eframe::egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect};
 use eframe::egui::accesskit::{Role, Toggled};
+use eframe::egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect};
 use egui_kittest::kittest::{NodeT, Queryable};
 
 impl World {
@@ -35,6 +35,19 @@ impl World {
         !self.first(label).accesskit_node().is_disabled()
     }
 
+    /// How many nodes are labelled exactly `label`.
+    pub fn h_count(&self, label: &str) -> usize {
+        self.h.query_all_by_label(label).count()
+    }
+
+    /// Whether the n-th node labelled `label` is enabled.
+    pub fn enabled_nth(&self, label: &str, n: usize) -> bool {
+        self.h
+            .query_all_by_label(label)
+            .nth(n)
+            .is_some_and(|x| !x.accesskit_node().is_disabled())
+    }
+
     /// Whether the first node labelled `label` is selected or checked.
     pub fn selected(&self, label: &str) -> bool {
         let n = self.first(label);
@@ -56,7 +69,10 @@ impl World {
         {
             let all: Vec<_> = self.h.query_all_by_label(label).collect();
             let Some(node) = all.get(n) else {
-                panic!("no node {n} labelled {label:?}; on screen: {:?}", self.labels());
+                panic!(
+                    "no node {n} labelled {label:?}; on screen: {:?}",
+                    self.labels()
+                );
             };
             assert!(
                 !node.accesskit_node().is_disabled(),
@@ -72,7 +88,10 @@ impl World {
     pub fn click_text(&mut self, text: &str) {
         {
             let Some(node) = self.h.query_all_by_label_contains(text).next() else {
-                panic!("no node containing {text:?}; on screen: {:?}", self.labels());
+                panic!(
+                    "no node containing {text:?}; on screen: {:?}",
+                    self.labels()
+                );
             };
             node.click();
         }
@@ -97,7 +116,11 @@ impl World {
     pub fn pick_code(&mut self, button: &str, n: usize, search: &str, chip: &str) {
         self.click_nth(button, n);
         let fields = self.h.query_all_by_role(Role::TextInput).count();
-        assert!(fields > 0, "no search field; on screen: {:?}", self.labels());
+        assert!(
+            fields > 0,
+            "no search field; on screen: {:?}",
+            self.labels()
+        );
         // The picker's search field is the newest text field.
         self.click_role(Role::TextInput, fields - 1);
         // The picker keeps its last search: replace it.
@@ -181,7 +204,10 @@ impl World {
         {
             let all: Vec<_> = self.h.query_all_by_value(value).collect();
             let Some(node) = all.get(n) else {
-                panic!("no node {n} with value {value:?}; on screen: {:?}", self.labels());
+                panic!(
+                    "no node {n} with value {value:?}; on screen: {:?}",
+                    self.labels()
+                );
             };
             node.click();
         }
@@ -194,7 +220,10 @@ impl World {
         {
             let all: Vec<_> = self.h.query_all_by_label(label).collect();
             let Some(node) = all.get(n) else {
-                panic!("no field {n} labelled {label:?}; on screen: {:?}", self.labels());
+                panic!(
+                    "no field {n} labelled {label:?}; on screen: {:?}",
+                    self.labels()
+                );
             };
             node.click();
         }
@@ -225,7 +254,10 @@ impl World {
 
     /// Types `text` into the focused field (no Enter).
     pub fn type_text(&mut self, text: &str) {
-        self.h.input_mut().events.push(Event::Text(text.to_string()));
+        self.h
+            .input_mut()
+            .events
+            .push(Event::Text(text.to_string()));
         self.frames(2);
     }
 
