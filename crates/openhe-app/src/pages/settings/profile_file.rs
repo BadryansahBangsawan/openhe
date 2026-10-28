@@ -14,12 +14,16 @@
 //!   worker for a full reload.
 
 use crate::worker::DeviceSnapshot;
+use openhe_device::keyboard::performance::{MAX_DEADZONE_UM, MIN_RT_UM};
 use openhe_device::{AdvancedConfig, Error, KeySettings, Keyboard, PerformanceChange, Transport};
-use openhe_proto::advanced::{Dks, End, Mpt, Mt, Socd, SocdMode, Tgl};
+use openhe_proto::advanced::{self, Dks, End, Mpt, Mt, Socd, SocdMode, Tgl};
 use openhe_proto::key::{Advanced, KeyMode};
+use openhe_proto::keycodes;
 use openhe_proto::lighting::{Lighting, Rgb, COLOR_SLOTS};
+use openhe_proto::model::MIN_ACTUATION_UM;
 use openhe_proto::{Layer, Micrometers, Model, TouchMode};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// `format` field of every profile file.
 pub const FORMAT: &str = "openhe-profile";
@@ -526,8 +530,112 @@ fn perf_change(s: &KeySettings) -> PerformanceChange {
     }
 }
 
-/// Plans an import of `data` onto the keyboard in `snap`. Refuses a file
-/// for another model.
+fn bad(msg: String) -> FileError {
+    FileError::BadValue(msg)
+}
+
+fn known_code(key: u8, what: &str, code: u16) -> Result<(), FileError> {
+    if keycodes::lookup(code).is_none() {
+        return Err(bad(format!(
+            "key 0x{key:02X}: unknown {what} keycode 0x{code:04X}"
+        )));
+    }
+    Ok(())
+}
+
+/// The checks the device API would make while writing `change` to `key`
+/// (switch id, actuation 0.1 mm..=max, RT 0.005 mm..=max, deadzones
+/// 0..=1.0 mm), done up front so a bad file writes nothing.
+fn check_performance(model: Model, key: u8, change: &PerformanceChange) -> Result<(), FileError> {
+    let id = change.switch.unwrap_or(0);
+    let sw = model
+        .switches()
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| bad(format!("key 0x{key:02X}: unknown switch id {id}")))?;
+    let max = sw.max_travel.0;
+    if let Some(a) = change.actuation {
+        if a.0 < MIN_ACTUATION_UM || a.0 > max {
+            return Err(bad(format!("key 0x{key:02X}: actuation {} um", a.0)));
+        }
+    }
+    for (name, v) in [
+        ("RT press", change.rt_press),
+        ("RT release", change.rt_release),
+    ] {
+        if let Some(v) = v {
+            if v.0 < MIN_RT_UM || v.0 > max {
+                return Err(bad(format!("key 0x{key:02X}: {name} {} um", v.0)));
+            }
+        }
+    }
+    for (name, v) in [
+        ("top deadzone", change.top_dz),
+        ("bottom deadzone", change.bottom_dz),
+    ] {
+        if let Some(v) = v {
+            if v.0 > MAX_DEADZONE_UM {
+                return Err(bad(format!("key 0x{key:02X}: {name} {} um", v.0)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The function checks of `set_advanced`: the proto packet builders'
+/// validation, known keycodes, and SOCD positions that are real keys of
+/// this keyboard with `key` one of them.
+fn check_advanced(key: u8, cfg: &AdvancedConfig, present: &BTreeSet<u8>) -> Result<(), FileError> {
+    let invalid = |e: openhe_proto::advanced::AdvancedError| bad(format!("key 0x{key:02X}: {e}"));
+    match cfg {
+        AdvancedConfig::None | AdvancedConfig::Macro => {}
+        AdvancedConfig::Dks(d) => {
+            advanced::dks_set(key, d).map_err(invalid)?;
+            for c in d.bindings {
+                known_code(key, "DKS", c)?;
+            }
+        }
+        AdvancedConfig::Mt(m) => {
+            advanced::mt_set(key, m).map_err(invalid)?;
+            known_code(key, "MT hold", m.hold)?;
+            known_code(key, "MT tap", m.tap)?;
+        }
+        AdvancedConfig::Tgl(t) => {
+            advanced::tgl_set(key, t).map_err(invalid)?;
+            known_code(key, "TGL", t.code)?;
+        }
+        AdvancedConfig::Mpt(m) => {
+            advanced::mpt_set(key, m).map_err(invalid)?;
+            for c in m.codes {
+                known_code(key, "MPT", c)?;
+            }
+        }
+        AdvancedConfig::End(e) => known_code(key, "END", e.code)?,
+        AdvancedConfig::Socd(s) => {
+            advanced::socd_set(s).map_err(invalid)?;
+            if key != s.pos1 && key != s.pos2 {
+                return Err(bad(format!("key 0x{key:02X} is not in its SOCD pair")));
+            }
+            for p in [s.pos1, s.pos2] {
+                if !present.contains(&p) {
+                    return Err(bad(format!("SOCD position 0x{p:02X} is not a key")));
+                }
+            }
+            known_code(key, "SOCD", s.key1)?;
+            known_code(key, "SOCD", s.key2)?;
+        }
+    }
+    Ok(())
+}
+
+/// Plans an import of `data` onto the keyboard in `snap`.
+///
+/// Everything the device API would refuse is checked here first, so a bad
+/// file is rejected (`FileError`) before anything is written: the model,
+/// duplicate key entries, every performance value against its switch,
+/// every advanced function (packet validation, keycodes, SOCD positions),
+/// every layer keycode, and the per-key colours (no duplicates). The Fn
+/// key's own base-layer code is left out of the writes.
 pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPlan, FileError> {
     if data.model != snap.model {
         return Err(FileError::WrongModel {
@@ -535,7 +643,19 @@ pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPl
             keyboard: snap.model.name().to_string(),
         });
     }
-    let present: std::collections::BTreeSet<u8> = snap.matrix.keys().map(|(_, _, c)| c).collect();
+    let present: BTreeSet<u8> = snap.matrix.keys().map(|(_, _, c)| c).collect();
+    let mut seen = BTreeSet::new();
+    for k in &data.keys {
+        if !seen.insert(k.code) {
+            return Err(bad(format!("key 0x{:02X} is listed twice", k.code)));
+        }
+    }
+    let mut colored = BTreeSet::new();
+    for (k, _) in &data.key_colors {
+        if !colored.insert(*k) {
+            return Err(bad(format!("colour of key 0x{k:02X} is listed twice")));
+        }
+    }
     let mut plan = ImportPlan::default();
     let mut socd_done: Vec<(u8, u8)> = Vec::new();
     for k in &data.keys {
@@ -544,6 +664,13 @@ pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPl
             continue;
         }
         let change = perf_change(&k.settings);
+        check_performance(snap.model, k.code, &change)?;
+        check_advanced(k.code, &k.advanced, &present)?;
+        for (layer, code) in LAYERS.into_iter().zip(k.layers) {
+            if !(k.code == FN_KEY && layer == Layer::Base) {
+                known_code(k.code, "layer", code)?;
+            }
+        }
         match plan.performance.iter_mut().find(|(_, c)| *c == change) {
             Some((keys, _)) => keys.push(k.code),
             None => plan.performance.push((vec![k.code], change)),
@@ -696,7 +823,7 @@ mod tests {
                         bindings: [0x14, 0xE1, 0, 0],
                         trps: [0x01, 0x80, 0, 0],
                         first_actuation: um(1500),
-                        bottom: um(3300),
+                        bottom: um(3400),
                     }),
                 ),
                 key(
@@ -839,6 +966,93 @@ mod tests {
         snap.keys.get_mut(&0x29).unwrap().mode.advanced = Advanced::Dks;
         let plan = plan_import(&sample(), &snap).unwrap();
         assert_eq!(plan.clear_advanced, vec![0x29]);
+    }
+
+    /// Every way a file can be wrong where the device API would refuse it,
+    /// placed in the file's last key so earlier keys would have been
+    /// written by a check-as-you-go import.
+    #[test]
+    fn a_bad_value_late_in_the_file_writes_nothing() {
+        let snap = snapshot68();
+        let last = sample().keys.len() - 1; // the Fn key, Global
+        let mut cases: Vec<(&str, ProfileData)> = Vec::new();
+        let mut push = |name: &'static str, f: &dyn Fn(&mut ProfileData)| {
+            let mut d = sample();
+            f(&mut d);
+            cases.push((name, d));
+        };
+        push("unknown switch", &|d| d.keys[last].settings.switch = 9);
+        push("actuation beyond travel", &|d| {
+            let k = &mut d.keys[1].settings; // rapid trigger key
+            k.actuation = um(3500);
+        });
+        push("actuation below 0.1", &|d| {
+            d.keys[1].settings.actuation = um(50)
+        });
+        push("RT below 0.005", &|d| d.keys[1].settings.rt_press = um(2));
+        push("RT beyond travel", &|d| {
+            d.keys[1].settings.rt_release = um(3401)
+        });
+        push("deadzone above 1 mm", &|d| {
+            d.keys[last].settings.bottom_dz = um(1001)
+        });
+        push("DKS depth", &|d| {
+            if let AdvancedConfig::Dks(x) = &mut d.keys[2].advanced {
+                x.first_actuation = um(10);
+            }
+        });
+        push("MPT depth", &|d| {
+            if let AdvancedConfig::Mpt(x) = &mut d.keys[5].advanced {
+                x.depths[2] = um(9000);
+            }
+        });
+        push("MT delay", &|d| {
+            if let AdvancedConfig::Mt(x) = &mut d.keys[3].advanced {
+                x.delay_ms = 0;
+            }
+        });
+        push("SOCD position not a key", &|d| {
+            for k in &mut d.keys {
+                if let AdvancedConfig::Socd(x) = &mut k.advanced {
+                    x.pos2 = 0x68;
+                }
+            }
+        });
+        push("SOCD on a key outside its pair", &|d| {
+            d.keys[last].advanced = AdvancedConfig::Socd(socd());
+        });
+        push("unknown layer keycode", &|d| {
+            d.keys[last].layers[3] = 0xBEEF
+        });
+        push("unknown TGL keycode", &|d| {
+            if let AdvancedConfig::Tgl(x) = &mut d.keys[4].advanced {
+                x.code = 0xBEEF;
+            }
+        });
+        push("duplicate key", &|d| {
+            let k = d.keys[0].clone();
+            d.keys.push(k);
+        });
+        push("duplicate colour", &|d| {
+            let c = d.key_colors[0];
+            d.key_colors.push(c);
+        });
+        for (name, data) in cases {
+            let r = plan_import(&data, &snap);
+            assert!(matches!(r, Err(FileError::BadValue(_))), "{name}: {r:?}");
+            // The UI only runs import_job with a plan, so nothing is
+            // written; show it with a keyboard that records writes.
+            let mut kb = Keyboard::new(MockTransport::new(), Model::Win68HeMax);
+            if let Ok(plan) = r {
+                let _ = import_job(&mut kb, &plan);
+            }
+            assert!(
+                kb.session_mut().transport().written().is_empty(),
+                "{name}: wrote before failing"
+            );
+        }
+        // The untouched sample still plans.
+        assert!(plan_import(&sample(), &snap).is_ok());
     }
 
     #[test]
