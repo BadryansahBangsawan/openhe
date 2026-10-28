@@ -1,3 +1,9 @@
+pub mod advanced;
+pub mod lighting;
+pub mod macros;
+pub mod performance;
+pub mod system;
+
 use crate::{Error, Session, Transport};
 use openhe_proto::defkey::{self, Matrix};
 use openhe_proto::key::{self, KeyMode, KeyParam};
