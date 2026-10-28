@@ -232,3 +232,14 @@ fn switching_or_editing_the_macro_forgets_the_last_bind() {
     w.frames(2);
     assert!(!w.has("Coba lagi"), "a retry would send the old macro");
 }
+
+#[test]
+fn the_recorder_says_its_delays_are_frame_steps() {
+    let mut w = World::new();
+    w.page("Macro");
+    w.click("+ Baru");
+    w.click("● Rekam");
+    // egui stamps events per frame, not per key: the UI says so.
+    assert!(w.has_text("per frame layar"), "{:?}", w.labels());
+    w.click("● Berhenti");
+}

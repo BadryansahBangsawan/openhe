@@ -58,6 +58,8 @@ mod strings {
     pub const RECORDING: &str =
         "Merekam. Tekan tombol di keyboard komputer; pencet Berhenti kalau selesai.";
     pub const RECORD_APPENDS: &str = "Hasil rekaman ditambahkan di akhir langkah.";
+    pub const RECORD_TIMING: &str =
+        "Jeda direkam per frame layar (sekitar 16 ms), jadi tombol yang ditekan sangat cepat bisa tercatat 0 ms. Ubah jedanya di tabel kalau perlu lebih tepat.";
     pub const RECORD_FULL: &str = "Batas 255 langkah tercapai; rekaman dihentikan.";
     pub const RECORD_INTERRUPTED: &str = "Rekaman dihentikan karena halaman ditinggalkan.";
     pub const ADD_STEP: &str = "+ Tambah langkah";
@@ -314,6 +316,13 @@ pub struct Recording {
 /// Turns key events into macro actions. The delay of an action is the time
 /// until the next recorded action ("jeda setelahnya"), measured between the
 /// timestamps passed in (seconds); the last action has delay 0.
+///
+/// egui gives events no timestamps of their own, only the frame time, so
+/// delays come in frame steps (~16 ms) and events of one frame get 0 ms
+/// between them (the UI says so, `strings::RECORD_TIMING`). Modifiers are
+/// not key events in egui either: those that change within one frame are
+/// recorded in the order Ctrl, Shift, Alt, GUI, but always before the key
+/// event that carries them.
 #[derive(Debug)]
 pub struct Recorder {
     actions: Vec<MacroAction>,
@@ -1643,7 +1652,7 @@ impl Page {
                     });
                 if recording {
                     ui.add_space(8.0);
-                    card::hint(ui, strings::RECORD_APPENDS);
+                    card::hint(ui, strings::RECORD_TIMING);
                 }
                 card::hint(ui, strings::DELAY_HINT);
             });
