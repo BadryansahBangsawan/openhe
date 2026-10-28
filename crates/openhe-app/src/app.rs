@@ -391,6 +391,12 @@ impl OpenHeApp {
         // Calibration jobs are collected whichever page is shown, so a stop
         // sent on leaving the page is always seen through.
         self.calibration.pump(&self.worker, snapshot, ctx);
+        if self.calibration.take_saved() {
+            self.data.borrow_mut().last_calibrated = Some(pages::calibration::unix_now());
+            if self.data.borrow().save().is_err() {
+                self.shell_error = Some((i18n::storage::SAVE_FAILED.to_string(), None));
+            }
+        }
         let calibrating = self.calibrating();
         let stop_owed = self.stop_owed();
         if busy || snapshot.is_none() {

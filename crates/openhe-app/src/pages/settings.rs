@@ -533,7 +533,7 @@ mod strings {
     pub const AUTO_NO_RULES: &str = "Belum ada aturan. Tambahkan aplikasi dan profilnya.";
     pub const AUTO_FAILED: &str = "Pemantau aplikasi tidak bisa dijalankan.";
     pub const AUTO_SESSION: &str =
-        "Aturan disimpan; sakelar ini perlu dinyalakan lagi setiap OpenHE dibuka.";
+        "Aturan dan sakelar ini disimpan di komputer ini. Pergantian hanya terjadi selama OpenHE berjalan.";
     pub const LOGIN: &str = "Jalankan saat komputer menyala";
     pub const LOGIN_FAILED: &str = "Pengaturan jalan otomatis gagal diubah.";
     pub const LANGUAGE: &str = "Bahasa";
@@ -695,6 +695,8 @@ pub struct Page {
     /// Runs the per-app switcher (see [`AutoSwitcher`]) while enabled.
     watcher: Option<ForegroundWatcher>,
     auto: Arc<AutoShared>,
+    /// The saved "per-app switching on" was looked at (once per run).
+    auto_restored: bool,
     app_error: Option<String>,
     new_rule: (String, u8),
     reset_open: bool,
@@ -715,6 +717,7 @@ impl Default for Page {
             auto_enabled: false,
             watcher: None,
             auto: Arc::default(),
+            auto_restored: false,
             app_error: None,
             new_rule: (String::new(), 0),
             reset_open: false,
@@ -760,6 +763,10 @@ impl Page {
         }
         self.poll_transfer(ctx);
 
+        let saved_on = ctx.data.borrow().auto_profile_enabled;
+        if self.restore_auto_due(saved_on) {
+            self.set_auto(true, ctx, egui_ctx);
+        }
         if self.names_due(now) && ctx.save_data().is_err() {
             self.app_error = Some(t::SAVE_FAILED.to_string());
         }
@@ -1326,7 +1333,7 @@ impl Page {
             setting_row(ui, t::AUTO, Some(t::AUTO_HINT), true, |ui| {
                 let mut on = self.auto_enabled;
                 if toggle(ui, &mut on, true).changed() {
-                    self.set_auto(on, ctx, ui.ctx());
+                    self.toggle_auto(on, ctx, ui.ctx());
                 }
             });
             if self.auto_enabled {
@@ -1369,6 +1376,24 @@ impl Page {
                 card::error_box(ui, e, "", None, None);
             }
         });
+    }
+
+    /// True once per run, when per-app switching was on last time: it is
+    /// started again when the app opens.
+    fn restore_auto_due(&mut self, saved_on: bool) -> bool {
+        let first = !std::mem::replace(&mut self.auto_restored, true);
+        first && saved_on && !self.auto_enabled
+    }
+
+    /// The toggle: starts or stops switching and stores the choice.
+    fn toggle_auto(&mut self, on: bool, ctx: &AppCtx, egui_ctx: &egui::Context) {
+        self.auto_restored = true;
+        self.set_auto(on, ctx, egui_ctx);
+        let enabled = self.auto_enabled;
+        ctx.data.borrow_mut().auto_profile_enabled = enabled;
+        if ctx.save_data().is_err() && self.app_error.is_none() {
+            self.app_error = Some(t::SAVE_FAILED.to_string());
+        }
     }
 
     /// Starts or stops per-app switching. The watcher thread reads the
@@ -2147,6 +2172,38 @@ mod tests {
         page.name_edited(true, false, t0);
         assert!(page.name_edited(false, true, t0));
         assert!(!page.names_due(t0 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn per_app_switching_is_remembered() {
+        use crate::app::test_support::offline_worker;
+        use crate::storage::AppData;
+        use std::cell::RefCell;
+        // Started again once when the app opens, if it was on.
+        let mut page = Page::default();
+        assert!(page.restore_auto_due(true));
+        assert!(!page.restore_auto_due(true), "once");
+        assert!(!Page::default().restore_auto_due(false));
+        // The switch itself is stored.
+        let w = offline_worker();
+        let theme = crate::theme::Theme::default();
+        let mut d = AppData::default();
+        d.auto_profile_enabled = true;
+        d.set_save_blocked(true); // never touch the real data file
+        let data = RefCell::new(d);
+        let status = crate::worker::ConnectionStatus::Searching;
+        let ctx = AppCtx {
+            worker: &w,
+            snapshot: None,
+            status: &status,
+            busy: false,
+            theme: &theme,
+            data: &data,
+        };
+        let mut page = Page::default();
+        page.toggle_auto(false, &ctx, &egui::Context::default());
+        assert!(!data.borrow().auto_profile_enabled);
+        assert!(!page.auto_enabled);
     }
 
     #[test]

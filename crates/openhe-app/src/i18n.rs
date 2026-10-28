@@ -72,7 +72,8 @@ pub mod storage {
     pub const RECOVERED: &str =
         "File data OpenHE rusak, jadi memakai pengaturan kosong. File lama disimpan sebagai";
     pub const UNREADABLE: &str =
-        "File data OpenHE tidak bisa dibaca; perubahan lokal mungkin tidak tersimpan.";
+        "File data OpenHE tidak bisa dibaca. Perubahan lokal (macro, nama profil, aturan aplikasi) TIDAK akan disimpan sampai file itu diperbaiki.";
+    pub const SAVE_FAILED: &str = "Pengaturan lokal tidak bisa disimpan.";
 }
 
 /// Sidebar navigation.
@@ -102,7 +103,6 @@ pub mod topbar {
     pub const PROFILE: &str = "Profil";
     pub const MAC: &str = "Mac";
     pub const WIN: &str = "Win";
-    pub const READ_ONLY_HINT: &str = "Ganti dari halaman Pengaturan (segera hadir)";
 }
 
 /// Device card at the bottom of the sidebar.
@@ -184,7 +184,6 @@ pub mod perf {
         "Klik atau seret untuk memilih beberapa tombol. Shift+klik untuk menambah.";
 
     pub const TRAVEL: &str = "Gerak tombol";
-    pub const LIVE_SOON: &str = "Kedalaman live — segera hadir";
     pub const ACTUATION_MARK: &str = "Aktuasi";
     pub const DZ_SUMMARY_TOP: &str = "Deadzone atas";
     pub const DZ_SUMMARY_BOTTOM: &str = "bawah";

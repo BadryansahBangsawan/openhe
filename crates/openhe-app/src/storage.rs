@@ -40,10 +40,9 @@ fn free_bad_path(dir: &Path) -> PathBuf {
 /// Defaults for a data file that could not be read or moved aside: saving
 /// is blocked so the file stays as it is.
 fn blocked_defaults() -> AppData {
-    AppData {
-        save_blocked: true,
-        ..AppData::default()
-    }
+    let mut d = AppData::default();
+    d.set_save_blocked(true);
+    d
 }
 
 /// One macro step. A serde mirror of `openhe_proto::macros::MacroAction`
@@ -140,14 +139,33 @@ pub struct AppData {
     /// `(app name, profile index 0..=3)`.
     pub app_profile_rules: Vec<(String, u8)>,
     pub launch_at_login: bool,
+    /// Per-app automatic profile switching is on (restarted when the app
+    /// opens).
+    #[serde(default)]
+    pub auto_profile_enabled: bool,
+    /// When the last calibration was saved on the keyboard (Unix seconds).
+    #[serde(default)]
+    pub last_calibrated: Option<u64>,
     /// Set when the data file existed but could not be read or moved aside
     /// at load. [`AppData::save`] then refuses to write, so that file is
-    /// never replaced by defaults. Not stored in the file.
+    /// never replaced by defaults. Not stored in the file; only this crate
+    /// sets it.
     #[serde(skip)]
-    pub save_blocked: bool,
+    save_blocked: bool,
 }
 
 impl AppData {
+    /// Saving is refused (see the `save_blocked` field).
+    pub fn save_blocked(&self) -> bool {
+        self.save_blocked
+    }
+
+    /// Blocks or allows saving (the loader blocks it for a file it could
+    /// not read; tests block it so the real data file is never touched).
+    pub(crate) fn set_save_blocked(&mut self, on: bool) {
+        self.save_blocked = on;
+    }
+
     /// The OS config directory for OpenHE, if the platform has one.
     pub fn default_dir() -> Option<PathBuf> {
         directories::ProjectDirs::from("dev", "OpenHE", "OpenHE")
@@ -168,7 +186,7 @@ impl AppData {
     /// crash never leaves a half-written file.
     ///
     /// Refuses (`PermissionDenied`, text [`WRITE_REFUSED`]) when
-    /// [`AppData::save_blocked`] is set, without touching the disk.
+    /// [`AppData::save_blocked`] is true, without touching the disk.
     pub fn save_to(&self, dir: &Path) -> io::Result<()> {
         if self.save_blocked {
             return Err(io::Error::new(
@@ -295,7 +313,7 @@ mod tests {
             ],
             app_profile_rules: vec![("Valorant".into(), 1)],
             launch_at_login: true,
-            save_blocked: false,
+            ..AppData::default()
         }
     }
 
@@ -400,7 +418,7 @@ mod tests {
         std::fs::create_dir_all(dir.0.join(FILE_NAME)).unwrap();
         let (d, notice) = AppData::load_or_recover(&dir.0);
         assert!(matches!(notice, Some(LoadNotice::Unreadable(_))));
-        assert!(d.save_blocked);
+        assert!(d.save_blocked());
         let err = d.save_to(&dir.0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains(WRITE_REFUSED));
@@ -416,11 +434,11 @@ mod tests {
         std::fs::write(dir.0.join(FILE_NAME), b"{not json").unwrap();
         let (d, notice) = AppData::load_or_recover(&dir.0);
         assert!(matches!(notice, Some(LoadNotice::Recovered { .. })));
-        assert!(!d.save_blocked);
+        assert!(!d.save_blocked());
         d.save_to(&dir.0).unwrap();
         let fresh = TempDir::new("missing-save");
         let (d, notice) = AppData::load_or_recover(&fresh.0);
-        assert_eq!((notice, d.save_blocked), (None, false));
+        assert_eq!((notice, d.save_blocked()), (None, false));
         d.save_to(&fresh.0).unwrap();
     }
 
@@ -430,6 +448,38 @@ mod tests {
         sample().save_to(&dir.0).unwrap();
         let text = std::fs::read_to_string(dir.0.join(FILE_NAME)).unwrap();
         assert!(!text.contains("save_blocked"));
+    }
+
+    #[test]
+    fn auto_switching_and_last_calibration_are_stored() {
+        let dir = TempDir::new("new-fields");
+        // An older file without them: off / never.
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.0.join(FILE_NAME), br#"{"launch_at_login":true}"#).unwrap();
+        let d = AppData::load_from(&dir.0).unwrap();
+        assert!(!d.auto_profile_enabled);
+        assert_eq!(d.last_calibrated, None);
+        let d = AppData {
+            auto_profile_enabled: true,
+            last_calibrated: Some(1_793_000_000),
+            ..sample()
+        };
+        d.save_to(&dir.0).unwrap();
+        assert_eq!(AppData::load_from(&dir.0).unwrap(), d);
+    }
+
+    #[test]
+    fn save_blocked_is_set_only_inside_the_crate() {
+        let mut d = AppData::default();
+        assert!(!d.save_blocked());
+        d.set_save_blocked(true);
+        assert!(d.save_blocked());
+        let dir = TempDir::new("blocked-setter");
+        assert_eq!(
+            d.save_to(&dir.0).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!dir.0.exists());
     }
 
     #[test]

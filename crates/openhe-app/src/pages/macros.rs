@@ -2751,7 +2751,7 @@ mod tests {
         ];
         d.macros = vec![m, SavedMacro::new("Kosong")];
         // Saving must not touch the user's real data file in a test.
-        d.save_blocked = true;
+        d.set_save_blocked(true);
         let data = RefCell::new(d);
         let egui_ctx = egui::Context::default();
         crate::theme::apply(&egui_ctx);
@@ -2820,12 +2820,11 @@ mod tests {
         use std::cell::RefCell;
         let worker = offline_worker();
         let theme = Theme::default();
-        let data = RefCell::new(AppData {
-            macros: vec![SavedMacro::new("Rekaman")],
-            // Never write the real data file from a test.
-            save_blocked: true,
-            ..AppData::default()
-        });
+        let mut d = AppData::default();
+        d.macros = vec![SavedMacro::new("Rekaman")];
+        // Never write the real data file from a test.
+        d.set_save_blocked(true);
+        let data = RefCell::new(d);
         let egui_ctx = egui::Context::default();
         crate::theme::apply(&egui_ctx);
         let status = ConnectionStatus::Searching;

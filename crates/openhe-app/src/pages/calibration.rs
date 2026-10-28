@@ -434,6 +434,28 @@ impl Lifecycle {
     }
 }
 
+/// "28-10-2026" (day-month-year, UTC) for Unix seconds.
+pub fn date_label(secs: u64) -> String {
+    // Days to civil date (H. Hinnant's algorithm), for days >= 0.
+    let z = secs / 86_400 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!("{day:02}-{month:02}-{year}")
+}
+
+/// Now, in Unix seconds.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 // ----------------------------------------------------------------- page
 
 /// How long the app waits on exit for the calibration stop: a worst-case
@@ -475,6 +497,8 @@ pub struct Page {
     /// means the keyboard was reopened (and the worker stopped it).
     connects_at_start: u64,
     saved_this_session: bool,
+    /// A calibration was saved and not yet recorded in the data file.
+    saved_unrecorded: bool,
     selection: Selection,
 }
 
@@ -562,13 +586,8 @@ impl Page {
         }
         if let Some(r) = self.stop.as_mut().and_then(Pending::poll) {
             self.stop = None;
-            let ok = r.is_ok();
-            self.life.stopped(r);
-            if ok {
+            if self.stop_finished(r) {
                 worker.set_calibration_guard(false);
-                if self.life.outcome == Some(Outcome::Saved) {
-                    self.saved_this_session = true;
-                }
             }
         }
         if self.life.is_active()
@@ -589,6 +608,23 @@ impl Page {
         if self.life.is_active() {
             ui.request_repaint_after(POLL_INTERVAL);
         }
+    }
+
+    /// The stop job finished; true when it worked (the guard may go).
+    fn stop_finished(&mut self, r: Result<(), Error>) -> bool {
+        let ok = r.is_ok();
+        self.life.stopped(r);
+        if ok && self.life.outcome == Some(Outcome::Saved) {
+            self.saved_this_session = true;
+            self.saved_unrecorded = true;
+        }
+        ok
+    }
+
+    /// True once after a calibration was saved: the shell records the date
+    /// in the data file ("Terakhir dikalibrasi").
+    pub fn take_saved(&mut self) -> bool {
+        std::mem::take(&mut self.saved_unrecorded)
     }
 
     /// Screenshot hook: a calibration in step 2 with `done` measured and
@@ -771,15 +807,12 @@ impl Page {
             };
             card::kv_row(ui, t::MEASURED, &range);
             ui.add_space(6.0);
-            card::kv_row(
-                ui,
-                t::LAST,
-                if self.saved_this_session {
-                    t::LAST_SESSION
-                } else {
-                    t::LAST_NEVER
-                },
-            );
+            let last = match ctx.data.borrow().last_calibrated {
+                Some(secs) => date_label(secs),
+                None if self.saved_this_session => t::LAST_SESSION.to_string(),
+                None => t::LAST_NEVER.to_string(),
+            };
+            card::kv_row(ui, t::LAST, &last);
         });
         ui.add_space(16.0);
         Card::new()
@@ -1007,6 +1040,32 @@ mod tests {
             travel: frame_with(snap, &f),
             values: frame_with(snap, |_| 1234),
         }
+    }
+
+    #[test]
+    fn the_last_calibration_date_reads_day_month_year() {
+        assert_eq!(date_label(0), "01-01-1970");
+        assert_eq!(date_label(951_782_400), "29-02-2000");
+        assert_eq!(date_label(1_793_145_600), "28-10-2026");
+        assert_eq!(date_label(1_793_231_999), "28-10-2026");
+    }
+
+    #[test]
+    fn a_saved_calibration_is_reported_once_for_the_data_file() {
+        let mut page = Page::default();
+        assert!(!page.take_saved());
+        page.life.start();
+        page.life.started(Ok(()), Instant::now());
+        page.life.finish(true);
+        page.stop_finished(Ok(()));
+        assert!(page.take_saved());
+        assert!(!page.take_saved(), "once");
+        // Cancelled: nothing to record.
+        page.life.start();
+        page.life.started(Ok(()), Instant::now());
+        page.life.finish(false);
+        page.stop_finished(Ok(()));
+        assert!(!page.take_saved());
     }
 
     #[test]
