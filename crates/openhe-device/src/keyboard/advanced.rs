@@ -26,6 +26,8 @@ const SLOTS: [Slot; 4] = [Slot::S1, Slot::S2, Slot::S3, Slot::S4];
 
 /// The Fn key's own default code.
 const FN_KEY: u8 = 0x01;
+/// Layer code 0x0001: transparent ("follow Base") on the Fn layers.
+const TRANSPARENT: u16 = 0x0001;
 
 fn invalid(e: AdvancedError) -> Error {
     Error::InvalidInput(e.to_string())
@@ -247,14 +249,23 @@ impl<T: Transport> Keyboard<T> {
     ///
     /// The Fn key's own Base-layer code must never be overwritten, so any
     /// Base-layer entry for key 0x01 is `Error::InvalidInput` and nothing at all
-    /// is written. Assigning the Fn code (0x01) to other keys, on any layer, is
-    /// allowed (e.g. Caps to Fn), and the Fn key may be remapped on the Fn
-    /// layers. At most 14 entries go in each packet.
+    /// is written. Code 0x0001 on Base is refused the same way: it is the
+    /// transparent "follow Base" code of the Fn layers (hardware finding 16),
+    /// not Fn, so on Base it makes a dead key. To make a key act as Fn on
+    /// Base use 0xF001 (Fn1 while held), as the factory Fn key does. The Fn
+    /// key may be remapped on the Fn layers. At most 14 entries go in each
+    /// packet.
     pub fn set_layer_codes(&mut self, entries: &[(u8, Layer, u16)]) -> Result<(), Error> {
-        for &(key, layer, _) in entries {
+        for &(key, layer, code) in entries {
             if layer == Layer::Base && key == FN_KEY {
                 return Err(Error::InvalidInput(format!(
                     "refusing to overwrite the Fn key's base-layer code (key 0x{key:02X})"
+                )));
+            }
+            if layer == Layer::Base && code == TRANSPARENT {
+                return Err(Error::InvalidInput(format!(
+                    "code 0x0001 is transparent, not Fn: refusing it on the base layer \
+                     (key 0x{key:02X}; use 0xF001 for Fn1 while held)"
                 )));
             }
         }
@@ -918,13 +929,32 @@ mod tests {
 
     #[test]
     fn fn_may_be_assigned_to_other_keys_on_the_base_layer() {
-        // Caps (0x39) -> Fn (0x01).
+        // Caps (0x39) -> Fn1 while held (0xF001), like the factory Fn key.
         let mut m = MockTransport::new();
-        m.push_reply(key_reply(0x39, 0, 0x01));
-        m.push_reply(key_reply(0x39, 0, 0x01));
+        m.push_reply(key_reply(0x39, 0, 0xF001));
+        m.push_reply(key_reply(0x39, 0, 0xF001));
         let mut k = kb(m);
-        assert_eq!(k.set_layer_codes(&[(0x39, Layer::Base, 0x01)]), Ok(()));
-        assert_eq!(payload(&written(&mut k)[0]), [0x01, 0x39, 0, 0x01, 0]);
+        assert_eq!(k.set_layer_codes(&[(0x39, Layer::Base, 0xF001)]), Ok(()));
+        assert_eq!(payload(&written(&mut k)[0]), [0x01, 0x39, 0, 0x01, 0xF0]);
+    }
+
+    #[test]
+    fn transparent_0x0001_is_refused_on_base_only() {
+        // 0x0001 is "follow Base" (finding 16): a dead key on Base.
+        let mut k = kb(MockTransport::new());
+        let e = k
+            .set_layer_codes(&[(0x04, Layer::Fn1, 0x05), (0x39, Layer::Base, 0x0001)])
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::InvalidInput(s) if s.contains("0x0001")),
+            "{e:?}"
+        );
+        assert!(written(&mut k).is_empty(), "nothing written");
+        // On a Fn layer it is the normal transparent code.
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x39, 2, 0x0001));
+        m.push_reply(key_reply(0x39, 2, 0x0001));
+        assert_eq!(kb(m).set_layer_codes(&[(0x39, Layer::Fn2, 0x0001)]), Ok(()));
     }
 
     #[test]

@@ -290,6 +290,10 @@ pub struct SimState {
     pub rejects: Vec<Reject>,
     /// Unplug (no reply) when this many more SETs have been written.
     pub unplug_after_sets: Option<u32>,
+    /// The next write of (cmd, payload[0]) fails with `Disconnected`
+    /// before reaching the keyboard (a handle that went stale), and the
+    /// connection is dead; the keyboard stays on the bus.
+    pub drop_before: Option<(u8, u8)>,
     /// Unsolicited reports to deliver on the next read.
     pub events: VecDeque<[u8; 64]>,
 }
@@ -329,6 +333,7 @@ impl SimState {
             log: Vec::new(),
             rejects: Vec::new(),
             unplug_after_sets: None,
+            drop_before: None,
             events: VecDeque::new(),
         }
     }
@@ -809,6 +814,11 @@ impl Transport for SimTransport {
         let cmd = report[2];
         let len = usize::from(report[1]);
         let pl = report[4..4 + len].to_vec();
+        if s.drop_before == Some((cmd, pl[0])) {
+            s.drop_before = None;
+            s.conn += 1;
+            return Err(Error::Disconnected);
+        }
         assert_eq!(
             report[3],
             checksum(report[1], cmd, &pl),

@@ -598,6 +598,9 @@ mod strings {
     pub const FILE_MODEL: &str = "Model keyboard di file tidak dikenal.";
     pub const FILE_WRONG_MODEL: &str = "Profil ini untuk keyboard lain:";
     pub const FILE_BAD_VALUE: &str = "File berisi nilai yang tidak valid.";
+    pub const FILE_TRANSPARENT_BASE: &str = "File memberi kode 0x0001 di layer Base untuk tombol";
+    pub const FILE_TRANSPARENT_BASE_TAIL: &str =
+        "— kode itu \"Ikut Base\" (transparan), bukan Fn, dan di Base membuat tombol mati. Profil tidak diimpor.";
 
     pub const APP: &str = "Aplikasi";
     pub const AUTO: &str = "Ganti profil otomatis per aplikasi";
@@ -660,6 +663,12 @@ pub fn file_error_text(e: &FileError) -> String {
             format!("{} {file} (keyboard ini {keyboard}).", t::FILE_WRONG_MODEL)
         }
         FileError::BadValue(_) => t::FILE_BAD_VALUE.to_string(),
+        FileError::TransparentOnBase(k) => format!(
+            "{} {} {}",
+            t::FILE_TRANSPARENT_BASE,
+            openhe_proto::keycodes::legend(*k),
+            t::FILE_TRANSPARENT_BASE_TAIL
+        ),
     }
 }
 

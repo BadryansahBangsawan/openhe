@@ -31,6 +31,8 @@ pub const VERSION: u32 = 1;
 const LAYERS: [Layer; 4] = [Layer::Base, Layer::Fn1, Layer::Fn2, Layer::Fn3];
 /// The Fn key: its own base-layer code is never written.
 const FN_KEY: u8 = 0x01;
+/// Layer code 0x0001: transparent on the Fn layers, a dead key on Base.
+const TRANSPARENT: u16 = 0x0001;
 
 // ------------------------------------------------------------ device side
 
@@ -213,8 +215,14 @@ pub enum FileError {
     NotAProfile,
     NewerVersion(u32),
     UnknownModel(String),
-    WrongModel { file: String, keyboard: String },
+    WrongModel {
+        file: String,
+        keyboard: String,
+    },
     BadValue(String),
+    /// Code 0x0001 on the Base layer of this key: transparent on the Fn
+    /// layers, a dead key on Base (hardware finding 16).
+    TransparentOnBase(u8),
 }
 
 fn touch_name(t: TouchMode) -> &'static str {
@@ -703,6 +711,9 @@ pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPl
         for (layer, code) in LAYERS.into_iter().zip(k.layers) {
             if k.code == FN_KEY && layer == Layer::Base {
                 continue;
+            }
+            if layer == Layer::Base && code == TRANSPARENT {
+                return Err(FileError::TransparentOnBase(k.code));
             }
             plan.layers.push((k.code, layer, code));
         }
