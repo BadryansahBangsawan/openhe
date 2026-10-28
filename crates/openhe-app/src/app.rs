@@ -160,17 +160,19 @@ pub enum PageId {
     Macros,
     Lighting,
     Calibration,
+    Templates,
     Settings,
 }
 
 impl PageId {
-    pub const ALL: [PageId; 7] = [
+    pub const ALL: [PageId; 8] = [
         PageId::Performance,
         PageId::Advanced,
         PageId::Remap,
         PageId::Macros,
         PageId::Lighting,
         PageId::Calibration,
+        PageId::Templates,
         PageId::Settings,
     ];
 
@@ -183,6 +185,7 @@ impl PageId {
             PageId::Macros => MACROS,
             PageId::Lighting => LIGHTING,
             PageId::Calibration => CALIBRATION,
+            PageId::Templates => TEMPLATES,
             PageId::Settings => SETTINGS,
         }
     }
@@ -196,6 +199,7 @@ impl PageId {
             PageId::Macros => MACROS,
             PageId::Lighting => LIGHTING,
             PageId::Calibration => CALIBRATION,
+            PageId::Templates => TEMPLATES,
             PageId::Settings => SETTINGS,
         }
     }
@@ -213,6 +217,7 @@ pub struct OpenHeApp {
     macros: pages::macros::Page,
     lighting: pages::lighting::Page,
     calibration: pages::calibration::Page,
+    templates: pages::templates::Page,
     settings: pages::settings::Page,
     /// A Win/Mac switch started from the top bar.
     switch: Option<TopbarSwitch>,
@@ -272,6 +277,7 @@ impl OpenHeApp {
             macros: Default::default(),
             lighting: Default::default(),
             calibration: Default::default(),
+            templates: Default::default(),
             settings: Default::default(),
             switch: None,
             profile_switch: RestartRun::default(),
@@ -361,6 +367,49 @@ impl OpenHeApp {
     #[cfg(feature = "preview")]
     pub fn preview_live_depth(&mut self, depths: &[(u8, u16)], select: &[u8]) {
         self.performance.preview_live(depths, select);
+    }
+
+    /// Screenshot hook: see `pages::templates::Page::preview_state`.
+    #[cfg(feature = "preview")]
+    pub fn preview_templates(&mut self) {
+        let status = self.worker.status();
+        let snapshot = match &status {
+            ConnectionStatus::Connected(s) => Some(s),
+            _ => None,
+        };
+        let ctx = AppCtx {
+            worker: &self.worker,
+            snapshot,
+            status: &status,
+            busy: false,
+            theme: &self.theme,
+            data: &self.data,
+        };
+        self.templates.preview_state(&ctx);
+    }
+
+    /// The Template page (tests read its preview and open files with it).
+    pub fn templates(&self) -> &pages::templates::Page {
+        &self.templates
+    }
+
+    /// Opens a template file on the Template page, as its import dialog
+    /// would (tests cannot drive the native dialog).
+    pub fn import_template(&mut self, path: &std::path::Path) {
+        let status = self.worker.status();
+        let snapshot = match &status {
+            ConnectionStatus::Connected(s) => Some(s),
+            _ => None,
+        };
+        let ctx = AppCtx {
+            worker: &self.worker,
+            snapshot,
+            status: &status,
+            busy: self.worker.is_busy() || self.worker.is_restarting(),
+            theme: &self.theme,
+            data: &self.data,
+        };
+        self.templates.import_path(&ctx, path);
     }
 
     /// Screenshot hook: see `pages::settings::Page::preview`.
@@ -614,7 +663,13 @@ impl OpenHeApp {
         // Pengaturan's restart flows run whichever page is shown; per-app
         // profile switching runs on its own thread and is told here what
         // the UI holds it back with (calibration, a top-bar switch).
-        let auto_locked = calibrating || self.switch.is_some() || self.profile_switch.is_busy();
+        // The Template page's jobs run whichever page is shown; a preview
+        // is made for this profile, so automatic switches wait for it.
+        self.templates.pump(&app_ctx);
+        let auto_locked = calibrating
+            || self.switch.is_some()
+            || self.profile_switch.is_busy()
+            || self.templates.holds_profile();
         if let Some(e) = self.settings.background(&app_ctx, auto_locked, ctx) {
             self.shell_error = Some((e, None));
         }
@@ -627,6 +682,7 @@ impl OpenHeApp {
                 PageId::Macros => self.macros.ui(&app_ctx, ui),
                 PageId::Lighting => self.lighting.ui(&app_ctx, ui),
                 PageId::Calibration => self.calibration.ui(&app_ctx, ui),
+                PageId::Templates => self.templates.ui(&app_ctx, ui),
                 PageId::Settings => self.settings.ui(&app_ctx, ui),
             });
         self.skin_dialog(ctx, snapshot);

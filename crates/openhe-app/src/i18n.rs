@@ -119,6 +119,7 @@ pub mod nav {
     pub const MACROS: &str = "Macro";
     pub const LIGHTING: &str = "Lampu";
     pub const CALIBRATION: &str = "Kalibrasi";
+    pub const TEMPLATES: &str = "Template";
     pub const SETTINGS: &str = "Pengaturan";
 }
 
@@ -130,6 +131,7 @@ pub mod subtitle {
     pub const MACROS: &str = "Rekam urutan tombol, pasang ke tombol mana saja";
     pub const LIGHTING: &str = "Efek, warna per tombol, kecerahan";
     pub const CALIBRATION: &str = "Ukur ulang jarak tekan semua switch";
+    pub const TEMPLATES: &str = "Preset siap pakai, template sendiri, cadangan";
     pub const SETTINGS: &str = "Polling rate, profil, app, reset";
 }
 

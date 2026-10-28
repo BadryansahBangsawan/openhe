@@ -621,6 +621,32 @@ impl TemplateFile {
     }
 }
 
+/// The keys of `snap` with the factory layer codes and no advanced
+/// functions: what a factory-fresh keyboard with these settings reads
+/// (the screenshot preview and tests use it instead of a read).
+pub fn snapshot_keys(snap: &crate::worker::DeviceSnapshot) -> Vec<KeyData> {
+    snap.keys
+        .iter()
+        .map(|(&code, s)| {
+            let mut layers = [0u16; 4];
+            for (slot, layer) in layers.iter_mut().zip(LAYERS) {
+                *slot = crate::pages::remap::factory_code(snap.model, layer, code).unwrap_or(
+                    match layer {
+                        Layer::Base => u16::from(code),
+                        _ => TRANSPARENT,
+                    },
+                );
+            }
+            KeyData {
+                code,
+                settings: *s,
+                layers,
+                advanced: AdvancedConfig::None,
+            }
+        })
+        .collect()
+}
+
 /// Parses and checks a template file's text.
 pub fn parse(text: &str) -> Result<Template, TemplateError> {
     TemplateFile::from_json(text)?.to_template()
@@ -636,26 +662,7 @@ pub(crate) mod tests {
 
     /// The keys of `snap` as a factory keyboard reads them (Windows mode).
     pub fn factory_keys(snap: &DeviceSnapshot) -> Vec<KeyData> {
-        snap.keys
-            .iter()
-            .map(|(&code, s)| {
-                let mut layers = [0u16; 4];
-                for (slot, layer) in layers.iter_mut().zip(LAYERS) {
-                    *slot = crate::pages::remap::factory_code(snap.model, layer, code).unwrap_or(
-                        match layer {
-                            Layer::Base => u16::from(code),
-                            _ => TRANSPARENT,
-                        },
-                    );
-                }
-                KeyData {
-                    code,
-                    settings: *s,
-                    layers,
-                    advanced: AdvancedConfig::None,
-                }
-            })
-            .collect()
+        snapshot_keys(snap)
     }
 
     fn keys_of(snap: &DeviceSnapshot) -> Vec<u8> {
