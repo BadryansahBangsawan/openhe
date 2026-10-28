@@ -11,6 +11,7 @@ use thiserror::Error;
 pub use hid::{list_devices, DeviceEntry, HidTransport};
 pub use keyboard::advanced::AdvancedConfig;
 pub use keyboard::macros::MacroBinding;
+pub use keyboard::performance::PerformanceChange;
 pub use keyboard::system::{DeviceEvent, WriteOutcome};
 pub use keyboard::{KeySettings, Keyboard};
 pub use session::Session;
