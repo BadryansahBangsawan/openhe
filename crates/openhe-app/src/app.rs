@@ -195,13 +195,16 @@ impl eframe::App for OpenHeApp {
     /// there): stop it and give the stop a moment to go out. The worker's
     /// calibration guard sends it too if this does not finish in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.calibration.leave(&self.worker);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
-        let ctx = egui::Context::default();
-        while self.calibration.is_active() && std::time::Instant::now() < deadline {
-            let snapshot = self.worker.snapshot();
-            self.calibration.pump(&self.worker, snapshot.as_ref(), &ctx);
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        // Whenever the guard is set (any page, any phase, also after a
+        // failed stop), send a stop and wait for its own result. Should it
+        // still not finish, dropping the worker waits for the thread's own
+        // shutdown stop.
+        if let Some(stop) = self.calibration.exit_stop(&self.worker) {
+            pages::calibration::wait_for_stop(
+                &self.worker,
+                stop,
+                pages::calibration::EXIT_STOP_WAIT,
+            );
         }
     }
 }

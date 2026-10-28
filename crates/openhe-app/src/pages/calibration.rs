@@ -422,6 +422,34 @@ impl Lifecycle {
 
 // ----------------------------------------------------------------- page
 
+/// How long the app waits on exit for the calibration stop: a worst-case
+/// poll in flight (two RM6X21 calls of up to 3 × 1 s each when the framing
+/// is wrong) plus the stop itself.
+pub const EXIT_STOP_WAIT: Duration = Duration::from_secs(7);
+
+/// Waits up to `timeout` for a stop job's own result; clears the worker's
+/// calibration guard when the stop worked. True when it worked.
+pub fn wait_for_stop<T: Transport + 'static>(
+    worker: &Worker<T>,
+    mut stop: Pending<()>,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(r) = stop.poll() {
+            let ok = r.is_ok();
+            if ok {
+                worker.set_calibration_guard(false);
+            }
+            return ok;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[derive(Default)]
 pub struct Page {
     life: Lifecycle,
@@ -442,8 +470,22 @@ impl Page {
         self.life.is_active()
     }
 
-    /// Called when the user leaves the page or the app closes: stops a
-    /// running calibration (the result is picked up by [`Page::pump`]).
+    /// App exit. Whatever the page or phase (also after a failed stop,
+    /// when the phase is already `Idle`), if the worker's calibration guard
+    /// is set the keyboard may still be calibrating: returns a fresh stop
+    /// job to wait on with [`wait_for_stop`]. It is queued behind any poll
+    /// or stop already in flight.
+    pub fn exit_stop<T: Transport + 'static>(&mut self, worker: &Worker<T>) -> Option<Pending<()>> {
+        // The page is done either way; the stop below replaces the one
+        // `leave` would send.
+        let _ = self.life.leave();
+        worker
+            .calibration_guard()
+            .then(|| worker.submit("calibration-stop-exit", |kb| kb.stop_calibration()))
+    }
+
+    /// Called when the user leaves the page: stops a running calibration
+    /// (the result is picked up by [`Page::pump`]).
     pub fn leave(&mut self, worker: &Worker) {
         let cmd = self.life.leave();
         self.exec(worker, cmd);
@@ -1146,6 +1188,82 @@ mod tests {
         }
         let mut kb = Keyboard::new(m, Model::Win68HeMax);
         assert!(poll_job(&mut kb).is_err());
+    }
+
+    /// A connected mock worker whose writes are logged; the keyboard
+    /// answers the snapshot load and then one `stop_calibration`.
+    type WriteLog = std::sync::Arc<std::sync::Mutex<Vec<[u8; 64]>>>;
+
+    fn logged_worker() -> (Worker<crate::worker::tests::Probe>, WriteLog) {
+        use crate::worker::tests::{order_reply, push_snapshot, Probe};
+        use crate::worker::WorkerConfig;
+        let log: WriteLog = Default::default();
+        let l = log.clone();
+        let w = Worker::spawn_with(
+            Box::new(move || {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                m.push_reply(order_reply(0x0D, 1));
+                Ok(Keyboard::new(
+                    Probe::logging(m, l.clone()),
+                    Model::Win68HeMax,
+                ))
+            }),
+            WorkerConfig {
+                retry_interval: Duration::from_millis(5),
+                idle_poll: Duration::from_millis(2),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !w.is_connected() {
+            assert!(Instant::now() < deadline, "never connected");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        (w, log)
+    }
+
+    #[test]
+    fn app_exit_stops_calibration_behind_a_slow_poll() {
+        use crate::worker::tests::wrote_stop;
+        let (w, log) = logged_worker();
+        let mut page = Page::default();
+        page.life.start();
+        page.life.started(Ok(()), Instant::now());
+        w.set_calibration_guard(true);
+        // A poll that takes long (RM6X21 retries) is in flight on exit.
+        let _poll = w.submit_quiet("calibration-poll", |_kb| {
+            std::thread::sleep(Duration::from_millis(800));
+            Ok(())
+        });
+        let stop = page.exit_stop(&w).expect("guard set: a stop is sent");
+        assert!(wait_for_stop(&w, stop, EXIT_STOP_WAIT));
+        assert!(wrote_stop(&log));
+        assert!(!w.calibration_guard(), "cleared once the stop worked");
+    }
+
+    #[test]
+    fn app_exit_after_a_failed_stop_still_stops() {
+        use crate::worker::tests::wrote_stop;
+        let (w, log) = logged_worker();
+        let mut page = Page::default();
+        page.life.start();
+        page.life.started(Ok(()), Instant::now());
+        page.life.finish(false);
+        page.life.stopped(Err(Error::Timeout));
+        assert!(matches!(page.life.outcome, Some(Outcome::StopFailed(_))));
+        assert!(!page.is_active(), "phase is Idle after a failed stop");
+        w.set_calibration_guard(true); // still set after the failed stop
+        let stop = page.exit_stop(&w).expect("a stop is sent anyway");
+        assert!(wait_for_stop(&w, stop, EXIT_STOP_WAIT));
+        assert!(wrote_stop(&log));
+    }
+
+    #[test]
+    fn app_exit_without_calibration_sends_nothing() {
+        let (w, log) = logged_worker();
+        let mut page = Page::default();
+        assert!(page.exit_stop(&w).is_none());
+        assert!(!crate::worker::tests::wrote_stop(&log));
     }
 
     #[test]

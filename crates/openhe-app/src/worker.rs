@@ -392,12 +392,20 @@ fn guarded<R>(f: impl FnOnce() -> Result<R, Error>) -> (Result<R, Error>, bool) 
     }
 }
 
+/// How long dropping the handle waits for the thread while the calibration
+/// guard is set: a worst-case job in flight (an RM6X21 poll is 2 calls of
+/// up to 3 × 1 s) plus the shutdown stop.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
+
 /// Handle to the worker thread. Dropping it stops the thread after its
-/// current step (it is not joined, so closing the window never waits on a
-/// slow keyboard).
+/// current step. Normally it is not joined, so closing the window never
+/// waits on a slow keyboard; while the calibration guard is set it is
+/// joined for up to [`SHUTDOWN_WAIT`], so the shutdown `stop_calibration`
+/// goes out before the process ends.
 pub struct Worker<T: Transport + 'static = HidTransport> {
     tx: Sender<Msg<T>>,
     ctl: Arc<Control>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// The result of a submitted job, polled from the UI.
@@ -469,14 +477,18 @@ impl<T: Transport + 'static> Worker<T> {
             calibrating: AtomicBool::new(false),
         });
         let thread_ctl = Arc::clone(&ctl);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("openhe-worker".into())
             .spawn(move || {
                 let _guard = ExitGuard(Arc::clone(&thread_ctl));
                 run(connect, rx, thread_ctl, cfg);
             })
             .expect("spawn the worker thread");
-        Worker { tx, ctl }
+        Worker {
+            tx,
+            ctl,
+            thread: Some(thread),
+        }
     }
 
     /// Queues `job` to run on the worker thread with the open keyboard.
@@ -668,6 +680,18 @@ impl<T: Transport + 'static> Worker<T> {
 impl<T: Transport + 'static> Drop for Worker<T> {
     fn drop(&mut self) {
         self.ctl.stop.store(true, Ordering::SeqCst);
+        // Only an open keyboard can be calibrating.
+        if !self.ctl.calibrating.load(Ordering::SeqCst) || !self.is_connected() {
+            return;
+        }
+        // The keyboard may be calibrating (it types nothing then): give the
+        // thread time to finish its job and send the stop.
+        if let Some(h) = self.thread.take() {
+            let deadline = Instant::now() + SHUTDOWN_WAIT;
+            while !h.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }
 
@@ -845,9 +869,10 @@ fn run<T: Transport>(
                 {
                     break;
                 }
-                match rx.recv_timeout(left) {
+                // Short slices, so a stop or reconnect request is seen soon.
+                match rx.recv_timeout(left.min(Duration::from_millis(100))) {
                     Ok(msg) => finish(&ctl, msg.counted, (msg.job)(None)),
-                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
@@ -1529,6 +1554,17 @@ pub(crate) mod tests {
         panic_once: Arc<AtomicBool>,
     }
 
+    impl Probe {
+        /// A transport that logs its writes into `log`.
+        pub(crate) fn logging(inner: MockTransport, log: Arc<Mutex<Vec<[u8; 64]>>>) -> Probe {
+            Probe {
+                inner,
+                log,
+                panic_once: Arc::default(),
+            }
+        }
+    }
+
     impl Transport for Probe {
         fn write(&mut self, r: &[u8; 64]) -> Result<(), Error> {
             self.log.lock().unwrap().push(*r);
@@ -1543,9 +1579,9 @@ pub(crate) mod tests {
         }
     }
 
-    const STOP_CALIBRATION: [u8; 7] = [0x5C, 0x03, 0x00, 0x93, 0x0D, 0xFF, 0xFF];
+    pub(crate) const STOP_CALIBRATION: [u8; 7] = [0x5C, 0x03, 0x00, 0x93, 0x0D, 0xFF, 0xFF];
 
-    fn wrote_stop(log: &Mutex<Vec<[u8; 64]>>) -> bool {
+    pub(crate) fn wrote_stop(log: &Mutex<Vec<[u8; 64]>>) -> bool {
         log.lock()
             .unwrap()
             .iter()
@@ -1770,7 +1806,14 @@ pub(crate) mod tests {
         );
         wait_for("connect", || w.is_connected());
         w.set_calibration_guard(true);
+        // A slow job (like an RM6X21 poll timing out) is running when the
+        // app closes: dropping the handle waits for it and for the stop.
+        let _slow = w.submit_quiet("slow-poll", |_kb| {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(())
+        });
+        std::thread::sleep(Duration::from_millis(20));
         drop(w);
-        wait_for("stop on shutdown", || wrote_stop(&log));
+        assert!(wrote_stop(&log), "stop sent before drop returned");
     }
 }
