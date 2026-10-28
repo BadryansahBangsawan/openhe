@@ -25,6 +25,7 @@ use crate::widgets::keyboard::{layout, reference_matrix, KeyDecoration, Keyboard
 use crate::widgets::segmented::Segmented;
 use crate::widgets::toggle::toggle;
 use crate::worker::Pending;
+use eframe::egui::ecolor::Hsva;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, StrokeKind,
     Ui,
@@ -655,6 +656,9 @@ pub struct Page {
     paint: Rgb,
     paint_hex_buf: String,
     paint_hex_editing: bool,
+    /// Picker state (hue survives grey and black colours).
+    slot_hsva: Hsva,
+    paint_hsva: Hsva,
 }
 
 impl Default for Page {
@@ -689,11 +693,40 @@ impl Default for Page {
             },
             paint_hex_buf: String::new(),
             paint_hex_editing: false,
+            slot_hsva: Hsva::default(),
+            paint_hsva: Hsva::default(),
         }
     }
 }
 
 impl Page {
+    /// A page that already holds what the keyboard reported for worker
+    /// generation `generation`, so it starts without device reads. For
+    /// screenshots and tests that run without a keyboard.
+    #[doc(hidden)]
+    pub fn preloaded(
+        generation: u64,
+        lighting: Lighting,
+        key_colors: impl IntoIterator<Item = (u8, Rgb)>,
+    ) -> Page {
+        let key_device: BTreeMap<u8, Rgb> = key_colors.into_iter().collect();
+        Page {
+            form: Form::from_lighting(&lighting),
+            device: Some(lighting),
+            loaded_generation: Some(generation),
+            key_loaded_generation: Some(generation),
+            key_edit: key_device.clone(),
+            key_device,
+            ..Page::default()
+        }
+    }
+
+    /// Opens the per-key tab (screenshots and tests).
+    #[doc(hidden)]
+    pub fn show_key_tab(&mut self) {
+        self.tab = Tab::Keys;
+    }
+
     pub fn ui(&mut self, ctx: &AppCtx, ui: &mut Ui) {
         self.poll(ctx);
         self.start_reads(ctx);
@@ -1207,18 +1240,14 @@ impl Page {
         });
         ui.add_space(8.0);
         let slot = usize::from(self.slot.min(6));
-        let mut col = c32(self.form.colors[slot]);
-        ui.add_enabled_ui(editable, |ui| {
-            ui.spacing_mut().slider_width = (ui.available_width() - 16.0).clamp(120.0, 230.0);
-            if egui::color_picker::color_picker_color32(
-                ui,
-                &mut col,
-                egui::color_picker::Alpha::Opaque,
-            ) {
-                self.form.colors[slot] = rgb_of(col);
-                self.applied = false;
-            }
-        });
+        if color_field(
+            ui,
+            &mut self.slot_hsva,
+            &mut self.form.colors[slot],
+            editable,
+        ) {
+            self.applied = false;
+        }
         ui.add_space(6.0);
         if hex_box(
             ui,
@@ -1264,12 +1293,7 @@ impl Page {
             }
         });
         ui.add_space(8.0);
-        let mut col = c32(self.paint);
-        ui.spacing_mut().slider_width = (ui.available_width() - 16.0).clamp(120.0, 230.0);
-        if egui::color_picker::color_picker_color32(ui, &mut col, egui::color_picker::Alpha::Opaque)
-        {
-            self.paint = rgb_of(col);
-        }
+        color_field(ui, &mut self.paint_hsva, &mut self.paint, true);
         ui.add_space(6.0);
         hex_box(
             ui,
@@ -1499,6 +1523,111 @@ fn hex_box(
             *editing = false;
         }
     });
+    changed
+}
+
+/// A wide saturation/value field with a hue bar underneath (the mockup's
+/// picker). `hsva` keeps the hue while `value` is grey or black; when
+/// `value` changed elsewhere (hex box, another swatch) it is re-derived.
+/// Returns true when the user changed the colour.
+fn color_field(ui: &mut Ui, hsva: &mut Hsva, value: &mut Rgb, enabled: bool) -> bool {
+    if rgb_of(Color32::from(*hsva)) != *value {
+        *hsva = Hsva::from(c32(*value));
+    }
+    let mut changed = false;
+    let w = ui.available_width() - 4.0;
+    let sense = if enabled {
+        Sense::click_and_drag()
+    } else {
+        Sense::hover()
+    };
+
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 140.0), sense);
+    if let (true, Some(p)) = (enabled, resp.interact_pointer_pos()) {
+        hsva.s = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        hsva.v = ((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0);
+        changed = true;
+    }
+    let mut mesh = egui::Mesh::default();
+    const NX: usize = 24;
+    const NY: usize = 12;
+    for yi in 0..=NY {
+        for xi in 0..=NX {
+            let (s, v) = (xi as f32 / NX as f32, 1.0 - yi as f32 / NY as f32);
+            let pos = egui::pos2(
+                egui::lerp(rect.x_range(), s),
+                egui::lerp(rect.y_range(), 1.0 - v),
+            );
+            mesh.colored_vertex(pos, Color32::from(Hsva::new(hsva.h, s, v, 1.0)));
+        }
+    }
+    for yi in 0..NY {
+        for xi in 0..NX {
+            let i = (yi * (NX + 1) + xi) as u32;
+            let row = (NX + 1) as u32;
+            mesh.add_triangle(i, i + 1, i + row);
+            mesh.add_triangle(i + 1, i + row + 1, i + row);
+        }
+    }
+    let radius = CornerRadius::same(size::CONTROL_RADIUS);
+    ui.painter().add(egui::Shape::mesh(mesh));
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        line(1.0, color::BORDER_STRONG),
+        StrokeKind::Inside,
+    );
+    let knob = egui::pos2(
+        egui::lerp(rect.x_range(), hsva.s),
+        egui::lerp(rect.y_range(), 1.0 - hsva.v),
+    );
+    ui.painter()
+        .circle_stroke(knob, 7.0, line(2.0, Color32::WHITE));
+    ui.painter()
+        .circle_stroke(knob, 8.5, line(1.0, Color32::from_black_alpha(160)));
+
+    ui.add_space(6.0);
+    let (hrect, hresp) = ui.allocate_exact_size(egui::vec2(w, 16.0), sense);
+    if let (true, Some(p)) = (enabled, hresp.interact_pointer_pos()) {
+        hsva.h = ((p.x - hrect.left()) / hrect.width()).clamp(0.0, 1.0);
+        changed = true;
+    }
+    let mut bar = egui::Mesh::default();
+    const NH: usize = 24;
+    for i in 0..=NH {
+        let t = i as f32 / NH as f32;
+        let c = Color32::from(Hsva::new(t, 1.0, 1.0, 1.0));
+        let x = egui::lerp(hrect.x_range(), t);
+        bar.colored_vertex(egui::pos2(x, hrect.top()), c);
+        bar.colored_vertex(egui::pos2(x, hrect.bottom()), c);
+        if i < NH {
+            let k = (2 * i) as u32;
+            bar.add_triangle(k, k + 1, k + 2);
+            bar.add_triangle(k + 1, k + 3, k + 2);
+        }
+    }
+    ui.painter().add(egui::Shape::mesh(bar));
+    ui.painter().rect_stroke(
+        hrect,
+        CornerRadius::same(8),
+        line(1.0, color::BORDER_STRONG),
+        StrokeKind::Inside,
+    );
+    let hx = egui::lerp(hrect.x_range(), hsva.h);
+    ui.painter().circle_filled(
+        egui::pos2(hx, hrect.center().y),
+        hrect.height() / 2.0 + 2.0,
+        Color32::from(Hsva::new(hsva.h, 1.0, 1.0, 1.0)),
+    );
+    ui.painter().circle_stroke(
+        egui::pos2(hx, hrect.center().y),
+        hrect.height() / 2.0 + 2.0,
+        line(2.0, Color32::WHITE),
+    );
+
+    if changed {
+        *value = rgb_of(Color32::from(*hsva));
+    }
     changed
 }
 
