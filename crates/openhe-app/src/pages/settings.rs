@@ -988,6 +988,14 @@ impl Page {
         self.name_save.take_due(now)
     }
 
+    /// The app is closing: true when typed names are still waiting for
+    /// their save (the caller saves now; the wait is dropped).
+    pub fn take_unsaved_names(&mut self) -> bool {
+        let pending = self.name_save.is_pending();
+        self.name_save.cancel();
+        pending
+    }
+
     /// Nothing of this page is running on the keyboard.
     fn idle(&self) -> bool {
         self.switch.is_none() && !self.restart.is_busy() && !self.transfer.is_busy()

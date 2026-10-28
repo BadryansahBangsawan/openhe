@@ -294,6 +294,9 @@ pub struct SimState {
     /// before reaching the keyboard (a handle that went stale), and the
     /// connection is dead; the keyboard stays on the bus.
     pub drop_before: Option<(u8, u8)>,
+    /// Time every SET takes (a slow keyboard), for tests that must catch
+    /// a job while it runs.
+    pub set_delay: std::time::Duration,
     /// Unsolicited reports to deliver on the next read.
     pub events: VecDeque<[u8; 64]>,
 }
@@ -334,6 +337,7 @@ impl SimState {
             rejects: Vec::new(),
             unplug_after_sets: None,
             drop_before: None,
+            set_delay: std::time::Duration::ZERO,
             events: VecDeque::new(),
         }
     }
@@ -806,6 +810,10 @@ impl SimTransport {
 impl Transport for SimTransport {
     fn write(&mut self, report: &[u8; 64]) -> Result<(), Error> {
         let sim = self.sim.clone();
+        let delay = sim.state().set_delay;
+        if !delay.is_zero() && is_set(report[2], &report[4..4 + usize::from(report[1])]) {
+            std::thread::sleep(delay);
+        }
         let mut s = sim.state();
         if !self.alive(&s) {
             return Err(Error::Disconnected);

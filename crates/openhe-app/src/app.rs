@@ -277,10 +277,16 @@ impl eframe::App for OpenHeApp {
         self.draw(ctx);
     }
 
-    /// Never leave the keyboard in calibration mode (it types nothing
-    /// there): stop it and give the stop a moment to go out. The worker's
-    /// calibration guard sends it too if this does not finish in time.
+    /// Saves profile names still waiting for their save, and never leaves
+    /// the keyboard in calibration mode (it types nothing there): stop it
+    /// and give the stop a moment to go out. The worker's calibration guard
+    /// sends it too if this does not finish in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Profile names typed in the last moment are saved after a pause;
+        // closing must not lose them.
+        if self.settings.take_unsaved_names() {
+            let _ = self.data.borrow().save();
+        }
         // Whenever the guard is set (any page, any phase, also after a
         // failed stop), send a stop and wait for its own result. Should it
         // still not finish, dropping the worker waits for the thread's own
