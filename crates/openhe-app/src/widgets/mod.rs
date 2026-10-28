@@ -3,5 +3,6 @@
 pub mod card;
 pub mod keyboard;
 pub mod segmented;
+pub mod skin_art;
 pub mod slider_mm;
 pub mod toggle;

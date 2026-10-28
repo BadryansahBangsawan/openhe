@@ -6,7 +6,12 @@
 //! per-key packet), which is what [`Selection`] stores.
 
 use crate::i18n;
+use crate::skin::{
+    cap_legend, contrast, key_group, legend_for, luminance, over, readable, CapColors, CapIcon,
+    CapLegend, KeyboardSkin,
+};
 use crate::theme::{color, font, line, size};
+use crate::widgets::skin_art;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontFamily, FontId, Id, Pos2, Rect, Response, Sense,
     StrokeKind, Ui, Vec2,
@@ -402,19 +407,30 @@ pub struct KeyDecoration {
 pub struct KeyboardView {
     layout: KeyLayout,
     enabled: bool,
+    interactive: bool,
+    min_unit: f32,
     max_unit: f32,
     id_salt: &'static str,
+    skin: Option<KeyboardSkin>,
 }
 
 const CASE_PAD: f32 = 14.0;
+
+/// Amber selection outline width and its gap (in the case colour) from the
+/// cap, so it shows on amber caps too.
+const SELECT_W: f32 = 2.0;
+const SELECT_GAP: f32 = 1.0;
 
 impl KeyboardView {
     pub fn new(model: Model, matrix: &Matrix) -> KeyboardView {
         KeyboardView {
             layout: layout(model, matrix),
             enabled: true,
+            interactive: true,
+            min_unit: 28.0,
             max_unit: 64.0,
             id_salt: "keyboard",
+            skin: None,
         }
     }
 
@@ -430,8 +446,29 @@ impl KeyboardView {
         self
     }
 
+    /// Smallest key size in points (default 28).
+    pub fn min_unit(mut self, unit: f32) -> Self {
+        self.min_unit = unit;
+        self
+    }
+
     pub fn id_salt(mut self, salt: &'static str) -> Self {
         self.id_salt = salt;
+        self
+    }
+
+    /// Paints the caps in `skin`'s colours (side wall, top face, printed
+    /// legends). Without a skin the caps are flat (the Lampu page, whose
+    /// fills are the RGB preview).
+    pub fn skin(mut self, skin: KeyboardSkin) -> Self {
+        self.skin = Some(skin);
+        self
+    }
+
+    /// A picture only (thumbnails): no hover, no clicks, no per-key
+    /// accessibility nodes, not dimmed.
+    pub fn picture(mut self) -> Self {
+        self.interactive = false;
         self
     }
 
@@ -447,25 +484,40 @@ impl KeyboardView {
     ) -> Response {
         let lay = &self.layout;
         let width_u = lay.width.max(1.0);
-        let unit = ((ui.available_width() - 2.0 * CASE_PAD) / width_u).clamp(28.0, self.max_unit);
+        let skin = self.skin.map(|s| (s, s.colors()));
+        let case_pad = |unit: f32| {
+            if skin.is_some() {
+                (unit * 0.26).clamp(3.0, CASE_PAD)
+            } else {
+                CASE_PAD
+            }
+        };
+        let mut unit = ((ui.available_width() - 2.0 * case_pad(self.max_unit)) / width_u)
+            .clamp(self.min_unit, self.max_unit);
+        if skin.is_some() {
+            unit = ((ui.available_width() - 2.0 * case_pad(unit)) / width_u)
+                .clamp(self.min_unit, self.max_unit);
+        }
+        let pad_case = case_pad(unit);
         let note_h = if lay.tested { 0.0 } else { 22.0 };
         let size = egui::vec2(
-            width_u * unit + 2.0 * CASE_PAD,
-            lay.rows as f32 * unit + 2.0 * CASE_PAD + note_h,
+            width_u * unit + 2.0 * pad_case,
+            lay.rows as f32 * unit + 2.0 * pad_case + note_h,
         );
-        let sense = if self.enabled {
+        let interactive = self.enabled && self.interactive;
+        let sense = if interactive {
             Sense::click_and_drag()
         } else {
             Sense::hover()
         };
         let (rect, response) = ui.allocate_exact_size(size, sense);
-        let origin = rect.min + egui::vec2(CASE_PAD, CASE_PAD);
+        let origin = rect.min + egui::vec2(pad_case, pad_case);
         let to_units = |p: Pos2| -> Pos2 { ((p - origin) / unit).to_pos2() };
         let id = Id::new(self.id_salt).with("drag-origin");
 
         // ---- interaction
         let mut drag_rect = None;
-        if self.enabled {
+        if interactive {
             let additive = ui.input(|i| i.modifiers.shift || i.modifiers.command);
             if response.drag_started() {
                 if let Some(o) = ui.input(|i| i.pointer.press_origin()) {
@@ -497,19 +549,38 @@ impl KeyboardView {
         }
         let hovered = response
             .hover_pos()
-            .filter(|_| self.enabled)
+            .filter(|_| interactive)
             .and_then(|p| key_at(lay, to_units(p)));
 
         // ---- drawing
-        let painter = ui.painter_at(rect.expand(1.0));
-        painter.rect(
-            rect,
-            CornerRadius::same(16),
-            color::CASE,
-            line(1.0, color::BORDER),
-            StrokeKind::Inside,
-        );
-        let gap = (unit * 0.09).clamp(3.0, 6.0);
+        let painter = ui.painter_at(rect.expand(SELECT_W + SELECT_GAP + 1.0));
+        let board = Rect::from_min_size(rect.min, egui::vec2(size.x, size.y - note_h));
+        match &skin {
+            Some((_, sc)) => {
+                let k = unit / 50.0;
+                painter.rect(
+                    board,
+                    CornerRadius::same((10.0 * k).clamp(4.0, 16.0) as u8),
+                    sc.case,
+                    line(2.0 * k.clamp(0.5, 1.0), sc.bezel),
+                    StrokeKind::Inside,
+                );
+            }
+            None => {
+                painter.rect(
+                    rect,
+                    CornerRadius::same(16),
+                    color::CASE,
+                    line(1.0, color::BORDER),
+                    StrokeKind::Inside,
+                );
+            }
+        }
+        let gap = if skin.is_some() {
+            (unit * 0.07).clamp(1.0, 4.0)
+        } else {
+            (unit * 0.09).clamp(3.0, 6.0)
+        };
         let fs = (unit * 0.26).clamp(10.0, 14.0);
         let fs2 = (unit * 0.235).clamp(9.0, 12.5);
         let dim = |c: Color32| {
@@ -519,31 +590,72 @@ impl KeyboardView {
                 c.gamma_multiply(0.55)
             }
         };
-        for k in &lay.keys {
+        let key_rect = |k: &KeyGeom| {
             let min = origin + egui::vec2(k.x * unit + gap / 2.0, k.y * unit + gap / 2.0);
-            let r = Rect::from_min_size(min, egui::vec2(k.w * unit - gap, unit - gap));
+            Rect::from_min_size(min, egui::vec2(k.w * unit - gap, unit - gap))
+        };
+        let art = match &skin {
+            Some((s, _)) if s.has_artwork() => {
+                let rects: Vec<Rect> = lay.keys.iter().map(key_rect).collect();
+                Some(skin_art::cached(
+                    ui.ctx(),
+                    Id::new(self.id_salt),
+                    board,
+                    &rects,
+                    unit,
+                ))
+            }
+            _ => None,
+        };
+        let mut selected_rects = Vec::new();
+        for (ki, k) in lay.keys.iter().enumerate() {
+            let r = key_rect(k);
             let deco = decorate(k.code);
             let selected = selection.contains(k.code);
             let is_hover = hovered == Some(k.code);
             // Each key is its own accessibility node (screen readers, UI
             // tests), named like its hover text; clicks go to the board.
-            ui.ctx()
-                .accesskit_node_builder(response.id.with(k.code), |n| {
-                    n.set_role(egui::accesskit::Role::Button);
-                    n.set_label(format!("{} · 0x{:02X}", keycodes::legend(k.code), k.code));
-                    n.set_bounds(egui::accesskit::Rect {
-                        x0: r.min.x.into(),
-                        y0: r.min.y.into(),
-                        x1: r.max.x.into(),
-                        y1: r.max.y.into(),
+            if self.interactive {
+                ui.ctx()
+                    .accesskit_node_builder(response.id.with(k.code), |n| {
+                        n.set_role(egui::accesskit::Role::Button);
+                        n.set_label(format!("{} · 0x{:02X}", keycodes::legend(k.code), k.code));
+                        n.set_bounds(egui::accesskit::Rect {
+                            x0: r.min.x.into(),
+                            y0: r.min.y.into(),
+                            x1: r.max.x.into(),
+                            y1: r.max.y.into(),
+                        });
+                        if selected {
+                            n.set_selected(true);
+                        }
+                        if !self.enabled {
+                            n.set_disabled();
+                        }
                     });
-                    if selected {
-                        n.set_selected(true);
-                    }
-                    if !self.enabled {
-                        n.set_disabled();
-                    }
-                });
+            }
+            if let Some((_, sc)) = &skin {
+                let cap = SkinnedCap {
+                    rect: r,
+                    unit,
+                    fs2,
+                    code: k.code,
+                    colors: sc.cap(key_group(k.code)),
+                    case: sc.case,
+                    art: art.as_ref().map(|a| &a.keys[ki]),
+                    selected,
+                    hovered: is_hover,
+                    enabled: self.enabled,
+                    // Thumbnails keep the design's sizes; the board on a
+                    // page keeps legends readable.
+                    min_text: self.min_unit >= 20.0,
+                };
+                cap.paint(&painter, &deco);
+                if selected {
+                    selected_rects.push(r);
+                }
+                continue;
+            }
             let fill = deco.fill.unwrap_or(if selected {
                 Color32::from_rgb(0x33, 0x27, 0x10)
             } else if is_hover {
@@ -632,6 +744,27 @@ impl KeyboardView {
                 }
             }
         }
+        // Selection outlines last, so neighbouring caps never cover them:
+        // a ring in the case colour, then the amber line.
+        if let Some((_, sc)) = &skin {
+            let k = unit / 50.0;
+            let radius = (6.0 * k).clamp(2.0, 6.0);
+            for r in selected_rects {
+                let ring = r.expand(SELECT_GAP);
+                painter.rect_stroke(
+                    ring,
+                    CornerRadius::same((radius + SELECT_GAP) as u8),
+                    line(SELECT_GAP, sc.case),
+                    StrokeKind::Outside,
+                );
+                painter.rect_stroke(
+                    ring.expand(SELECT_GAP),
+                    CornerRadius::same((radius + 2.0 * SELECT_GAP) as u8),
+                    line(SELECT_W, dim(color::ACCENT)),
+                    StrokeKind::Outside,
+                );
+            }
+        }
         if let Some(r) = drag_rect {
             painter.rect(
                 r,
@@ -642,12 +775,13 @@ impl KeyboardView {
             );
         }
         if !lay.tested {
+            let bg = skin.as_ref().map_or(color::CASE, |(_, sc)| sc.case);
             painter.text(
-                egui::pos2(rect.min.x + CASE_PAD, rect.max.y - CASE_PAD / 2.0 - 2.0),
+                egui::pos2(rect.min.x + pad_case, rect.max.y - pad_case / 2.0 - 2.0),
                 Align2::LEFT_BOTTOM,
                 format!("⚠ {}", i18n::common::UNTESTED_LAYOUT),
                 FontId::new(11.0, FontFamily::Proportional),
-                color::ACCENT,
+                readable(color::ACCENT, bg, 3.0),
             );
         }
         if let Some(code) = hovered {
@@ -658,6 +792,301 @@ impl KeyboardView {
             }
         }
         response
+    }
+}
+
+/// One cap painted in a skin.
+struct SkinnedCap<'a> {
+    /// The whole cap (side wall).
+    rect: Rect,
+    unit: f32,
+    /// Second-line font size.
+    fs2: f32,
+    code: u8,
+    colors: CapColors,
+    case: Color32,
+    art: Option<&'a skin_art::KeyArt>,
+    selected: bool,
+    hovered: bool,
+    enabled: bool,
+    /// Keep legends at least ~9 pt (not for thumbnails).
+    min_text: bool,
+}
+
+impl SkinnedCap<'_> {
+    fn k(&self) -> f32 {
+        self.unit / 50.0
+    }
+
+    /// The top face: inset 4/2/4/7 at a 50 pt unit.
+    fn face(&self) -> Rect {
+        let k = self.k();
+        let r = self.rect;
+        Rect::from_min_max(
+            r.min + egui::vec2(4.0 * k, 2.0 * k),
+            r.max - egui::vec2(4.0 * k, 7.0 * k),
+        )
+    }
+
+    /// `base` × k, at least `min` on a page's board.
+    fn text_size(&self, base: f32, min: f32) -> f32 {
+        let s = base * self.k();
+        if self.min_text {
+            s.max(min)
+        } else {
+            s
+        }
+    }
+
+    fn paint(&self, painter: &egui::Painter, deco: &KeyDecoration) {
+        let k = self.k();
+        let r = self.rect;
+        let face = self.face();
+        let wall_r = CornerRadius::same((6.0 * k).clamp(1.0, 6.0) as u8);
+        let face_r = CornerRadius::same((5.0 * k).clamp(1.0, 5.0) as u8);
+        let c = self.colors;
+
+        // Face colour as decorations change it: a fill tints the cap.
+        let mut top = c.top;
+        if let Some(art) = self.art {
+            // The artwork: dimmed on the wall, full on the face.
+            skin_art::paint(painter, art, r);
+            painter.rect_filled(r, wall_r, Color32::from_black_alpha(107));
+            skin_art::paint(painter, art, face);
+            top = skin_art::ART_BG;
+        } else {
+            painter.rect_filled(r, wall_r, c.side);
+            painter.rect_filled(face, face_r, c.top);
+        }
+        if let Some(fill) = deco.fill {
+            painter.rect_filled(face, face_r, fill);
+            top = over(fill, top);
+        }
+        if self.hovered && !self.selected {
+            let hover = if luminance(top) > 0.4 {
+                Color32::from_black_alpha(18)
+            } else {
+                Color32::from_white_alpha(14)
+            };
+            painter.rect_filled(face, face_r, hover);
+            top = over(hover, top);
+        }
+        // A thin highlight along the top edge of the face.
+        if face.height() > 6.0 {
+            painter.hline(
+                face.x_range().shrink(3.0 * k),
+                face.top() + 0.5,
+                line(1.0, Color32::from_white_alpha(20)),
+            );
+        }
+        if let Some(s) = deco.stroke {
+            painter.rect_stroke(
+                r,
+                wall_r,
+                line(1.5, readable(s, c.side, 2.0)),
+                StrokeKind::Inside,
+            );
+        }
+
+        // Legend colour: the printed one, unless a tint made it unreadable.
+        let legend = if deco.fill.is_some() && contrast(over(c.legend, top), top) < 3.0 {
+            legend_for(top)
+        } else {
+            c.legend
+        };
+        let pad = egui::vec2(6.0 * k, 4.0 * k);
+        let inner = face;
+        let text_w = (inner.width() - pad.x - 2.0 * k).max(4.0);
+        let font = |s: f32| font::bold(s);
+
+        // Second line (values, ✓, …), at the bottom of the face.
+        let l2 = deco.label2.as_ref().map(|l2| {
+            let col = match (l2.color, self.selected) {
+                (Some(col), _) => readable(col, top, 3.0),
+                (None, true) => readable(color::ACCENT, top, 3.0),
+                (None, false) => readable(legend.gamma_multiply(0.8), top, 3.0),
+            };
+            let g = painter.layout_job(elided(
+                &l2.text,
+                FontId::new(
+                    self.fs2.min(self.text_size(12.0, 8.0)),
+                    FontFamily::Proportional,
+                ),
+                col,
+                text_w,
+            ));
+            (g, col)
+        });
+        let l2_h = l2.as_ref().map_or(0.0, |(g, _)| g.size().y);
+        let top_left = inner.min + pad;
+        let mut legend_right = top_left.x;
+        match cap_legend(self.code) {
+            CapLegend::Blank => {}
+            CapLegend::Char(s) => {
+                let g =
+                    painter.layout_job(elided(s, font(self.text_size(17.0, 12.0)), legend, text_w));
+                legend_right = top_left.x + g.size().x;
+                painter.galley(top_left, g, legend);
+            }
+            CapLegend::TwoTier { shifted, base } => {
+                let size = self.text_size(13.0, 9.5);
+                let line_h = size * 1.05;
+                let room = inner.height() - pad.y - l2_h - 2.0 * k;
+                if l2.is_none() || 2.0 * line_h <= room {
+                    painter.text(top_left, Align2::LEFT_TOP, shifted, font(size), legend);
+                    let r2 = painter.text(
+                        top_left + egui::vec2(0.0, line_h),
+                        Align2::LEFT_TOP,
+                        base,
+                        font(size),
+                        legend,
+                    );
+                    legend_right = r2.right();
+                } else {
+                    // No room for both lines above the value: the base
+                    // character alone, like a letter.
+                    let r2 = painter.text(
+                        top_left,
+                        Align2::LEFT_TOP,
+                        base,
+                        font(self.text_size(17.0, 12.0)),
+                        legend,
+                    );
+                    legend_right = r2.right();
+                }
+            }
+            CapLegend::Label { icon, text } => {
+                let mut size = self.text_size(11.0, 9.0);
+                let icon_w = |s: f32| if icon.is_some() { s * 1.15 } else { 0.0 };
+                // A label a little too wide ("Delete" on 1u) is set
+                // slightly smaller rather than cut.
+                let wide = painter
+                    .layout_no_wrap(text.to_string(), font(size), legend)
+                    .size()
+                    .x;
+                if wide > text_w - icon_w(size) {
+                    size = (size * (text_w - icon_w(size)) / wide).max(size * 0.8);
+                }
+                let icon_w = icon_w(size);
+                let g = painter.layout_job(elided(text, font(size), legend, text_w - icon_w));
+                let h = g.size().y;
+                // Centred vertically, or at the top above a second line.
+                let y = if l2.is_some() {
+                    top_left.y
+                } else {
+                    inner.center().y - h / 2.0
+                };
+                let mut x = top_left.x;
+                if let Some(icon) = icon {
+                    paint_icon(
+                        painter,
+                        icon,
+                        egui::pos2(x, y + h / 2.0),
+                        size * 0.72,
+                        legend,
+                    );
+                    x += icon_w;
+                }
+                legend_right = x + g.size().x;
+                painter.galley(egui::pos2(x, y), g, legend);
+            }
+            CapLegend::Arrow(code) => {
+                if let Some(dir) = arrow_dir(code) {
+                    let len = self.text_size(12.0, 9.0);
+                    let center = if l2.is_some() {
+                        egui::pos2(inner.center().x, top_left.y + len * 0.6)
+                    } else {
+                        inner.center()
+                    };
+                    paint_arrow(painter, center, len, dir, legend);
+                    legend_right = center.x + len / 2.0;
+                }
+            }
+        }
+        if let Some((g, col)) = l2 {
+            let pos = egui::pos2(
+                inner.min.x + pad.x,
+                inner.max.y - (2.0 * k).max(1.0) - g.size().y,
+            );
+            painter.galley(pos, g, col);
+        }
+        if let Some((text, col)) = &deco.badge {
+            let size = self.text_size(10.0, 8.0);
+            let g =
+                painter.layout_no_wrap(text.clone(), FontId::proportional(size), legend_for(*col));
+            let bsize = g.size() + egui::vec2(6.0, 2.0);
+            let brect = Rect::from_min_size(
+                egui::pos2(face.max.x - bsize.x - 2.0 * k, face.min.y + 2.0 * k),
+                bsize,
+            );
+            if !text.is_empty() && brect.left() >= legend_right + 3.0 {
+                painter.rect(
+                    brect,
+                    CornerRadius::same(4),
+                    *col,
+                    line(1.0, self.case),
+                    StrokeKind::Outside,
+                );
+                painter.galley(brect.min + egui::vec2(3.0, 1.0), g, legend_for(*col));
+            } else {
+                // TSX "mark": a dot at right 6, top 4, size 6 (at 50 pt),
+                // ringed in the case colour so it shows on any cap.
+                let rad = if self.min_text {
+                    (3.0 * k).clamp(2.5, 3.5)
+                } else {
+                    3.0 * k
+                };
+                let center = egui::pos2(r.max.x - 6.0 * k - rad, r.min.y + 4.0 * k + rad);
+                painter.circle(center, rad, *col, line(1.0, self.case));
+            }
+        }
+        if !self.enabled {
+            painter.rect_filled(r.expand(0.5), wall_r, self.case.gamma_multiply(0.5));
+        }
+    }
+}
+
+/// The small symbols before modifier labels.
+fn paint_icon(p: &egui::Painter, icon: CapIcon, left_mid: Pos2, s: f32, c: Color32) {
+    let stroke = line((s * 0.14).clamp(0.6, 1.4), c);
+    let x0 = left_mid.x;
+    let y = left_mid.y;
+    match icon {
+        CapIcon::Back => {
+            let tip = egui::pos2(x0, y);
+            p.line_segment([tip, egui::pos2(x0 + s, y)], stroke);
+            p.line_segment([tip, egui::pos2(x0 + s * 0.38, y - s * 0.34)], stroke);
+            p.line_segment([tip, egui::pos2(x0 + s * 0.38, y + s * 0.34)], stroke);
+        }
+        CapIcon::Return => {
+            let tip = egui::pos2(x0, y + s * 0.2);
+            let corner = egui::pos2(x0 + s, y + s * 0.2);
+            p.line_segment([tip, corner], stroke);
+            p.line_segment([corner, egui::pos2(x0 + s, y - s * 0.4)], stroke);
+            p.line_segment(
+                [tip, egui::pos2(x0 + s * 0.32, y + s * 0.2 - s * 0.3)],
+                stroke,
+            );
+            p.line_segment(
+                [tip, egui::pos2(x0 + s * 0.32, y + s * 0.2 + s * 0.3)],
+                stroke,
+            );
+        }
+        CapIcon::Shift => {
+            let w = s;
+            let h = s * 1.05;
+            let top = egui::pos2(x0 + w / 2.0, y - h / 2.0);
+            let pts = vec![
+                top,
+                egui::pos2(x0 + w, y),
+                egui::pos2(x0 + w * 0.72, y),
+                egui::pos2(x0 + w * 0.72, y + h / 2.0),
+                egui::pos2(x0 + w * 0.28, y + h / 2.0),
+                egui::pos2(x0 + w * 0.28, y),
+                egui::pos2(x0, y),
+            ];
+            p.add(egui::Shape::closed_line(pts, stroke));
+        }
     }
 }
 

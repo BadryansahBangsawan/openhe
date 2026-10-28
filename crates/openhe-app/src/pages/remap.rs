@@ -1353,6 +1353,7 @@ impl Page {
             let changes = &self.changes;
             ui.vertical_centered(|ui| {
                 KeyboardView::new(model, matrix)
+                    .skin(ctx.skin())
                     .enabled(connected)
                     .id_salt("remap-keyboard")
                     .show(ui, &mut self.selection, |key| {

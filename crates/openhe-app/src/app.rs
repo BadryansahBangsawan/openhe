@@ -75,6 +75,18 @@ impl AppCtx<'_> {
     pub fn save_data(&self) -> std::io::Result<()> {
         self.data.borrow().save()
     }
+
+    /// The storage key of the connected keyboard (its serial).
+    pub fn keyboard_key(&self) -> Option<String> {
+        self.snapshot
+            .map(|s| crate::skin::skin_key(s.model, &s.info.serial))
+    }
+
+    /// The key cap colours to draw the keyboard in (see
+    /// [`AppData::skin_for`]).
+    pub fn skin(&self) -> crate::skin::KeyboardSkin {
+        self.data.borrow().skin_for(self.keyboard_key().as_deref())
+    }
 }
 
 /// Longest the window stays open after a close request while a write job
