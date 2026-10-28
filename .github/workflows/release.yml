@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS app bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build OpenHE.app and zip it
+        run: packaging/macos/build-app.sh --zip
+      - name: Rename archive after the tag
+        run: mv dist/macos/OpenHE-*-macos.zip "dist/macos/OpenHE-${GITHUB_REF_NAME}-macos-arm64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenHE-macos
+          path: dist/macos/OpenHE-*-macos-arm64.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux AppImage
+    # Oldest supported Ubuntu runner: the AppImage then runs on newer distributions too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev pkg-config libxkbcommon-dev libgl1-mesa-dev \
+            libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            curl file
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build AppImage
+        run: packaging/linux/build-appimage.sh
+      - name: Rename AppImage after the tag
+        run: mv dist/linux/OpenHE-*-x86_64.AppImage "dist/linux/OpenHE-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenHE-linux
+          path: dist/linux/OpenHE-*-linux-x86_64.AppImage
+          if-no-files-found: error
+
+  windows:
+    name: Windows executable
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p openhe-app
+      - name: Collect executable
+        shell: bash
+        run: |
+          mkdir -p dist/windows
+          cp target/release/openhe-app.exe "dist/windows/OpenHE-${GITHUB_REF_NAME}-windows-x86_64.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenHE-windows
+          path: dist/windows/OpenHE-*-windows-x86_64.exe
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: List files
+        run: ls -l artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: true
