@@ -1134,6 +1134,37 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A WIN 60 HE MAX at factory defaults (its reference matrix), Windows
+    /// mode, profile 1.
+    pub fn snapshot60() -> DeviceSnapshot {
+        let matrix = reference_matrix(Model::Win60HeMax);
+        let keys = matrix
+            .keys()
+            .map(|(_, _, code)| {
+                let s = KeySettings {
+                    mode: KeyMode {
+                        touch: TouchMode::Global,
+                        advanced: Advanced::None,
+                        high: 0,
+                    },
+                    actuation: Micrometers(2000),
+                    rt_press: Micrometers(20),
+                    rt_release: Micrometers(20),
+                    top_dz: Micrometers(200),
+                    bottom_dz: Micrometers(200),
+                    switch: 0,
+                };
+                (code, s)
+            })
+            .collect();
+        DeviceSnapshot {
+            model: Model::Win60HeMax,
+            matrix,
+            keys,
+            ..snapshot68()
+        }
+    }
+
     /// Runs `n` frames at 1440×900.
     pub fn run_frames(ctx: &egui::Context, n: usize, mut f: impl FnMut(&egui::Context)) {
         for _ in 0..n {

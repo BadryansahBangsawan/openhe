@@ -81,21 +81,7 @@ pub struct Exported {
 /// parts are best effort (left out and listed in `skipped`). A disconnect
 /// is always `Err(Disconnected)`.
 pub fn export_job<T: Transport>(kb: &mut Keyboard<T>, keys: &[u8]) -> Result<Exported, Error> {
-    let mut out = Vec::with_capacity(keys.len());
-    for &code in keys {
-        let settings = kb.key_settings(code)?;
-        let mut layers = [0u16; 4];
-        for (slot, layer) in layers.iter_mut().zip(LAYERS) {
-            *slot = kb.layer_code(code, layer)?;
-        }
-        let advanced = kb.advanced(code)?;
-        out.push(KeyData {
-            code,
-            settings,
-            layers,
-            advanced,
-        });
-    }
+    let out = read_keys(kb, keys)?;
     let mut skipped = Vec::new();
     let lighting = match kb.lighting() {
         Ok(l) => Some(l),
@@ -123,6 +109,28 @@ pub fn export_job<T: Transport>(kb: &mut Keyboard<T>, keys: &[u8]) -> Result<Exp
         },
         skipped,
     })
+}
+
+/// Reads every key in `keys`: settings, the four layer codes and the
+/// advanced function (the key part of [`export_job`]; templates use it for
+/// their preview and backup). Any error fails the read.
+pub fn read_keys<T: Transport>(kb: &mut Keyboard<T>, keys: &[u8]) -> Result<Vec<KeyData>, Error> {
+    let mut out = Vec::with_capacity(keys.len());
+    for &code in keys {
+        let settings = kb.key_settings(code)?;
+        let mut layers = [0u16; 4];
+        for (slot, layer) in layers.iter_mut().zip(LAYERS) {
+            *slot = kb.layer_code(code, layer)?;
+        }
+        let advanced = kb.advanced(code)?;
+        out.push(KeyData {
+            code,
+            settings,
+            layers,
+            advanced,
+        });
+    }
+    Ok(out)
 }
 
 // -------------------------------------------------------------- the file
@@ -234,7 +242,7 @@ pub enum FileError {
     TransparentOnBase(u8),
 }
 
-fn touch_name(t: TouchMode) -> &'static str {
+pub(crate) fn touch_name(t: TouchMode) -> &'static str {
     match t {
         TouchMode::Global => "global",
         TouchMode::Single => "single",
@@ -242,7 +250,7 @@ fn touch_name(t: TouchMode) -> &'static str {
     }
 }
 
-fn touch_from(s: &str) -> Option<TouchMode> {
+pub(crate) fn touch_from(s: &str) -> Option<TouchMode> {
     match s {
         "global" => Some(TouchMode::Global),
         "single" => Some(TouchMode::Single),
@@ -251,7 +259,7 @@ fn touch_from(s: &str) -> Option<TouchMode> {
     }
 }
 
-fn model_from(s: &str) -> Option<Model> {
+pub(crate) fn model_from(s: &str) -> Option<Model> {
     [Model::Win68HeMax, Model::Win60HeMax]
         .into_iter()
         .find(|m| m.name() == s.trim())
@@ -262,7 +270,7 @@ fn um(v: u16) -> Micrometers {
 }
 
 impl AdvancedEntry {
-    fn from_config(c: &AdvancedConfig) -> AdvancedEntry {
+    pub(crate) fn from_config(c: &AdvancedConfig) -> AdvancedEntry {
         match *c {
             AdvancedConfig::None => AdvancedEntry::None,
             AdvancedConfig::Dks(d) => AdvancedEntry::Dks {
@@ -298,7 +306,7 @@ impl AdvancedEntry {
         }
     }
 
-    fn to_config(&self) -> Result<AdvancedConfig, FileError> {
+    pub(crate) fn to_config(&self) -> Result<AdvancedConfig, FileError> {
         Ok(match *self {
             AdvancedEntry::None => AdvancedConfig::None,
             AdvancedEntry::Dks {
@@ -602,7 +610,11 @@ fn check_performance(model: Model, key: u8, change: &PerformanceChange) -> Resul
 /// Fn key never gets a function (macros included) and is never part of a
 /// SOCD pair: what the firmware does then is unknown, and losing Fn loses
 /// the Fn layers.
-fn check_advanced(key: u8, cfg: &AdvancedConfig, present: &BTreeSet<u8>) -> Result<(), FileError> {
+pub(crate) fn check_advanced(
+    key: u8,
+    cfg: &AdvancedConfig,
+    present: &BTreeSet<u8>,
+) -> Result<(), FileError> {
     let invalid = |e: openhe_proto::advanced::AdvancedError| bad(format!("key 0x{key:02X}: {e}"));
     if key == FN_KEY && *cfg != AdvancedConfig::None {
         return Err(bad(
