@@ -735,27 +735,40 @@ impl Page {
         let mut retry = false;
         Card::new().show(ui, |ui| {
             ui.set_min_size(egui::vec2(ui.available_width(), h - 42.0));
-            ui.horizontal(|ui| {
-                let title_code = focus.map(|f| f.0).or(codes.first().copied());
-                let title = match title_code {
-                    Some(c) => format!("{} · {}", t::TRAVEL, openhe_proto::keycodes::legend(c)),
-                    None => t::TRAVEL.to_string(),
-                };
-                card::title(ui, title);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let hint = match (live, codes.first()) {
-                        (false, _) => live_strings::SWITCH_TO_LIVE.to_string(),
-                        (true, Some(&c)) if codes.len() == 1 => format!(
-                            "{} {} {}",
-                            live_strings::PRESS,
-                            openhe_proto::keycodes::legend(c),
-                            live_strings::TO_SEE_LIVE
-                        ),
-                        (true, _) => live_strings::PRESS_ANY.to_string(),
-                    };
-                    ui.label(RichText::new(hint).font(font::small()).color(color::MUTED));
+            let title_code = focus.map(|f| f.0).or(codes.first().copied());
+            let title = match title_code {
+                Some(c) => format!("{} · {}", t::TRAVEL, openhe_proto::keycodes::legend(c)),
+                None => t::TRAVEL.to_string(),
+            };
+            let hint = match (live, codes.first()) {
+                (false, _) => live_strings::SWITCH_TO_LIVE.to_string(),
+                (true, Some(&c)) if codes.len() == 1 => format!(
+                    "{} {} {}",
+                    live_strings::PRESS,
+                    openhe_proto::keycodes::legend(c),
+                    live_strings::TO_SEE_LIVE
+                ),
+                (true, _) => live_strings::PRESS_ANY.to_string(),
+            };
+            // The hint sits right of the title when both fit on one row,
+            // else on its own (wrapped) row below it: never on top.
+            let width = |text: &str, f: egui::FontId| {
+                ui.fonts(|fo| fo.layout_no_wrap(text.to_string(), f, color::TEXT).size().x)
+            };
+            let one_row = width(&title, font::heading()) + 24.0 + width(&hint, font::small())
+                <= ui.available_width();
+            let hint_text = RichText::new(hint).font(font::small()).color(color::MUTED);
+            if one_row {
+                ui.horizontal(|ui| {
+                    card::title(ui, title);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(hint_text);
+                    });
                 });
-            });
+            } else {
+                card::title(ui, title);
+                ui.add(egui::Label::new(hint_text).wrap());
+            }
             ui.add_space(12.0);
             if let (true, Some((msg, tech))) = (live, &self.live.error) {
                 retry = card::error_box(
@@ -1092,7 +1105,7 @@ impl Page {
 }
 
 /// Per-key decoration: actuation value, a stroke when it differs from the
-/// factory default, and an "RT" badge for rapid-trigger keys.
+/// factory default, and an accent dot (badge) for rapid-trigger keys.
 fn decorate(snap: Option<&DeviceSnapshot>, code: u8) -> KeyDecoration {
     let Some(s) = snap.and_then(|s| s.keys.get(&code)) else {
         return KeyDecoration::default();
@@ -1101,7 +1114,8 @@ fn decorate(snap: Option<&DeviceSnapshot>, code: u8) -> KeyDecoration {
         label2: Some(mm_short(s.actuation.0).into()),
         fill: None,
         stroke: (s.actuation.0 != DEFAULT_ACTUATION_UM).then_some(color::INFO.gamma_multiply(0.7)),
-        badge: (s.mode.touch == TouchMode::RapidTrigger).then(|| ("RT".to_string(), color::ACCENT)),
+        // A dot (the legend explains it): an "RT" pill crowded the legend.
+        badge: (s.mode.touch == TouchMode::RapidTrigger).then(|| (String::new(), color::ACCENT)),
     }
 }
 
@@ -1191,20 +1205,12 @@ fn legend_row(ui: &mut Ui, swatch: Swatch, text: &str) {
             Swatch::Selected => (color::ACCENT_SOFT, line(1.5, color::ACCENT)),
             Swatch::Plain => (color::KEY, line(1.0, color::BORDER_STRONG)),
             Swatch::Changed => (color::KEY, line(1.0, color::INFO.gamma_multiply(0.7))),
-            Swatch::Rt => (
-                color::ACCENT.gamma_multiply(0.18),
-                line(0.0, Color32::TRANSPARENT),
-            ),
+            Swatch::Rt => (color::KEY, line(1.0, color::BORDER_STRONG)),
         };
         p.rect(r, radius, fill, stroke, StrokeKind::Inside);
         if let Swatch::Rt = swatch {
-            p.text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                "RT",
-                egui::FontId::proportional(8.5),
-                color::ACCENT,
-            );
+            // Like the keys: an accent dot in the top-right corner.
+            p.circle_filled(r.right_top() + egui::vec2(-5.5, 5.5), 2.8, color::ACCENT);
         }
         ui.label(RichText::new(text).color(color::TEXT));
     });
@@ -2004,7 +2010,7 @@ mod tests {
         let a = decorate(Some(&s), 0x04);
         assert_eq!(a.label2.as_deref(), Some("0.40"));
         assert!(a.stroke.is_some());
-        assert_eq!(a.badge.map(|b| b.0), Some("RT".to_string()));
+        assert_eq!(a.badge.map(|b| b.0), Some(String::new()));
         let w = decorate(Some(&s), 0x1A);
         assert_eq!(w.label2.as_deref(), Some("2.00"));
         assert!(w.stroke.is_none() && w.badge.is_none());
