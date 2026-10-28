@@ -3,8 +3,10 @@
 //!
 //! Nothing here is sent anywhere; the file lives in the user's config dir.
 
+use crate::skin::KeyboardSkin;
 use openhe_proto::macros::{MacroAction, PlayMode};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -146,6 +148,15 @@ pub struct AppData {
     /// When the last calibration was saved on the keyboard (Unix seconds).
     #[serde(default)]
     pub last_calibrated: Option<u64>,
+    /// Key cap colours per keyboard ([`crate::skin::skin_key`]: the
+    /// serial), picked by the user; the keyboard does not report them.
+    /// Read leniently: an unknown entry reads as the dark skin.
+    #[serde(default, deserialize_with = "crate::skin::deserialize_skins")]
+    pub keyboard_skins: BTreeMap<String, KeyboardSkin>,
+    /// Key (in `keyboard_skins`) of the keyboard last connected, so its
+    /// colours show while it is unplugged.
+    #[serde(default)]
+    pub last_keyboard: Option<String>,
     /// Set when the data file existed but could not be read or moved aside
     /// at load. [`AppData::save`] then refuses to write, so that file is
     /// never replaced by defaults. Not stored in the file; only this crate
@@ -243,6 +254,26 @@ impl AppData {
         let dir = Self::default_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config directory"))?;
         self.save_to(&dir)
+    }
+
+    /// The skin of keyboard `key` ([`crate::skin::skin_key`]), if one was
+    /// chosen.
+    pub fn skin_of(&self, key: &str) -> Option<KeyboardSkin> {
+        self.keyboard_skins.get(key).copied()
+    }
+
+    /// The skin to draw: that of `key` (the keyboard connected now), else
+    /// of the keyboard last connected, else the dark default.
+    pub fn skin_for(&self, key: Option<&str>) -> KeyboardSkin {
+        key.or(self.last_keyboard.as_deref())
+            .and_then(|k| self.skin_of(k))
+            .unwrap_or_default()
+    }
+
+    /// Stores `skin` for keyboard `key` (also as the last keyboard).
+    pub fn set_skin(&mut self, key: &str, skin: KeyboardSkin) {
+        self.keyboard_skins.insert(key.to_string(), skin);
+        self.last_keyboard = Some(key.to_string());
     }
 
     /// Display name for profile `idx` (0-based): "1 · Kerja" or just "1".
@@ -466,6 +497,54 @@ mod tests {
         };
         d.save_to(&dir.0).unwrap();
         assert_eq!(AppData::load_from(&dir.0).unwrap(), d);
+    }
+
+    #[test]
+    fn keyboard_skins_round_trip_and_old_files_load() {
+        let dir = TempDir::new("skins");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        // A file from before skins existed.
+        std::fs::write(
+            dir.0.join(FILE_NAME),
+            br#"{"launch_at_login":true,"profile_names":["a","","",""]}"#,
+        )
+        .unwrap();
+        let d = AppData::load_from(&dir.0).unwrap();
+        assert!(d.keyboard_skins.is_empty());
+        assert_eq!(d.profile_names[0], "a");
+        let mut d = sample();
+        d.keyboard_skins
+            .insert("A68M240193000000".into(), KeyboardSkin::BlackRed);
+        d.keyboard_skins.insert(
+            "model:Win60HeMax".into(),
+            KeyboardSkin::custom([0xD9, 0xD4, 0xC7], [0x3A, 0x3F, 0x4B], [0xE2, 0x72, 0x5B]),
+        );
+        d.save_to(&dir.0).unwrap();
+        assert_eq!(AppData::load_from(&dir.0).unwrap(), d);
+        // A skin from a newer version does not break the file.
+        std::fs::write(
+            dir.0.join(FILE_NAME),
+            br#"{"macros":[],"keyboard_skins":{"X":{"kind":"hologram"},"Y":{"kind":"grey_yellow"}}}"#,
+        )
+        .unwrap();
+        let d = AppData::load_from(&dir.0).unwrap();
+        assert_eq!(d.keyboard_skins["X"], KeyboardSkin::Gelap);
+        assert_eq!(d.keyboard_skins["Y"], KeyboardSkin::GreyYellow);
+    }
+
+    #[test]
+    fn skin_lookup_falls_back_to_the_last_keyboard_then_gelap() {
+        let mut d = AppData::default();
+        assert_eq!(d.skin_for(Some("A")), KeyboardSkin::Gelap);
+        assert_eq!(d.skin_for(None), KeyboardSkin::Gelap);
+        assert_eq!(d.skin_of("A"), None);
+        d.set_skin("A", KeyboardSkin::WhiteBlue);
+        assert_eq!(d.skin_of("A"), Some(KeyboardSkin::WhiteBlue));
+        assert_eq!(d.last_keyboard.as_deref(), Some("A"));
+        // Unplugged: the last keyboard's colours.
+        assert_eq!(d.skin_for(None), KeyboardSkin::WhiteBlue);
+        // Another keyboard without a choice: the default.
+        assert_eq!(d.skin_for(Some("B")), KeyboardSkin::Gelap);
     }
 
     #[test]

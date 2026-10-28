@@ -30,7 +30,7 @@ use crate::widgets::keyboard::{
 };
 use crate::widgets::slider_mm::mm_short;
 use crate::worker::{DeviceSnapshot, Pending, Worker};
-use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, Ui};
+use eframe::egui::{self, Align, CornerRadius, Layout, RichText, Sense, Ui};
 use openhe_device::{Error, Keyboard, Transport};
 use openhe_proto::travel::TravelFrame;
 use openhe_proto::Model;
@@ -733,6 +733,7 @@ impl Page {
         ui.vertical_centered(|ui| {
             // Selection is not used here: the view is display-only.
             KeyboardView::new(model, matrix)
+                .skin(ctx.skin())
                 .enabled(false)
                 .id_salt("calibration-keyboard")
                 .show(ui, &mut self.selection, |code| {
@@ -933,7 +934,7 @@ fn decorate(p: &Progress, code: u8, active: bool, counting: bool) -> KeyDecorati
     if p.done.contains(&code) {
         return KeyDecoration {
             label2: Some(Label2::colored("✔", color::SUCCESS)),
-            fill: Some(color::SUCCESS.gamma_multiply(0.10)),
+            fill: Some(color::SUCCESS.gamma_multiply(0.18)),
             stroke: Some(color::SUCCESS.gamma_multiply(0.6)),
             badge: None,
         };
@@ -942,7 +943,7 @@ fn decorate(p: &Progress, code: u8, active: bool, counting: bool) -> KeyDecorati
     if pressed {
         return KeyDecoration {
             label2: Some(t::PRESS.into()),
-            fill: Some(Color32::from_rgb(0x33, 0x27, 0x10)),
+            fill: Some(color::ACCENT.gamma_multiply(0.3)),
             stroke: Some(color::ACCENT),
             badge: None,
         };

@@ -75,6 +75,18 @@ impl AppCtx<'_> {
     pub fn save_data(&self) -> std::io::Result<()> {
         self.data.borrow().save()
     }
+
+    /// The storage key of the connected keyboard (its serial).
+    pub fn keyboard_key(&self) -> Option<String> {
+        self.snapshot
+            .map(|s| crate::skin::skin_key(s.model, &s.info.serial))
+    }
+
+    /// The key cap colours to draw the keyboard in (see
+    /// [`AppData::skin_for`]).
+    pub fn skin(&self) -> crate::skin::KeyboardSkin {
+        self.data.borrow().skin_for(self.keyboard_key().as_deref())
+    }
 }
 
 /// Longest the window stays open after a close request while a write job
@@ -211,6 +223,11 @@ pub struct OpenHeApp {
     /// An error from the top bar, shown as a dismissable notice.
     shell_error: Option<(String, Option<String>)>,
     close: CloseGuard,
+    /// Keyboards whose colour dialog was closed without a choice this
+    /// session (asked again next time the app opens).
+    skin_asked: std::collections::BTreeSet<String>,
+    /// The highlighted card of the colour dialog.
+    skin_choice: crate::skin::KeyboardSkin,
 }
 
 /// A running top-bar switch and the value it asked for (shown meanwhile).
@@ -260,6 +277,8 @@ impl OpenHeApp {
             profile_switch: RestartRun::default(),
             shell_error: None,
             close: CloseGuard::default(),
+            skin_asked: Default::default(),
+            skin_choice: crate::skin::KeyboardSkin::GreyYellow,
         }
     }
 }
@@ -610,6 +629,46 @@ impl OpenHeApp {
                 PageId::Calibration => self.calibration.ui(&app_ctx, ui),
                 PageId::Settings => self.settings.ui(&app_ctx, ui),
             });
+        self.skin_dialog(ctx, snapshot);
+    }
+
+    /// Asks for the colours of a keyboard connected for the first time
+    /// (the keyboard does not report them), and remembers the keyboard
+    /// last connected so its colours show while it is unplugged.
+    fn skin_dialog(&mut self, ctx: &egui::Context, snapshot: Option<&DeviceSnapshot>) {
+        let Some(snap) = snapshot else { return };
+        let key = crate::skin::skin_key(snap.model, &snap.info.serial);
+        if self.data.borrow().skin_of(&key).is_some() {
+            if self.data.borrow().last_keyboard.as_deref() != Some(key.as_str()) {
+                self.data.borrow_mut().last_keyboard = Some(key);
+                // Only a convenience: a failed save is not worth a notice.
+                let _ = self.data.borrow().save();
+            }
+            return;
+        }
+        if self.skin_asked.contains(&key) {
+            return;
+        }
+        let outcome = crate::widgets::skin_picker::first_connect_dialog(
+            ctx,
+            snap.model,
+            &snap.matrix,
+            &mut self.skin_choice,
+        );
+        use crate::widgets::skin_picker::DialogOutcome;
+        let skin = match outcome {
+            None => return,
+            Some(DialogOutcome::Dismissed) => {
+                self.skin_asked.insert(key);
+                return;
+            }
+            Some(DialogOutcome::Later) => crate::skin::KeyboardSkin::Gelap,
+            Some(DialogOutcome::Use(s)) => s,
+        };
+        self.data.borrow_mut().set_skin(&key, skin);
+        if self.data.borrow().save().is_err() {
+            self.shell_error = Some((i18n::storage::SAVE_FAILED.to_string(), None));
+        }
     }
 }
 

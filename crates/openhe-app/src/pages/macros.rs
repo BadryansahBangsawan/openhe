@@ -1961,6 +1961,7 @@ impl Page {
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
                     KeyboardView::new(snap.model, &snap.matrix)
+                        .skin(ctx.skin())
                         .id_salt("macro-target")
                         .show(ui, &mut self.pick_sel, |_| Default::default());
                 });

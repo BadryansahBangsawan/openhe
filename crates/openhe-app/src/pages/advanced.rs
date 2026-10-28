@@ -1324,6 +1324,7 @@ impl Page {
             partner.filter(|_| self.editor.as_ref().is_some_and(|e| e.func == Func::Socd));
         ui.vertical_centered(|ui| {
             KeyboardView::new(model, matrix)
+                .skin(ctx.skin())
                 .enabled(connected)
                 .id_salt("advanced-keyboard")
                 .show(ui, &mut self.selection, |code| {

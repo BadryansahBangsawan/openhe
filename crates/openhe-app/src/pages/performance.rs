@@ -18,8 +18,7 @@ use crate::widgets::slider_mm::{mm_short, mm_value_box, SliderMm};
 use crate::widgets::toggle::toggle;
 use crate::worker::{DeviceSnapshot, Pending};
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Rect, RichText, Sense,
-    StrokeKind, Ui,
+    self, Align, Align2, CornerRadius, Frame, Layout, Margin, Rect, RichText, Sense, StrokeKind, Ui,
 };
 use openhe_device::keyboard::performance::{PerformanceChange, MAX_DEADZONE_UM, MIN_RT_UM};
 use openhe_device::{Error, KeySettings};
@@ -656,14 +655,13 @@ impl Page {
         let snap = ctx.snapshot;
         let live = (self.view == View::Live).then_some(&self.live);
         ui.vertical_centered(|ui| {
-            KeyboardView::new(model, matrix).enabled(connected).show(
-                ui,
-                &mut self.selection,
-                |code| match live {
+            KeyboardView::new(model, matrix)
+                .enabled(connected)
+                .skin(ctx.skin())
+                .show(ui, &mut self.selection, |code| match live {
                     Some(l) => live_decoration(snap, l, code),
                     None => decorate(snap, code),
-                },
-            );
+                });
         });
         if !connected {
             ui.add_space(8.0);
@@ -1497,9 +1495,9 @@ fn live_decoration(snap: Option<&DeviceSnapshot>, live: &LiveDepth, code: u8) ->
     let frac = f32::from(depth.min(max)) / f32::from(max.max(1));
     KeyDecoration {
         label2: Some(mm_short(depth).into()),
-        fill: (depth > 0).then(|| {
-            color::KEY.lerp_to_gamma(Color32::from_rgb(0x5A, 0x40, 0x10), frac.clamp(0.0, 1.0))
-        }),
+        // An amber tint over the cap, stronger the deeper the key is (the
+        // cap keeps its colour, so it reads on every keyboard skin).
+        fill: (depth > 0).then(|| color::ACCENT.gamma_multiply(0.12 + 0.43 * frac.clamp(0.0, 1.0))),
         stroke: (depth > 0 && depth >= actuation).then_some(color::ACCENT),
         badge: None,
     }

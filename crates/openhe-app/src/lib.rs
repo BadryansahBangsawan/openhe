@@ -6,6 +6,7 @@ pub mod app;
 pub mod i18n;
 pub mod instance;
 pub mod pages;
+pub mod skin;
 pub mod storage;
 pub mod theme;
 pub mod widgets;

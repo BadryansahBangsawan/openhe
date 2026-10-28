@@ -286,3 +286,128 @@ fn screenshot_07_pengaturan() {
     w.idle();
     shots(&mut w, "07-pengaturan");
 }
+
+fn skin_slug(s: &openhe_app::skin::KeyboardSkin) -> &'static str {
+    use openhe_app::skin::KeyboardSkin::*;
+    match s {
+        GreyYellow => "abu-kuning",
+        BlackRed => "hitam-merah",
+        WhiteBlue => "putih-biru",
+        Gelap => "gelap",
+        Custom { .. } => "kustom",
+    }
+}
+
+/// Performa (as in screenshot 01) in every skin, at 1280×800.
+#[test]
+#[ignore]
+fn screenshot_08_performa_skins() {
+    use openhe_app::skin::KeyboardSkin;
+    for skin in [
+        KeyboardSkin::GreyYellow,
+        KeyboardSkin::BlackRed,
+        KeyboardSkin::WhiteBlue,
+        KeyboardSkin::Gelap,
+        KeyboardSkin::custom([0xD9, 0xD4, 0xC7], [0x3A, 0x3F, 0x4B], [0xE2, 0x72, 0x5B]),
+    ] {
+        let mut data = profile_names();
+        data.keyboard_skins.insert(SIM_SERIAL.into(), skin);
+        let mut w = world(data);
+        w.click("WASD");
+        w.click("Rapid Trigger");
+        w.edit_value("2.000 mm", 0, "0.4");
+        w.apply("Terapkan ke keyboard");
+        shot(
+            &mut w,
+            &format!("08-performa-{}", skin_slug(&skin)),
+            DESKTOP,
+        );
+    }
+}
+
+/// The first-connect dialog (mockup 08c).
+#[test]
+#[ignore]
+fn screenshot_08c_dialog() {
+    let mut w = World::first_connect(profile_names());
+    w.frames(3);
+    shots(&mut w, "08c-warna-dialog");
+}
+
+/// Pengaturan with the "Warna keyboard" row (mockup 08d), and the custom
+/// editor (mockup 08e).
+#[test]
+#[ignore]
+fn screenshot_08d_pengaturan_and_08e_kustom() {
+    let mut w = world(profile_names());
+    w.page("Pengaturan");
+    w.idle();
+    w.click("Abu Kuning");
+    shots(&mut w, "08d-warna-pengaturan");
+    w.click("Kustom…");
+    shots(&mut w, "08e-warna-kustom");
+}
+
+/// The keyboard widget in every skin, WIN 68 and WIN 60, with W selected
+/// and A, S, D marked (compare with mockups 08 and 08b).
+#[test]
+#[ignore]
+fn screenshot_08_skins() {
+    use eframe::egui;
+    use openhe_app::skin::KeyboardSkin;
+    use openhe_app::widgets::keyboard::{reference_matrix, KeyDecoration, KeyboardView, Selection};
+    use openhe_proto::Model;
+    let skins = [
+        KeyboardSkin::GreyYellow,
+        KeyboardSkin::BlackRed,
+        KeyboardSkin::WhiteBlue,
+        KeyboardSkin::Gelap,
+        KeyboardSkin::custom([0xD9, 0xD4, 0xC7], [0x3A, 0x3F, 0x4B], [0xE2, 0x72, 0x5B]),
+    ];
+    for model in [Model::Win68HeMax, Model::Win60HeMax] {
+        let mut ready = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1800.0, 1100.0))
+            .with_pixels_per_point(2.0)
+            .build_ui(move |ui| {
+                if !ready {
+                    openhe_app::theme::apply(ui.ctx());
+                    ready = true;
+                }
+                openhe_app::theme::ensure_fonts(ui.ctx());
+                let m = reference_matrix(model);
+                egui::Grid::new("g").spacing([24.0, 24.0]).show(ui, |ui| {
+                    for (i, s) in skins.iter().enumerate() {
+                        ui.vertical(|ui| {
+                            ui.set_width(860.0);
+                            ui.label(format!("{s:?}"));
+                            let mut sel = Selection::default();
+                            sel.set([0x1A]);
+                            KeyboardView::new(model, &m)
+                                .skin(*s)
+                                .max_unit(50.0)
+                                .id_salt(["k0", "k1", "k2", "k3", "k4"][i])
+                                .show(ui, &mut sel, |c| KeyDecoration {
+                                    badge: [0x04, 0x16, 0x07]
+                                        .contains(&c)
+                                        .then(|| (String::new(), openhe_app::theme::color::ACCENT)),
+                                    ..Default::default()
+                                });
+                        });
+                        if i % 2 == 1 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            });
+        h.run_steps(4);
+        let img = h.render().expect("render");
+        let name = match model {
+            Model::Win68HeMax => "08-skins-win68",
+            Model::Win60HeMax => "08b-skins-win60",
+        };
+        let path = out_dir().join(format!("{name}.png"));
+        img.save(&path).expect("save png");
+        eprintln!("wrote {}", path.display());
+    }
+}
