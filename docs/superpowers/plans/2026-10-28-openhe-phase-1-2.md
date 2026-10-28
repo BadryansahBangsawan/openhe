@@ -13,7 +13,7 @@
 Komunikasi dengan keyboard berjalan di thread worker. Antara UI dan worker cukup lewat channel, jadi UI tidak pernah tertahan menunggu keyboard.
 
 **Tech Stack:**
-- Rust stable, edition 2021, `rust-version = "1.81"`
+- Rust stable, edition 2021, `rust-version = "1.85"`
 - `hidapi` 2.x, `thiserror` 1.x, `clap` 4.x (CLI)
 - `eframe`/`egui` 0.29+ (GUI)
 - `serde` + `serde_json` dan `directories` 5.x (penyimpanan lokal)

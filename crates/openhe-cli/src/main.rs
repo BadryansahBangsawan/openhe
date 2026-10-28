@@ -5,7 +5,7 @@ mod trace;
 use clap::{Parser, Subcommand};
 use openhe_device::{list_devices, Error, HidTransport, Keyboard, Transport};
 use openhe_proto::defkey::Matrix;
-use openhe_proto::key::KeyParam;
+use openhe_proto::key::{KeyParam, TouchMode};
 use openhe_proto::model::{validate_actuation, Model, SystemMode};
 use openhe_proto::units::Micrometers;
 use output::{matrix_rows, DumpOut, InfoOut, KeyOut};
@@ -74,6 +74,8 @@ struct ActuationPlan {
     code: u8,
     old: Micrometers,
     new: Micrometers,
+    /// The key's touch mode, which this command does not change.
+    touch: TouchMode,
 }
 
 impl ActuationPlan {
@@ -90,6 +92,18 @@ impl ActuationPlan {
             output::mm(self.old),
             output::mm(self.new)
         )
+    }
+
+    /// A warning for a key in Global touch mode, where the per-key actuation
+    /// may be ignored (PROTOCOL.md 7.x finding 13).
+    fn note_line(&self) -> Option<String> {
+        (self.touch == TouchMode::Global).then(|| {
+            format!(
+                "note: key 0x{:02X} is in Global touch mode; the per-key actuation may not take \
+                 effect until the key uses Single/RT mode (not changed by this command)",
+                self.code
+            )
+        })
     }
 
     fn done_line(&self) -> String {
@@ -117,11 +131,17 @@ impl From<Error> for PlanError {
 }
 
 /// Reads what the change needs and checks it against the key's switch. Sends no SET.
+/// A keyboard in bootloader mode is refused before anything else is read.
 fn plan_actuation<T: Transport>(
     kb: &mut Keyboard<T>,
     code: u8,
     mm: f32,
 ) -> Result<ActuationPlan, PlanError> {
+    if kb.info()?.in_bootloader {
+        return Err(PlanError::Invalid(
+            "the keyboard is in bootloader mode; refusing to write".to_string(),
+        ));
+    }
     let matrix = kb.matrix()?;
     if !matrix.keys().any(|(_, _, c)| c == code) {
         return Err(PlanError::Invalid(format!(
@@ -153,6 +173,7 @@ fn plan_actuation<T: Transport>(
         code,
         old: current.actuation,
         new,
+        touch: current.mode.touch,
     })
 }
 
@@ -274,6 +295,9 @@ fn run(cli: &Cli) -> Result<bool, Error> {
             eprintln!("{}", plan.writing_line());
             kb.set_key_params(&[plan.entry()])?;
             println!("{}", plan.done_line());
+            if let Some(note) = plan.note_line() {
+                eprintln!("{note}");
+            }
         }
     }
     Ok(true)
@@ -483,10 +507,29 @@ mod tests {
         m.push_reply(defkey_reply(4, &[], 5, &[]));
     }
 
+    /// Queues the SYNC reply `info` reads.
+    fn push_sync(m: &mut MockTransport, in_bootloader: bool) {
+        let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
+        raw[2] = 0x81;
+        raw[4 + 7] = u8::from(in_bootloader);
+        m.push_reply(raw);
+    }
+
     /// Queues the seven replies `key_settings` reads (touch Global, factory-style values).
     fn push_settings(m: &mut MockTransport, key: u8, actuation: u16, switch: u16) {
+        push_settings_with_mode(m, key, 0, actuation, switch);
+    }
+
+    fn push_settings_with_mode(
+        m: &mut MockTransport,
+        key: u8,
+        mode: u16,
+        actuation: u16,
+        switch: u16,
+    ) {
         for (layout, v) in [
-            (8u8, 0u16),
+            (8u8, mode),
             (4, actuation),
             (20, 20),
             (21, 20),
@@ -510,6 +553,7 @@ mod tests {
         keys: &[u8],
     ) -> Result<ActuationPlan, PlanError> {
         let mut m = MockTransport::new();
+        push_sync(&mut m, false);
         push_matrix(&mut m, keys);
         push_settings(&mut m, code, settings.0, settings.1);
         plan_actuation(&mut kb(m), code, mm)
@@ -518,6 +562,7 @@ mod tests {
     #[test]
     fn plan_reads_then_computes_the_change_without_writing() {
         let mut m = MockTransport::new();
+        push_sync(&mut m, false);
         push_matrix(&mut m, &[0x0A, 0x0B]);
         push_settings(&mut m, 0x0A, 2000, 0);
         let mut k = kb(m);
@@ -527,18 +572,59 @@ mod tests {
             ActuationPlan {
                 code: 0x0A,
                 old: Micrometers(2000),
-                new: Micrometers(1500)
+                new: Micrometers(1500),
+                touch: TouchMode::Global,
             }
         );
         assert_eq!(plan.entry(), (0x0A, KeyParam::Actuation, 1500));
         let w = k.session_mut().transport().written();
-        assert_eq!(w.len(), 3 + 7); // the matrix, then the key's seven parameters
+        assert_eq!(w.len(), 1 + 3 + 7); // SYNC, the matrix, then the key's seven parameters
+        assert_eq!(w[0][2], 0x01, "device info is read first");
         assert!(!w.iter().any(is_key_set), "planning must not write");
+    }
+
+    #[test]
+    fn plan_refuses_a_keyboard_in_bootloader_mode() {
+        let mut m = MockTransport::new();
+        push_sync(&mut m, true);
+        push_matrix(&mut m, &[0x0A]);
+        push_settings(&mut m, 0x0A, 2000, 0);
+        let mut k = kb(m);
+        assert_eq!(
+            plan_actuation(&mut k, 0x0A, 1.5),
+            Err(PlanError::Invalid(
+                "the keyboard is in bootloader mode; refusing to write".to_string()
+            ))
+        );
+        let w = k.session_mut().transport().written();
+        assert_eq!(w.len(), 1, "nothing after SYNC");
+        assert_eq!(w[0][2], 0x01);
+    }
+
+    #[test]
+    fn global_touch_mode_gets_a_note_and_other_modes_do_not() {
+        let plan = plan_on(0x0A, 1.5, (2000, 0), &[0x0A]).unwrap();
+        assert_eq!(
+            plan.note_line().as_deref(),
+            Some(
+                "note: key 0x0A is in Global touch mode; the per-key actuation may not take \
+                 effect until the key uses Single/RT mode (not changed by this command)"
+            )
+        );
+        for mode in [0x10u16, 0x20] {
+            let mut m = MockTransport::new();
+            push_sync(&mut m, false);
+            push_matrix(&mut m, &[0x0A]);
+            push_settings_with_mode(&mut m, 0x0A, mode, 2000, 0);
+            let plan = plan_actuation(&mut kb(m), 0x0A, 1.5).unwrap();
+            assert_eq!(plan.note_line(), None, "mode 0x{mode:02X}");
+        }
     }
 
     #[test]
     fn plan_rejects_a_key_missing_from_the_matrix_before_reading_it() {
         let mut m = MockTransport::new();
+        push_sync(&mut m, false);
         push_matrix(&mut m, &[0x0B]);
         let mut k = kb(m);
         assert_eq!(
@@ -547,7 +633,7 @@ mod tests {
                 "key 0x0A is not on this keyboard".to_string()
             ))
         );
-        assert_eq!(k.session_mut().transport().written().len(), 3); // the matrix only
+        assert_eq!(k.session_mut().transport().written().len(), 1 + 3); // SYNC and the matrix only
     }
 
     #[test]
@@ -634,6 +720,7 @@ mod tests {
             ))
         );
         let mut m = MockTransport::new();
+        push_sync(&mut m, false);
         push_matrix(&mut m, &[0x0A]);
         push_settings(&mut m, 0x0A, 2000, 1);
         let mut k60 = Keyboard::new(m, Model::Win60HeMax);
@@ -656,6 +743,7 @@ mod tests {
     #[test]
     fn full_flow_writes_only_the_actuation_slot_then_verifies() {
         let mut m = MockTransport::new();
+        push_sync(&mut m, false);
         push_matrix(&mut m, &[0x0A]);
         push_settings(&mut m, 0x0A, 2000, 0);
         m.push_reply(key_reply(0x0A, 4, 1500)); // SET echo
@@ -664,7 +752,7 @@ mod tests {
         let plan = plan_actuation(&mut k, 0x0A, 1.5).unwrap();
         k.set_key_params(&[plan.entry()]).unwrap();
         let w = k.session_mut().transport().written();
-        assert_eq!(w.len(), 3 + 7 + 1 + 1);
+        assert_eq!(w.len(), 1 + 3 + 7 + 1 + 1);
         let sets: Vec<_> = w.iter().filter(|f| is_key_set(f)).collect();
         assert_eq!(sets.len(), 1, "exactly one SET");
         // Layout 4 (actuation) only: never layout 8 (the mode byte) or anything else.
@@ -677,6 +765,7 @@ mod tests {
             code: 0x0A,
             old: Micrometers(2000),
             new: Micrometers(1500),
+            touch: TouchMode::Single,
         };
         assert_eq!(
             plan.writing_line(),
