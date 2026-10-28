@@ -120,8 +120,8 @@ pub fn parse(reports: &[[u8; REPORT_LEN]]) -> Result<TravelHalf, FrameError> {
     }
     let data = &body[2..2 + HALF_BYTES];
     let mut um = [[0u16; COLS]; 3];
-    for (i, v) in data.chunks_exact(2).enumerate() {
-        um[i / COLS][i % COLS] = u16::from_le_bytes([v[0], v[1]]);
+    for (i, v) in data.as_chunks::<2>().0.iter().enumerate() {
+        um[i / COLS][i % COLS] = u16::from_le_bytes(*v);
     }
     Ok(TravelHalf { sub, um })
 }
