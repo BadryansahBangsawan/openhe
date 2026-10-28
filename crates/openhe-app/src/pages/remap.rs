@@ -49,6 +49,12 @@ mod strings {
         "Semua tombol di layer ini kembali ke isi bawaan pabrik. Perubahan layer ini yang belum diterapkan dibuang.";
     pub const FOLLOW_BASE: &str = "Ikut Base";
     pub const FOLLOW_BASE_PICK: &str = "Ikut Base (transparan)";
+    pub const TRANSPARENT_ON_BASE: &str = "Kode 0x0001 — bukan Fn; ganti ke Fn1 (tahan)";
+    pub const TRANSPARENT_ON_BASE_SHORT: &str = "0x0001 !";
+    pub const ONLY_FN2: &str =
+        "Tombol ini satu-satunya Fn2 (tahan) di layer Fn1. Kalau diganti, layer Fn2 tidak bisa dibuka lagi.";
+    pub const LOSES_FN2: &str =
+        "Perubahan ini menghapus Fn2 (tahan) terakhir di layer Fn1: layer Fn2 tidak bisa dibuka lagi. Pasang Fn2 (tahan) di tombol lain dulu, atau batalkan.";
     pub const RESET_YES: &str = "Ya, kembalikan";
     pub const CANCEL: &str = "Batal";
 
@@ -272,6 +278,47 @@ pub fn short_code_name(code: u16) -> String {
         Some(k) if !k.label.starts_with("i18n:") && k.label != "-" => abbreviate(k.label),
         _ => unknown(code),
     }
+}
+
+/// [`code_name`] for a code on `layer`: 0x0001 on Base is not "Ikut Base"
+/// (there is nothing below Base) and not a Fn key, so it is a warning.
+pub fn layer_code_name(layer: Layer, code: u16) -> String {
+    if layer == Layer::Base && code == TRANSPARENT {
+        t::TRANSPARENT_ON_BASE.to_string()
+    } else {
+        code_name(code)
+    }
+}
+
+/// [`short_code_name`] for a code on `layer` (see [`layer_code_name`]).
+pub fn layer_short_code_name(layer: Layer, code: u16) -> String {
+    if layer == Layer::Base && code == TRANSPARENT {
+        t::TRANSPARENT_ON_BASE_SHORT.to_string()
+    } else {
+        short_code_name(code)
+    }
+}
+
+/// The Fn2 hold code. On a factory WIN 68 HE MAX only RCtrl's Fn1 code is
+/// 0xF002, so it is the only way into the Fn2 layer.
+pub const FN2_HOLD: u16 = 0xF002;
+
+/// The pending Fn1 changes would remove the last Fn2 (tahan) from the Fn1
+/// layer (`fn1`: the codes read), leaving no way into Fn2 from there.
+pub fn loses_fn2_access(fn1: &BTreeMap<u8, u16>, changes: &Changes) -> bool {
+    let had = fn1.values().any(|&c| c == FN2_HOLD);
+    let mut after = fn1.clone();
+    for (k, l, c) in changes.entries() {
+        if l == Layer::Fn1 {
+            after.insert(k, c);
+        }
+    }
+    had && !after.values().any(|&c| c == FN2_HOLD)
+}
+
+/// `key` holds the only Fn2 (tahan) of the Fn1 layer (`fn1`).
+pub fn is_only_fn2_hold(fn1: &BTreeMap<u8, u16>, key: u8) -> bool {
+    fn1.get(&key) == Some(&FN2_HOLD) && fn1.values().filter(|&&c| c == FN2_HOLD).count() == 1
 }
 
 /// The name on a picker button: [`code_name`], except that the transparent
@@ -900,6 +947,14 @@ pub fn decoration(
     if unchanged && (layer == Layer::Base || code == TRANSPARENT) {
         return KeyDecoration::default();
     }
+    if layer == Layer::Base && code == TRANSPARENT {
+        return KeyDecoration {
+            label2: Some(layer_short_code_name(layer, code)),
+            fill: None,
+            stroke: Some(color::DANGER),
+            badge: None,
+        };
+    }
     KeyDecoration {
         label2: Some(short_code_name(code)),
         fill: None,
@@ -1359,7 +1414,7 @@ impl Page {
         let first = keys[0];
         if keys.len() == 1 {
             let now = match code_of(&self.codes, layer, first) {
-                Some(c) => code_name(c),
+                Some(c) => layer_code_name(layer, c),
                 None => t::UNREAD.to_string(),
             };
             let who = if layer == Layer::Base {
@@ -1376,6 +1431,17 @@ impl Page {
             }
         } else {
             card::hint(ui, format!("{} {}", keys.len(), t::KEYS_SELECTED));
+        }
+        if layer == Layer::Fn1 {
+            if let Some(fn1) = self.codes.get(&(Layer::Fn1 as u8)) {
+                if keys.iter().any(|&k| is_only_fn2_hold(fn1, k)) {
+                    ui.label(
+                        RichText::new(t::ONLY_FN2)
+                            .font(font::small())
+                            .color(color::ACCENT),
+                    );
+                }
+            }
         }
         if keys.iter().any(|&k| is_locked(layer, k)) {
             card::hint(
@@ -1398,7 +1464,8 @@ impl Page {
                     cap_tile(
                         ui,
                         t::ORIGINAL,
-                        &original.map_or(t::UNREAD.to_string(), short_code_name),
+                        &original
+                            .map_or(t::UNREAD.to_string(), |c| layer_short_code_name(layer, c)),
                         false,
                     );
                     ui.label(RichText::new("→").font(font::title()).color(color::MUTED));
@@ -1425,7 +1492,8 @@ impl Page {
         const SHOWN: usize = 8;
         let entries = self.changes.entries();
         for (k, l, c) in entries.iter().take(SHOWN) {
-            let was = code_of(&self.codes, *l, *k).map_or(t::UNREAD.to_string(), code_name);
+            let was = code_of(&self.codes, *l, *k)
+                .map_or(t::UNREAD.to_string(), |c| layer_code_name(*l, c));
             Frame::new()
                 .fill(color::PANEL)
                 .stroke(line(1.0, color::BORDER))
@@ -1468,6 +1536,12 @@ impl Page {
                 self.retry(ctx);
             }
             ui.add_space(8.0);
+        }
+        if let Some(fn1) = self.codes.get(&(Layer::Fn1 as u8)) {
+            if loses_fn2_access(fn1, &self.changes) {
+                ui.add(egui::Label::new(RichText::new(t::LOSES_FN2).color(color::DANGER)).wrap());
+                ui.add_space(6.0);
+            }
         }
         if let Some(n) = self.notice {
             card::hint(ui, n);
@@ -1860,6 +1934,52 @@ mod tests {
         assert_eq!(short_code_name(0xF002), "Fn2");
         assert_eq!(picker_label(0xF001), "Fn1 (tahan)");
         assert_eq!(picker_label(0x0004), "A");
+    }
+
+    /// 0x0001 on Base is not a Fn key (that is 0xF001): it is shown as a
+    /// warning, never as "Ikut Base".
+    #[test]
+    fn transparent_on_base_is_shown_as_a_warning() {
+        assert_eq!(
+            layer_code_name(Layer::Base, TRANSPARENT),
+            "Kode 0x0001 — bukan Fn; ganti ke Fn1 (tahan)"
+        );
+        assert_eq!(layer_code_name(Layer::Fn1, TRANSPARENT), "Ikut Base");
+        assert_eq!(layer_code_name(Layer::Base, 0x0004), "A");
+        assert_eq!(layer_short_code_name(Layer::Base, TRANSPARENT), "0x0001 !");
+        assert_eq!(layer_short_code_name(Layer::Fn2, TRANSPARENT), "Ikut Base");
+        let d = decoration(
+            Model::Win68HeMax,
+            Layer::Base,
+            0x39,
+            Some(TRANSPARENT),
+            None,
+        );
+        assert_eq!(d.label2.as_deref(), Some("0x0001 !"));
+        assert_eq!(d.stroke, Some(color::DANGER));
+    }
+
+    /// RCtrl's Fn1 code 0xF002 is the only way into Fn2 on a factory
+    /// keyboard: removing the last Fn2 (tahan) from Fn1 is warned about.
+    #[test]
+    fn losing_the_last_fn2_hold_on_fn1_is_detected() {
+        let fn1: BTreeMap<u8, u16> = [(0xE4, 0xF002), (0x04, 0xF101)].into();
+        let mut c = Changes::default();
+        assert!(!loses_fn2_access(&fn1, &c));
+        c.queue(Layer::Fn1, &[0x04], 0x0005, none);
+        assert!(!loses_fn2_access(&fn1, &c), "another key");
+        c.queue(Layer::Fn2, &[0xE4], 0x0005, none);
+        assert!(!loses_fn2_access(&fn1, &c), "another layer");
+        c.queue(Layer::Fn1, &[0xE4], 0x0004, none);
+        assert!(loses_fn2_access(&fn1, &c), "RCtrl remapped on Fn1");
+        // Moving Fn2 (tahan) to another key keeps the way in.
+        c.queue(Layer::Fn1, &[0x39], 0xF002, none);
+        assert!(!loses_fn2_access(&fn1, &c));
+        // A layer without Fn2 (tahan) to begin with: nothing to lose.
+        let none_map: BTreeMap<u8, u16> = [(0x04, 0x0001)].into();
+        assert!(!loses_fn2_access(&none_map, &Changes::default()));
+        assert!(is_only_fn2_hold(&fn1, 0xE4));
+        assert!(!is_only_fn2_hold(&fn1, 0x04));
     }
 
     #[test]
