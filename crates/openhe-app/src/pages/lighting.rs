@@ -1307,6 +1307,14 @@ impl Page {
             for i in 0..7u8 {
                 let selected = self.slot == i;
                 let (r, resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::click());
+                resp.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::SelectableLabel,
+                        editable,
+                        selected,
+                        format!("{} {}", strings::COLOR, i + 1),
+                    )
+                });
                 let radius = CornerRadius::same(8);
                 ui.painter()
                     .rect_filled(r, radius, c32(self.form.colors[usize::from(i)]));
@@ -1363,8 +1371,16 @@ impl Page {
         card::section(ui, strings::KEYS_PALETTE);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            for c in self.form.colors {
+            for (i, c) in self.form.colors.into_iter().enumerate() {
                 let (r, resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::click());
+                resp.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::SelectableLabel,
+                        true,
+                        self.paint == c,
+                        format!("{} {}", strings::KEYS_PALETTE, i + 1),
+                    )
+                });
                 ui.painter().rect_filled(r, CornerRadius::same(8), c32(c));
                 if self.paint == c {
                     ui.painter().rect_stroke(
@@ -1780,6 +1796,9 @@ fn tile(ui: &mut Ui, width: f32, label: &str, selected: bool, enabled: bool) -> 
         Sense::hover()
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 54.0), sense);
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, enabled, selected, label)
+    });
     let hovered = resp.hovered() && enabled;
     let (fill, stroke, text) = if selected {
         (color::ACCENT_SOFT, color::ACCENT, color::ACCENT)

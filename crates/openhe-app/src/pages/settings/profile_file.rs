@@ -30,7 +30,18 @@ pub const VERSION: u32 = 1;
 
 const LAYERS: [Layer; 4] = [Layer::Base, Layer::Fn1, Layer::Fn2, Layer::Fn3];
 /// The Fn key: its own base-layer code is never written.
-const FN_KEY: u8 = 0x01;
+use openhe_device::FN_KEY;
+/// Layer code 0x0001: transparent on the Fn layers, a dead key on Base.
+const TRANSPARENT: u16 = 0x0001;
+
+/// LAlt (0xE2) and LWin (0xE3): their Base codes swap with Win/Mac mode.
+fn is_win_alt(key: u8) -> bool {
+    matches!(key, 0xE2 | 0xE3)
+}
+
+fn is_win_alt_code(code: u16) -> bool {
+    matches!(code, 0x00E2 | 0x00E3)
+}
 
 // ------------------------------------------------------------ device side
 
@@ -213,8 +224,14 @@ pub enum FileError {
     NotAProfile,
     NewerVersion(u32),
     UnknownModel(String),
-    WrongModel { file: String, keyboard: String },
+    WrongModel {
+        file: String,
+        keyboard: String,
+    },
     BadValue(String),
+    /// Code 0x0001 on the Base layer of this key: transparent on the Fn
+    /// layers, a dead key on Base (hardware finding 16).
+    TransparentOnBase(u8),
 }
 
 fn touch_name(t: TouchMode) -> &'static str {
@@ -333,19 +350,6 @@ impl AdvancedEntry {
     }
 }
 
-fn nibble(c: &AdvancedConfig) -> Advanced {
-    match c {
-        AdvancedConfig::None => Advanced::None,
-        AdvancedConfig::Dks(_) => Advanced::Dks,
-        AdvancedConfig::Mt(_) => Advanced::Mt,
-        AdvancedConfig::Tgl(_) => Advanced::Tgl,
-        AdvancedConfig::Mpt(_) => Advanced::Mpt,
-        AdvancedConfig::End(_) => Advanced::End,
-        AdvancedConfig::Socd(_) => Advanced::Socd,
-        AdvancedConfig::Macro => Advanced::Macro,
-    }
-}
-
 impl ProfileFile {
     pub fn from_data(d: &ProfileData) -> ProfileFile {
         ProfileFile {
@@ -410,7 +414,7 @@ impl ProfileFile {
                 settings: KeySettings {
                     mode: KeyMode {
                         touch,
-                        advanced: nibble(&advanced),
+                        advanced: advanced.advanced(),
                         high: 0,
                     },
                     actuation: um(k.actuation_um),
@@ -704,6 +708,16 @@ pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPl
             if k.code == FN_KEY && layer == Layer::Base {
                 continue;
             }
+            if layer == Layer::Base && code == TRANSPARENT {
+                return Err(FileError::TransparentOnBase(k.code));
+            }
+            // LAlt / LWin read as each other's code in Mac mode (finding
+            // 16): a Win/Alt code there depends on the OS mode the file was
+            // exported in, so it is left as this keyboard has it (as the
+            // remap reset does). Any other code on them is a real remap.
+            if layer == Layer::Base && is_win_alt(k.code) && is_win_alt_code(code) {
+                continue;
+            }
             plan.layers.push((k.code, layer, code));
         }
     }
@@ -811,7 +825,7 @@ mod tests {
     fn key(code: u8, touch: TouchMode, advanced: AdvancedConfig) -> KeyData {
         KeyData {
             code,
-            settings: settings(touch, nibble(&advanced)),
+            settings: settings(touch, advanced.advanced()),
             layers: [u16::from(code), 0x3A, 0, 0x01],
             advanced,
         }

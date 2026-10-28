@@ -1,8 +1,8 @@
 //! Kalibrasi: re-measures every switch's travel (mockup
 //! `docs/design/mockups/06-kalibrasi.png`, PROTOCOL 3.4).
 //!
-//! Flow: `start_calibration`, then poll live travel and the calibration
-//! values as fast as the replies come back (one quiet job in flight, at
+//! Flow: `start_calibration`, then poll live travel
+//! as fast as the replies come back (one quiet job in flight, at
 //! least [`MIN_POLL_GAP`] between starts). A key counts as calibrated once
 //! its peak travel this session reaches `max travel - top deadzone - bottom
 //! deadzone - 0.1 mm` ([`calibrated_threshold`]); the peak is held, so the
@@ -136,19 +136,18 @@ pub fn key_limits(model: Model, snap: &DeviceSnapshot, code: u8) -> (u16, u16, u
 
 // ------------------------------------------------------------- progress
 
-/// One poll: live travel and the raw calibration values, both in matrix
-/// positions.
+/// One poll: live travel in matrix positions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sample {
     pub travel: TravelFrame,
-    pub values: TravelFrame,
 }
 
-/// The poll job: RM6X21 (2,1)+(2,2) and (6,1)+(6,2).
+/// The poll job: RM6X21 (2,1)+(2,2), travel only. The raw calibration
+/// values (6,1)+(6,2) are not shown anywhere; reading them too doubled the
+/// round trips of every sample, so quick presses were missed more often.
 pub fn poll_job<T: Transport>(kb: &mut Keyboard<T>) -> Result<Sample, Error> {
     let travel = kb.travel()?;
-    let values = kb.calibration_values()?;
-    Ok(Sample { travel, values })
+    Ok(Sample { travel })
 }
 
 /// Per-key calibration progress.
@@ -161,24 +160,25 @@ pub struct Progress {
     pub peak: BTreeMap<u8, u16>,
     /// Keys that reached their threshold (sticky).
     pub done: BTreeSet<u8>,
-    /// Latest raw calibration value per key.
-    pub values: BTreeMap<u8, u16>,
 }
 
 impl Progress {
     /// Takes in one sample. Only `count` samples (after the settle time)
     /// can mark keys as calibrated.
+    ///
+    /// A sample with travel where the matrix has no key (halves of the
+    /// frame mixed up, see `TravelFrame::fits`) is ignored, so it can never
+    /// mark the wrong keys as calibrated.
     pub fn apply(&mut self, snap: &DeviceSnapshot, s: &Sample, count: bool) {
+        if !s.travel.fits(&snap.matrix) {
+            return;
+        }
         for (row, col, code) in snap.matrix.keys() {
             let (r, c) = (usize::from(row), usize::from(col));
-            let (Some(tr), Some(val)) = (
-                s.travel.um.get(r).and_then(|x| x.get(c)),
-                s.values.um.get(r).and_then(|x| x.get(c)),
-            ) else {
+            let Some(tr) = s.travel.um.get(r).and_then(|x| x.get(c)) else {
                 continue;
             };
             self.current.insert(code, *tr);
-            self.values.insert(code, *val);
             if !count {
                 continue;
             }
@@ -1047,7 +1047,6 @@ mod tests {
     fn sample(snap: &DeviceSnapshot, f: impl Fn(u8) -> u16) -> Sample {
         Sample {
             travel: frame_with(snap, &f),
-            values: frame_with(snap, |_| 1234),
         }
     }
 
@@ -1103,12 +1102,17 @@ mod tests {
         assert!(p.done.contains(&0x1A));
         assert!(!p.done.contains(&0x04));
         assert_eq!(p.done.len(), 1);
+        // A frame with travel at a keyless position is ignored.
+        let mut bad = sample(&snap, |_| 3400);
+        bad.travel.um[0][0] = 3400; // row 0 has no keys
+        let before = p.clone();
+        p.apply(&snap, &bad, true);
+        assert_eq!(p, before);
         assert_eq!(p.remaining(&snap).len(), snap.matrix.len() - 1);
         // Sticky: releasing W keeps it done.
         p.apply(&snap, &sample(&snap, |_| 0), true);
         assert!(p.done.contains(&0x1A));
         assert_eq!(p.peak[&0x1A], 2900);
-        assert_eq!(p.values[&0x1A], 1234);
         assert_eq!(p.measured_range(), Some((2900, 2900)));
     }
 
@@ -1338,9 +1342,9 @@ mod tests {
     }
 
     #[test]
-    fn poll_job_reads_travel_then_calibration_values() {
+    fn poll_job_reads_travel_only() {
         let mut m = MockTransport::new();
-        for (sub, v) in [(2, 1500), (2, 1500), (6, 777), (6, 777)] {
+        for (sub, v) in [(2, 1500), (2, 1500)] {
             for r in rm_reply(sub, v) {
                 m.push_reply(r);
             }
@@ -1348,10 +1352,9 @@ mod tests {
         let mut kb = Keyboard::new(m, Model::Win68HeMax);
         let s = poll_job(&mut kb).unwrap();
         assert_eq!(s.travel.um[3][5], 1500);
-        assert_eq!(s.values.um[5][20], 777);
         let w = kb.session_mut().transport().written().to_vec();
         let subs: Vec<(u8, u8)> = w.iter().map(|f| (f[4], f[5])).collect();
-        assert_eq!(subs, vec![(2, 1), (2, 2), (6, 1), (6, 2)]);
+        assert_eq!(subs, vec![(2, 1), (2, 2)]);
     }
 
     #[test]

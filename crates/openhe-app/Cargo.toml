@@ -43,3 +43,10 @@ preview = []
 # targets). Without the default `toml` feature: no Cargo.toml metadata is
 # read, and its only dependency is version_check.
 winresource = { version = "0.1.34", default-features = false }
+
+[dev-dependencies]
+# Headless end-to-end UI tests (tests/e2e_*.rs): they drive the real app UI
+# through its AccessKit tree, on a keyboard simulator. Same egui as eframe;
+# rust-version 1.85. The `eframe` feature runs `eframe::App::update` (close
+# handling) with a test frame.
+egui_kittest = { version = "0.32.3", features = ["eframe"] }

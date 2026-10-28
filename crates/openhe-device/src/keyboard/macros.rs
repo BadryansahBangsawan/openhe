@@ -67,10 +67,10 @@ impl<T: Transport> Keyboard<T> {
         let mode_req = macros::mode_set(key, actions.len() as u8, mode, repeat, interval_ms)
             .map_err(invalid)?;
 
-        let mut current = self.macro_key_mode(key)?;
+        let mut current = self.read_mode(key)?;
         if !matches!(current.advanced, Advanced::None | Advanced::Macro) {
             self.set_advanced(key, &AdvancedConfig::None)?;
-            current = self.macro_key_mode(key)?;
+            current = self.read_mode(key)?;
         }
         let bound = KeyMode {
             advanced: Advanced::Macro,
@@ -108,16 +108,10 @@ impl<T: Transport> Keyboard<T> {
     /// reports, which is 0 on FW App V1.1.3 (PROTOCOL 7.x finding 24), so do
     /// not rely on it.
     pub fn macro_binding(&mut self, key: u8) -> Result<Option<MacroBinding>, Error> {
-        if self.macro_key_mode(key)?.advanced != Advanced::Macro {
+        if self.read_mode(key)?.advanced != Advanced::Macro {
             return Ok(None);
         }
         Ok(Some(self.read_macro_mode(key)?))
-    }
-
-    fn macro_key_mode(&mut self, key: u8) -> Result<KeyMode, Error> {
-        let raw = self.key_param(key, KeyParam::Mode)?;
-        KeyMode::from_u16(raw)
-            .ok_or_else(|| Error::Io(format!("unknown key mode 0x{raw:04X} for key 0x{key:02X}")))
     }
 
     fn read_macro_mode(&mut self, key: u8) -> Result<MacroBinding, Error> {

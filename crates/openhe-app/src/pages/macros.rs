@@ -1884,6 +1884,9 @@ fn library_row(
         Sense::hover()
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 54.0), sense);
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, enabled, selected, name)
+    });
     let (fill, stroke, title) = if selected {
         (color::ACCENT_SOFT, color::ACCENT, color::ACCENT)
     } else if resp.hovered() && enabled {
@@ -1940,6 +1943,9 @@ fn mode_card(
         Sense::hover()
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), sense);
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::RadioButton, enabled, selected, title)
+    });
     let hovered = resp.hovered() && enabled;
     let (fill, stroke) = if selected {
         (color::ACCENT_SOFT, color::ACCENT)

@@ -45,7 +45,9 @@
 //!   worked.
 //!
 //! The transport is a type parameter with a connector closure, so tests drive
-//! the worker with `MockTransport`; the app uses the `HidTransport` default.
+//! the worker with `MockTransport`. The app uses the [`AppTransport`]
+//! default: a boxed transport that is the HID keyboard in the app and a
+//! keyboard simulator in the end-to-end UI tests.
 
 use crate::i18n;
 use openhe_device::{
@@ -446,7 +448,7 @@ pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
 /// waits on a slow keyboard; while the calibration guard is set it is
 /// joined for up to [`SHUTDOWN_WAIT`], so the shutdown `stop_calibration`
 /// goes out before the process ends.
-pub struct Worker<T: Transport + 'static = HidTransport> {
+pub struct Worker<T: Transport + 'static = AppTransport> {
     tx: Sender<Msg<T>>,
     ctl: Arc<Control>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -489,11 +491,36 @@ impl<T> Pending<T> {
     }
 }
 
-impl Worker<HidTransport> {
+/// The transport of the app's worker: any [`Transport`], boxed. The app
+/// runs it on the HID keyboard ([`Worker::spawn`]); the end-to-end UI tests
+/// run the same app on a keyboard simulator through
+/// [`Worker::spawn_with`].
+pub struct AppTransport(Box<dyn Transport>);
+
+impl AppTransport {
+    pub fn new(t: impl Transport + 'static) -> AppTransport {
+        AppTransport(Box::new(t))
+    }
+}
+
+impl Transport for AppTransport {
+    fn write(&mut self, report: &[u8; 64]) -> Result<(), Error> {
+        self.0.write(report)
+    }
+
+    fn read(&mut self, timeout_ms: u32) -> Result<Option<[u8; 64]>, Error> {
+        self.0.read(timeout_ms)
+    }
+}
+
+impl Worker<AppTransport> {
     /// Starts the worker on the first supported HID keyboard.
-    pub fn spawn() -> Worker<HidTransport> {
+    pub fn spawn() -> Worker<AppTransport> {
         Worker::spawn_with(
-            Box::new(|| HidTransport::open_first().map(|(t, model)| Keyboard::new(t, model))),
+            Box::new(|| {
+                HidTransport::open_first()
+                    .map(|(t, model)| Keyboard::new(AppTransport::new(t), model))
+            }),
             WorkerConfig::default(),
         )
     }
@@ -563,15 +590,17 @@ impl<T: Transport + 'static> Worker<T> {
     /// Like [`Worker::submit`], for a write after which the keyboard
     /// re-enumerates on USB (polling rate, factory reset, profile switch).
     ///
-    /// When the job returns `Ok(_)` (`Done` or `Reenumerating`) or
-    /// `Err(Disconnected)`, the worker thread itself marks the worker
-    /// restarting ([`Worker::is_restarting`]) and schedules the reconnect
-    /// after `pause`, **before** the result is delivered and before the
-    /// next message is taken. So writes never unlock between the job and
-    /// the reconnect, the idle state poll never talks to the dying
-    /// connection, and the UI never has to call [`Worker::reconnect`] (a
-    /// late call could drop the fresh connection). Any other error leaves
-    /// the connection alone.
+    /// When the job returns `Ok(_)` (`Done` or `Reenumerating`), the worker
+    /// thread itself marks the worker restarting
+    /// ([`Worker::is_restarting`]) and schedules the reconnect after
+    /// `pause`, **before** the result is delivered and before the next
+    /// message is taken. So writes never unlock between the job and the
+    /// reconnect, the idle state poll never talks to the dying connection,
+    /// and the UI never has to call [`Worker::reconnect`] (a late call
+    /// could drop the fresh connection). An error means the frame never
+    /// went out (the device API reports a disconnect after the write as
+    /// `Reenumerating`): `Err(Disconnected)` drops the connection like any
+    /// job's and reconnects as usual; other errors leave it alone.
     pub fn submit_restart(
         &self,
         label: &'static str,
@@ -715,7 +744,7 @@ impl<T: Transport + 'static> Worker<T> {
 /// A cloneable handle to the worker for other threads (see
 /// [`Worker::handle`]). Jobs submitted after the worker is gone fail with
 /// `Err(Disconnected)`.
-pub struct WorkerHandle<T: Transport + 'static = HidTransport> {
+pub struct WorkerHandle<T: Transport + 'static = AppTransport> {
     tx: Sender<Msg<T>>,
     ctl: Arc<Control>,
 }
@@ -823,7 +852,12 @@ fn enqueue_restart<T: Transport + 'static>(
     let c = Arc::clone(ctl);
     enqueue(tx, ctl, label, true, move |kb| {
         let r = job(kb);
-        if matches!(r, Ok(_) | Err(Error::Disconnected)) {
+        // Only a write that went out restarts the keyboard: the device API
+        // reports a disconnect after the write as `Reenumerating`, so
+        // `Err(Disconnected)` means nothing was written (the worker drops
+        // that connection and reconnects as usual, without the pause and
+        // without holding writes locked as "restarting").
+        if r.is_ok() {
             c.request_reconnect(pause);
         }
         r
@@ -1626,6 +1660,32 @@ pub(crate) mod tests {
         assert!(!w.is_restarting());
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(w.connects(), before);
+    }
+
+    /// `Err(Disconnected)` from a restart job means the frame never went
+    /// out: the keyboard is reconnected like after any lost connection,
+    /// without the restart pause and without "restarting" locking writes.
+    #[test]
+    fn a_restart_job_disconnected_before_writing_is_not_a_restart() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        let mut p = w.submit_restart("x", Duration::from_secs(3600), |_kb| {
+            Err::<WriteOutcome, _>(Error::Disconnected)
+        });
+        assert_eq!(wait_result(&mut p), Err(Error::Disconnected));
+        assert!(
+            !w.is_restarting(),
+            "a write that never went out restarts nothing"
+        );
+        // Reconnected as usual (no hour-long restart pause).
+        wait_for("reconnect", || w.is_connected());
     }
 
     /// From a requested reconnect (a write after which the keyboard

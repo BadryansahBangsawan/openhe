@@ -115,7 +115,7 @@ mod strings {
 use strings as t;
 
 /// The Fn key's own default code. Locked on the Base layer.
-pub const FN_KEY: u8 = 0x01;
+pub use openhe_device::FN_KEY;
 
 pub const LAYERS: [(Layer, &str); 4] = [
     (Layer::Base, "Base"),
@@ -180,6 +180,15 @@ pub fn category_name(c: Category) -> &'static str {
 fn indonesian(code: u16) -> Option<(&'static str, &'static str)> {
     Some(match code {
         TRANSPARENT => (t::FOLLOW_BASE, t::FOLLOW_BASE),
+        // Left and right modifiers share a vendor label: say which side.
+        0x00E0 => ("Ctrl kiri", "Ctrl"),
+        0x00E1 => ("Shift kiri", "Shift"),
+        0x00E2 => ("Alt kiri", "Alt"),
+        0x00E3 => ("Win kiri", "Win"),
+        0x00E4 => ("Ctrl kanan", "Ctrl"),
+        0x00E5 => ("Shift kanan", "Shift"),
+        0x00E6 => ("Alt kanan", "Alt"),
+        0x00E7 => ("Win kanan", "Win"),
         0xF001 => ("Fn1 (tahan)", "Fn1"),
         0xF002 => ("Fn2 (tahan)", "Fn2"),
         0xF003 => ("Fn3 (tahan)", "Fn3"),
@@ -247,6 +256,12 @@ fn abbreviate(label: &str) -> String {
     }
 }
 
+/// A reserved vendor slot: label "-" in the Special category. The minus
+/// key (0x2D) and keypad minus (0x56) are also labelled "-" and are real.
+fn is_placeholder(k: &KeyCode) -> bool {
+    k.label == "-" && k.category == Category::Special
+}
+
 fn unknown(code: u16) -> String {
     format!("{} 0x{code:04X}", t::UNKNOWN_CODE)
 }
@@ -261,7 +276,7 @@ pub fn code_name(code: u16) -> String {
         return long.to_string();
     }
     match keycodes::lookup(code) {
-        Some(k) if !k.label.starts_with("i18n:") && k.label != "-" => k.label.to_string(),
+        Some(k) if !k.label.starts_with("i18n:") && !is_placeholder(k) => k.label.to_string(),
         _ => unknown(code),
     }
 }
@@ -275,7 +290,7 @@ pub fn short_code_name(code: u16) -> String {
         return short.to_string();
     }
     match keycodes::lookup(code) {
-        Some(k) if !k.label.starts_with("i18n:") && k.label != "-" => abbreviate(k.label),
+        Some(k) if !k.label.starts_with("i18n:") && !is_placeholder(k) => abbreviate(k.label),
         _ => unknown(code),
     }
 }
@@ -305,15 +320,21 @@ pub const FN2_HOLD: u16 = 0xF002;
 
 /// The pending Fn1 changes would remove the last Fn2 (tahan) from the Fn1
 /// layer (`fn1`: the codes read), leaving no way into Fn2 from there.
+///
+/// Keys whose Fn1 code was not read (a partial read) may hold Fn2 (tahan)
+/// themselves, so replacing one of them counts as possibly removing it
+/// unless a known Fn2 (tahan) stays on the layer.
 pub fn loses_fn2_access(fn1: &BTreeMap<u8, u16>, changes: &Changes) -> bool {
     let had = fn1.values().any(|&c| c == FN2_HOLD);
     let mut after = fn1.clone();
+    let mut unread_replaced = false;
     for (k, l, c) in changes.entries() {
         if l == Layer::Fn1 {
+            unread_replaced |= !fn1.contains_key(&k) && c != FN2_HOLD;
             after.insert(k, c);
         }
     }
-    had && !after.values().any(|&c| c == FN2_HOLD)
+    (had || unread_replaced) && !after.values().any(|&c| c == FN2_HOLD)
 }
 
 /// `key` holds the only Fn2 (tahan) of the Fn1 layer (`fn1`).
@@ -334,8 +355,7 @@ pub fn picker_label(code: u16) -> String {
 /// Codes offered by the picker: reserved placeholders ("-"), the unnamed
 /// non-US keys and the two codes with no known meaning are hidden.
 pub fn pickable(k: &KeyCode) -> bool {
-    !(k.label == "-" && k.category == Category::Special)
-        && !matches!(k.code, 0x0032 | 0x0064 | 0x00C7 | 0x00C8)
+    !is_placeholder(k) && !matches!(k.code, 0x0032 | 0x0064 | 0x00C7 | 0x00C8)
 }
 
 /// The hex digits of a query that looks like a hex code: "0x…" or at least
@@ -1537,7 +1557,9 @@ impl Page {
             }
             ui.add_space(8.0);
         }
-        if let Some(fn1) = self.codes.get(&(Layer::Fn1 as u8)) {
+        let no_codes = BTreeMap::new();
+        let fn1 = self.codes.get(&(Layer::Fn1 as u8)).unwrap_or(&no_codes);
+        {
             if loses_fn2_access(fn1, &self.changes) {
                 ui.add(egui::Label::new(RichText::new(t::LOSES_FN2).color(color::DANGER)).wrap());
                 ui.add_space(6.0);
@@ -1922,6 +1944,31 @@ mod tests {
         assert_eq!(code_name(0xF344), "Kode 0xF344");
     }
 
+    /// Left and right modifiers carry the same vendor label ("Ctrl"), so
+    /// the picker showed two identical "Ctrl" chips (and the pending list
+    /// "Caps → Ctrl" for either). Full names say which side; key caps keep
+    /// the short label.
+    #[test]
+    fn left_and_right_modifiers_have_distinct_names() {
+        let names: Vec<String> = (0xE0..=0xE7).map(code_name).collect();
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), 8, "{names:?}");
+        assert_eq!(code_name(0xE0), "Ctrl kiri");
+        assert_eq!(code_name(0xE4), "Ctrl kanan");
+        assert_eq!(short_code_name(0xE4), "Ctrl");
+    }
+
+    #[test]
+    fn the_minus_keys_have_names() {
+        // "-" is the vendor's placeholder only in the Special category;
+        // the minus key and keypad minus are real keys.
+        assert_eq!(code_name(0x002D), "-");
+        assert_eq!(short_code_name(0x002D), "-");
+        assert_eq!(code_name(0x0056), "-"); // like the other numpad keys
+        assert_eq!(code_name(0x00A7), "Kode 0x00A7");
+        assert_eq!(picker_label(0x002D), "-");
+    }
+
     #[test]
     fn transparent_and_fn_hold_codes_have_their_real_names() {
         // 0x0001 is "follow Base" on the Fn layers, never a Fn key.
@@ -1980,6 +2027,28 @@ mod tests {
         assert!(!loses_fn2_access(&none_map, &Changes::default()));
         assert!(is_only_fn2_hold(&fn1, 0xE4));
         assert!(!is_only_fn2_hold(&fn1, 0x04));
+    }
+
+    /// A partly read Fn1: the key that was not read may be the one holding
+    /// Fn2 (tahan), so replacing it is warned about unless a known Fn2
+    /// (tahan) stays.
+    #[test]
+    fn replacing_an_unread_fn1_key_warns_conservatively() {
+        let partial: BTreeMap<u8, u16> = [(0x04, 0xF101)].into();
+        let mut c = Changes::default();
+        c.queue(Layer::Fn1, &[0xE4], 0x0005, none);
+        assert!(loses_fn2_access(&partial, &c), "unread RCtrl replaced");
+        assert!(
+            loses_fn2_access(&BTreeMap::new(), &c),
+            "nothing read at all"
+        );
+        // Putting Fn2 (tahan) on an unread key is no loss.
+        let mut put = Changes::default();
+        put.queue(Layer::Fn1, &[0xE4], 0xF002, none);
+        assert!(!loses_fn2_access(&partial, &put));
+        // A known Fn2 (tahan) elsewhere keeps the way in.
+        let with: BTreeMap<u8, u16> = [(0x04, 0xF101), (0x39, 0xF002)].into();
+        assert!(!loses_fn2_access(&with, &c));
     }
 
     #[test]

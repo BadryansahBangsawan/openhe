@@ -1,7 +1,6 @@
 //! Keyboard lighting (CMD 0x18 PRGB and 0x2A KRGB) operations.
 
 use crate::{Error, Keyboard, Transport};
-use openhe_proto::frame::FrameError;
 use openhe_proto::lighting::{self, Lighting, LightingError, Rgb};
 use openhe_proto::order::{self, OrderType};
 use std::collections::HashSet;
@@ -27,17 +26,18 @@ impl<T: Transport> Keyboard<T> {
     /// connection, as the official app does before reading lighting, then
     /// a PRGB GET.
     ///
-    /// RGBNACK goes out **once per connection** only: FW App V1.1.3 rejects
-    /// it with a 0xFF reply (DeviceFail) while the GET works without it
-    /// (PROTOCOL 7.x finding 22), so repeating it on every read only adds a
-    /// failing round trip. That DeviceFail is ignored. Any other RGBNACK
-    /// error (timeout, disconnect) fails the read before the GET is sent,
-    /// and RGBNACK is tried again on the next read.
+    /// RGBNACK is best effort and goes out **once per connection**, with a
+    /// single attempt (`call_once`, at most one 1 s wait): FW App V1.1.3
+    /// rejects it with a 0xFF reply (DeviceFail) while the GET works
+    /// without it (PROTOCOL 7.x finding 22), so its answer never decides
+    /// the read. A reply, a DeviceFail, a timeout or any other error marks
+    /// it as tried and the GET follows; only `Disconnected` fails the read
+    /// (the GET could not be sent either).
     pub fn lighting(&mut self) -> Result<Lighting, Error> {
         if !self.rgbnack_sent {
-            match self.session.call(&order::set(OrderType::RgbNack, 1)) {
-                Ok(_) | Err(Error::Frame(FrameError::DeviceFail)) => self.rgbnack_sent = true,
-                Err(e) => return Err(e),
+            match self.session.call_once(&order::set(OrderType::RgbNack, 1)) {
+                Err(Error::Disconnected) => return Err(Error::Disconnected),
+                Ok(_) | Err(_) => self.rgbnack_sent = true,
             }
         }
         let r = self.session.call(&lighting::get())?;
@@ -223,17 +223,48 @@ mod tests {
         assert_eq!(&w[1][..5], &[0x5C, 0x0F, 0x18, 0xB8, 0x00]);
     }
 
+    /// Answers PRGB GETs only; RGBNACK gets no reply at all.
+    struct SilentNack {
+        out: Vec<[u8; 64]>,
+        written: Vec<[u8; 64]>,
+    }
+
+    impl Transport for SilentNack {
+        fn write(&mut self, r: &[u8; 64]) -> Result<(), Error> {
+            self.written.push(*r);
+            if r[2] == 0x18 {
+                self.out.push(prgb_reply(&sample()));
+            }
+            Ok(())
+        }
+
+        fn read(&mut self, _t: u32) -> Result<Option<[u8; 64]>, Error> {
+            Ok(self.out.pop())
+        }
+    }
+
+    /// RGBNACK is best effort: a keyboard that never answers it (Timeout)
+    /// is still read, with a single RGBNACK attempt, and RGBNACK is not
+    /// sent again on the next read.
     #[test]
-    fn other_rgbnack_errors_still_fail_the_read() {
-        // No reply at all: Timeout, and the GET is never sent.
-        let mut k = kb(MockTransport::new());
-        assert_eq!(k.lighting(), Err(Error::Timeout));
-        assert!(k
-            .session_mut()
-            .transport()
-            .written()
-            .iter()
-            .all(|w| w[2] == 0x00));
+    fn an_unanswered_rgbnack_does_not_stop_the_read() {
+        let mut k = Keyboard::new(
+            SilentNack {
+                out: Vec::new(),
+                written: Vec::new(),
+            },
+            Model::Win68HeMax,
+        );
+        assert_eq!(k.lighting(), Ok(sample()));
+        assert_eq!(k.lighting(), Ok(sample()));
+        let w = &k.session_mut().transport().written;
+        let nacks = w.iter().filter(|f| f[2] == 0x00 && f[4] == 0x47).count();
+        assert_eq!(nacks, 1, "one RGBNACK attempt, never repeated");
+        assert_eq!(w.len(), 3, "RGBNACK, GET, GET");
+    }
+
+    #[test]
+    fn a_disconnect_on_rgbnack_fails_the_read() {
         let mut m = MockTransport::new();
         m.fail_with(Error::Disconnected);
         assert_eq!(kb(m).lighting(), Err(Error::Disconnected));
