@@ -49,4 +49,6 @@ winresource = { version = "0.1.34", default-features = false }
 # through its AccessKit tree, on a keyboard simulator. Same egui as eframe;
 # rust-version 1.85. The `eframe` feature runs `eframe::App::update` (close
 # handling) with a test frame.
-egui_kittest = { version = "0.32.3", features = ["eframe"] }
+# `wgpu` + `snapshot` only for tests/screenshots.rs (ignored by default):
+# `Harness::render` to a PNG.
+egui_kittest = { version = "0.32.3", features = ["eframe", "wgpu", "snapshot"] }
