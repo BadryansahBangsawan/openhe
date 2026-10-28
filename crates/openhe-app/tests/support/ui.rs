@@ -48,6 +48,12 @@ impl World {
         self.replace_text(text);
     }
 
+    /// Focuses the first text field and replaces its text (then Enter).
+    pub fn type_into_first_field(&mut self, text: &str) {
+        self.click_role(Role::TextInput, 0);
+        self.replace_text(text);
+    }
+
     /// How many nodes are labelled exactly `label`.
     pub fn h_count(&self, label: &str) -> usize {
         self.h.query_all_by_label(label).count()
