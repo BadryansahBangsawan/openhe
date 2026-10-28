@@ -112,6 +112,7 @@ mod strings {
     pub const V_FIRST: &str = "Titik aktuasi pertama harus antara 0.10 dan 3.40 mm.";
     pub const V_MT_KEYS: &str = "Pilih tombol untuk ditahan dan untuk diketuk.";
     pub const V_TGL_KEY: &str = "Pilih tombol yang ditahan.";
+    pub const V_MPT_KEYS: &str = "Pilih setidaknya satu tombol untuk salah satu kedalaman.";
     pub const V_END_KEY: &str = "Pilih tombol yang dikirim saat dilepas.";
     pub const V_DELAY: &str = "Waktu harus antara 10 dan 1000 ms.";
     pub const V_DEPTH_RANGE: &str = "Kedalaman harus antara 0.10 dan 3.40 mm.";
@@ -452,6 +453,10 @@ impl Editor {
             }
             Func::Mpt => {
                 let f = &self.mpt;
+                if f.codes.iter().all(|&c| c == 0) {
+                    // Nothing at any depth: the key would send nothing.
+                    return Err(t::V_MPT_KEYS.into());
+                }
                 if f.depths
                     .iter()
                     .any(|d| !(MIN_DEPTH_UM..=MAX_DEPTH_UM).contains(d))
@@ -2236,6 +2241,17 @@ mod tests {
             assert_eq!(e.build(), Err(t::V_DEPTH_RANGE.to_string()), "{depths:?}");
         }
         e.mpt.depths = [100, 101, 3400];
+        assert!(e.build().is_ok());
+    }
+
+    #[test]
+    fn mpt_needs_at_least_one_key() {
+        let mut e = ed();
+        e.func = Func::Mpt;
+        e.mpt.codes = [0, 0, 0];
+        assert_eq!(e.build(), Err(t::V_MPT_KEYS.to_string()));
+        // One key at any depth is enough.
+        e.mpt.codes = [0, 0x29, 0];
         assert!(e.build().is_ok());
     }
 

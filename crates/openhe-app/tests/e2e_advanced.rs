@@ -164,6 +164,22 @@ fn macro_key_shows_macro_hint_and_can_be_replaced() {
     assert_eq!(nibble(&w, G), 5);
 }
 
+/// MPT with no key at any depth would turn the key dead: refused.
+#[test]
+fn mpt_without_any_key_cannot_be_applied() {
+    let mut w = open(G);
+    w.click("MPT");
+    assert!(!w.enabled("Terapkan"), "{:?}", w.labels());
+    assert!(
+        w.has_text("Pilih setidaknya satu tombol"),
+        "{:?}",
+        w.labels()
+    );
+    assert_eq!(nibble(&w, G), 0);
+    w.pick_code("Kosong", 0, "esc", "ESC");
+    assert!(w.enabled("Terapkan"));
+}
+
 /// Selecting another key while an apply runs must not leave the applied
 /// key's form under the new key's title (Terapkan then wrote it there).
 #[test]
