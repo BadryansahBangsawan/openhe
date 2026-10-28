@@ -1650,13 +1650,24 @@ fn filter_chip(
     } else {
         (color::BG, color::BORDER_STRONG, color::TEXT)
     };
-    let label = match dot {
-        Some(_) => format!("●  {text}"),
-        None => text.to_string(),
-    };
+    // The dot in the function's own colour, the name in the text colour.
+    let mut label = LayoutJob::default();
+    let style = ui.style();
+    let body = egui::TextStyle::Button.resolve(style);
+    if let Some(c) = dot {
+        label.append(
+            "●  ",
+            0.0,
+            egui::TextFormat::simple(
+                body.clone(),
+                if enabled { c } else { c.gamma_multiply(0.5) },
+            ),
+        );
+    }
+    label.append(text, 0.0, egui::TextFormat::simple(body, text_c));
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(label).color(text_c))
+        egui::Button::new(label)
             .fill(fill)
             .stroke(line(1.0, stroke))
             .corner_radius(CornerRadius::same(size::CONTROL_RADIUS + 2))
