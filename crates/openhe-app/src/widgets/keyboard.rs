@@ -499,7 +499,11 @@ impl KeyboardView {
                 .clamp(self.min_unit, self.max_unit);
         }
         let pad_case = case_pad(unit);
-        let note_h = if lay.tested { 0.0 } else { 22.0 };
+        let note_h = if lay.tested || !self.interactive {
+            0.0
+        } else {
+            22.0
+        };
         let size = egui::vec2(
             width_u * unit + 2.0 * pad_case,
             lay.rows as f32 * unit + 2.0 * pad_case + note_h,
@@ -774,7 +778,7 @@ impl KeyboardView {
                 StrokeKind::Inside,
             );
         }
-        if !lay.tested {
+        if !lay.tested && self.interactive {
             let bg = skin.as_ref().map_or(color::CASE, |(_, sc)| sc.case);
             painter.text(
                 egui::pos2(rect.min.x + pad_case, rect.max.y - pad_case / 2.0 - 2.0),
@@ -904,6 +908,9 @@ impl SkinnedCap<'_> {
             let col = match (l2.color, self.selected) {
                 (Some(col), _) => readable(col, top, 3.0),
                 (None, true) => readable(color::ACCENT, top, 3.0),
+                // Over the artwork the printed legend is faint by design;
+                // values must still read over the red swirl.
+                (None, false) if self.art.is_some() => Color32::from_white_alpha(235),
                 (None, false) => readable(legend.gamma_multiply(0.8), top, 3.0),
             };
             let g = painter.layout_job(elided(

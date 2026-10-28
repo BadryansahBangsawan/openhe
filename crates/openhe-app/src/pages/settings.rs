@@ -20,6 +20,7 @@ use crate::theme::{color, font, line, size};
 use crate::widgets::card::{self, Card};
 use crate::widgets::keyboard::legend_list;
 use crate::widgets::segmented::Segmented;
+use crate::widgets::skin_picker::{self, ChipClick, CustomEditor, EditorOutcome};
 use crate::widgets::toggle::toggle;
 use crate::worker::{Debounce, DeviceSnapshot, Pending, WorkerHandle};
 use eframe::egui::{self, Align, Align2, CornerRadius, Layout, Rect, RichText, Sense, Ui};
@@ -795,6 +796,8 @@ pub struct Page {
     new_rule: (String, u8),
     reset_open: bool,
     reset_text: String,
+    /// The custom colour editor, while open.
+    custom: Option<CustomEditor>,
 }
 
 impl Default for Page {
@@ -817,6 +820,7 @@ impl Default for Page {
             new_rule: (String::new(), 0),
             reset_open: false,
             reset_text: String::new(),
+            custom: None,
         }
     }
 }
@@ -1060,6 +1064,64 @@ impl Page {
             },
             |page, ui| page.right(ctx, ui),
         );
+        self.custom_editor(ctx, ui.ctx());
+    }
+
+    // ------------------------------------------------------ colours
+
+    /// "Warna keyboard": the chips, stored per keyboard.
+    fn skin_row(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        let key = ctx.keyboard_key();
+        let current = key.as_ref().map(|_| ctx.skin());
+        ui.label(RichText::new(skin_picker::strings::ROW_TITLE).color(color::TEXT));
+        let hint = if key.is_some() {
+            skin_picker::strings::ROW_HINT
+        } else {
+            skin_picker::strings::ROW_OFFLINE
+        };
+        ui.add(
+            egui::Label::new(RichText::new(hint).font(font::small()).color(color::MUTED)).wrap(),
+        );
+        ui.add_space(8.0);
+        let clicked = skin_picker::chips(ui, current, key.is_some());
+        match (clicked, &key) {
+            (Some(ChipClick::Preset(s)), Some(key)) => self.store_skin(ctx, key, s),
+            (Some(ChipClick::Custom), Some(_)) => {
+                self.custom = Some(CustomEditor::new(&current.unwrap_or_default()));
+            }
+            _ => {}
+        }
+        let y = ui.min_rect().bottom() + 8.0;
+        ui.painter()
+            .hline(ui.min_rect().x_range(), y, line(1.0, color::BORDER));
+        ui.add_space(20.0);
+    }
+
+    fn store_skin(&mut self, ctx: &AppCtx, key: &str, skin: crate::skin::KeyboardSkin) {
+        ctx.data.borrow_mut().set_skin(key, skin);
+        if ctx.save_data().is_err() {
+            self.app_error = Some(t::SAVE_FAILED.to_string());
+        }
+    }
+
+    /// The custom editor (a modal over the page) while open.
+    fn custom_editor(&mut self, ctx: &AppCtx, egui_ctx: &egui::Context) {
+        let Some(editor) = self.custom.as_mut() else {
+            return;
+        };
+        let (Some(snap), Some(key)) = (ctx.snapshot, ctx.keyboard_key()) else {
+            // Unplugged meanwhile: nothing to store it for.
+            self.custom = None;
+            return;
+        };
+        match editor.show(egui_ctx, snap.model, &snap.matrix) {
+            Some(EditorOutcome::Save(skin)) => {
+                self.custom = None;
+                self.store_skin(ctx, &key, skin);
+            }
+            Some(EditorOutcome::Cancel) => self.custom = None,
+            None => {}
+        }
     }
 
     // --------------------------------------------------------- keyboard
@@ -1116,6 +1178,9 @@ impl Page {
                     ));
                 }
             });
+
+            // Key cap colours (local only).
+            self.skin_row(ctx, ui);
 
             // Profiles.
             setting_row(ui, t::PROFILES, None, false, |ui| {

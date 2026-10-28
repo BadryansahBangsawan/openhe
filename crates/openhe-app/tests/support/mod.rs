@@ -24,6 +24,9 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+/// The simulator's serial number (its SYNC reply).
+pub const SIM_SERIAL: &str = "A68M240193000000";
+
 static HOME: OnceLock<PathBuf> = OnceLock::new();
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -72,7 +75,23 @@ impl World {
         World::with(Sim::new(), AppData::default(), fast_config())
     }
 
-    pub fn with(sim: Sim, data: AppData, cfg: WorkerConfig) -> World {
+    /// The app on `sim` with `data`. The simulator's colours count as
+    /// chosen (Gelap) unless `data` says otherwise, so the first-connect
+    /// dialog stays out of the way; see [`World::first_connect`].
+    pub fn with(sim: Sim, mut data: AppData, cfg: WorkerConfig) -> World {
+        data.keyboard_skins
+            .entry(SIM_SERIAL.to_string())
+            .or_default();
+        World::build(sim, data, cfg)
+    }
+
+    /// The app on a factory keyboard it has never seen: no colours stored,
+    /// so the first-connect dialog shows.
+    pub fn first_connect(data: AppData) -> World {
+        World::build(Sim::new(), data, fast_config())
+    }
+
+    fn build(sim: Sim, data: AppData, cfg: WorkerConfig) -> World {
         let serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         private_home();
         // Start every test from an empty data file.
