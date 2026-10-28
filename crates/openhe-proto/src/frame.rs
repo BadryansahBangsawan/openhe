@@ -38,6 +38,8 @@ pub enum FrameError {
     DeviceFail,
 }
 
+/// Expects `payload.len() >= len`; a missing last byte is treated as 0.
+///
 /// `(0x35 + 0x5C + LEN + CMD + PAYLOAD[LEN-1]) & 0xFF`, last term only when 1 <= LEN <= 252.
 pub fn checksum(len: u8, cmd: u8, payload: &[u8]) -> u8 {
     let last = if (1..=252).contains(&len) {
@@ -71,6 +73,63 @@ impl Request {
         out[3] = checksum(n as u8, self.cmd as u8, &self.payload);
         out[4..4 + n].copy_from_slice(&self.payload);
         Ok(out)
+    }
+}
+
+/// A keyboard-to-host reply: `[?, LEN, CMD|0x80, CHK, R...]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Response {
+    /// Command byte with the 0x80 reply bit cleared.
+    pub cmd: u8,
+    pub len: u8,
+    pub raw: [u8; REPORT_LEN],
+}
+
+impl Response {
+    /// Byte 0 is not validated (meaning unknown). Input longer than a report
+    /// is truncated to its first 64 bytes.
+    pub fn decode(report: &[u8]) -> Result<Response, FrameError> {
+        if report.len() < REPORT_LEN {
+            return Err(FrameError::ShortReport);
+        }
+        let mut raw = [0u8; REPORT_LEN];
+        raw.copy_from_slice(&report[..REPORT_LEN]);
+        if raw[2] == 0xFF {
+            return Err(FrameError::DeviceFail);
+        }
+        Ok(Response {
+            cmd: raw[2] & 0x7F,
+            len: raw[1],
+            raw,
+        })
+    }
+
+    /// The reply body `R` (`raw[4..]`).
+    pub fn body(&self) -> &[u8] {
+        &self.raw[4..]
+    }
+
+    /// Diagnostic only; replies are never rejected on a checksum mismatch.
+    pub fn checksum_ok(&self) -> bool {
+        let body = self.body();
+        let n = body.len().min(MAX_PAYLOAD);
+        checksum(self.len, self.cmd, &body[..n]) == self.raw[3]
+    }
+}
+
+impl Request {
+    /// Whether `resp` answers this request.
+    pub fn expects(&self, resp: &Response) -> bool {
+        if resp.cmd != self.cmd as u8 {
+            return false;
+        }
+        if self.cmd == Cmd::Order {
+            return match self.payload.first() {
+                Some(&t) => resp.body()[1] == t,
+                None => false,
+            };
+        }
+        true
     }
 }
 
@@ -123,5 +182,107 @@ mod tests {
     #[test]
     fn checksum_empty_payload() {
         assert_eq!(checksum(0, 0x01, &[]), 0x92);
+    }
+
+    #[test]
+    fn encode_max_payload_last_byte() {
+        let mut payload = vec![0u8; 60];
+        payload[59] = 0xAB;
+        let r = Request {
+            cmd: Cmd::Key,
+            payload,
+        };
+        let out = r.encode().unwrap();
+        assert_eq!(out[1], 60);
+        assert_eq!(out[63], 0xAB);
+        assert_eq!(out[3], checksum(60, 0x23, &r.payload));
+    }
+
+    #[test]
+    fn encode_empty_payload() {
+        let r = Request {
+            cmd: Cmd::Sync,
+            payload: vec![],
+        };
+        check(&r, &[0x5C, 0x00, 0x01, 0x92]);
+    }
+
+    fn reply(cmd_byte: u8, body: &[u8]) -> Vec<u8> {
+        let mut raw = vec![0u8; REPORT_LEN];
+        raw[1] = 2;
+        raw[2] = cmd_byte;
+        raw[4..4 + body.len()].copy_from_slice(body);
+        raw
+    }
+
+    #[test]
+    fn decode_strips_high_bit() {
+        let r = Response::decode(&reply(0xA3, &[])).unwrap();
+        assert_eq!(r.cmd, 0x23);
+        assert_eq!(r.len, 2);
+        assert_eq!(r.body().len(), 60);
+    }
+
+    #[test]
+    fn decode_fail() {
+        assert_eq!(
+            Response::decode(&reply(0xFF, &[])),
+            Err(FrameError::DeviceFail)
+        );
+    }
+
+    #[test]
+    fn decode_short() {
+        assert_eq!(Response::decode(&[0u8; 10]), Err(FrameError::ShortReport));
+    }
+
+    #[test]
+    fn decode_truncates_long_input() {
+        let mut raw = reply(0x81, &[]);
+        raw.extend_from_slice(&[9; 8]);
+        let r = Response::decode(&raw).unwrap();
+        assert_eq!(r.raw.len(), REPORT_LEN);
+        assert_eq!(r.cmd, 1);
+    }
+
+    #[test]
+    fn checksum_ok_diagnostic() {
+        let mut raw = reply(0x81, &[7, 8]);
+        raw[3] = checksum(2, 0x01, &[7, 8]);
+        assert!(Response::decode(&raw).unwrap().checksum_ok());
+        raw[3] ^= 1;
+        assert!(!Response::decode(&raw).unwrap().checksum_ok());
+    }
+
+    #[test]
+    fn order_reply_matches_type() {
+        let q = Request {
+            cmd: Cmd::Order,
+            payload: vec![0x70, 0xFF, 0xFF],
+        };
+        let ok = Response::decode(&reply(0x80, &[1, 0x70, 2])).unwrap();
+        assert!(q.expects(&ok));
+        let bad = Response::decode(&reply(0x80, &[1, 0x21, 2])).unwrap();
+        assert!(!q.expects(&bad));
+    }
+
+    #[test]
+    fn order_empty_payload_no_panic() {
+        let q = Request {
+            cmd: Cmd::Order,
+            payload: vec![],
+        };
+        let resp = Response::decode(&reply(0x80, &[1, 0x70])).unwrap();
+        assert!(!q.expects(&resp));
+    }
+
+    #[test]
+    fn key_reply_matches() {
+        let q = Request {
+            cmd: Cmd::Key,
+            payload: vec![1],
+        };
+        assert!(q.expects(&Response::decode(&reply(0xA3, &[])).unwrap()));
+        assert!(!q.expects(&Response::decode(&reply(0x80, &[])).unwrap()));
     }
 }
