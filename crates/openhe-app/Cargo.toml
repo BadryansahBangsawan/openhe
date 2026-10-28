@@ -20,3 +20,16 @@ eframe = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "5"
+# Pengaturan page (Track F). Versions picked by the MSRV-aware resolver
+# (CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback); none of them or
+# their dependencies declares a rust-version above 1.85.
+# Native open/save dialogs for profile import/export.
+rfd = "0.17.2"
+# Launch at login (LaunchAgent on macOS, registry on Windows, XDG on Linux).
+auto-launch = "0.6.0"
+# Foreground app name for per-app profile switching.
+active-win-pos-rs = "0.11.0"
+
+[features]
+# Hooks that put pages into demo states, for offscreen screenshots only.
+preview = []

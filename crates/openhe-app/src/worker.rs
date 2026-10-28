@@ -3,8 +3,16 @@
 //! - While no keyboard is open it tries to connect every second
 //!   (`HidTransport::open_first`), and fails any submitted job with
 //!   `Err(Disconnected)` straight away.
-//! - On connect it loads a [`DeviceSnapshot`] (info, system mode, profile,
-//!   polling rate, matrix, and the settings of every matrix key).
+//! - On connect it loads a [`DeviceSnapshot`] (handshake, system mode,
+//!   profile, polling rate, matrix, and the settings of every matrix key). A
+//!   keyboard in bootloader mode is refused after the handshake, with nothing
+//!   written.
+//! - While idle (and at least every `idle_poll` between jobs) it drains the
+//!   keyboard's own reports with `Keyboard::poll_events`: a profile or Win/Mac
+//!   change made on the keyboard patches the snapshot at once and schedules a
+//!   (debounced) full reload, key-data changes schedule a reload, lighting
+//!   changes bump [`Worker::lighting_generation`], and anything else is
+//!   ignored.
 //! - Pages talk to the keyboard only through [`Worker::submit`]: a closure
 //!   that runs on the worker thread with `&mut Keyboard`, and a [`Pending`]
 //!   handle the UI polls each frame without blocking.
@@ -17,13 +25,21 @@
 //!   alive, the status becomes `Error`.
 //! - A background reload that fails keeps the old snapshot, raises a
 //!   [`WorkerNotice`] for the shell, and is retried with backoff.
+//! - Polling jobs (live depth, calibration) go through
+//!   [`Worker::submit_quiet`], so they never mark the app busy.
+//! - [`Worker::reconnect`] drops the keyboard on purpose (after a polling-rate
+//!   change or a factory reset, when the keyboard re-enumerates) and connects
+//!   again after a pause.
+//! - [`Worker::set_calibration_guard`]: while set, a keyboard that is
+//!   (re)connected, or still open when the app closes, is sent
+//!   `stop_calibration` first, so a lost connection never leaves the keyboard
+//!   stuck in calibration mode (where it types nothing).
 //!
 //! The transport is a type parameter with a connector closure, so tests drive
 //! the worker with `MockTransport`; the app uses the `HidTransport` default.
 
 use crate::i18n;
-use openhe_device::{Error, HidTransport, KeySettings, Keyboard, Transport};
-use openhe_proto::frame::Response;
+use openhe_device::{DeviceEvent, Error, HidTransport, KeySettings, Keyboard, Transport};
 use openhe_proto::{DeviceInfo, Matrix, Model, PollingRate, SystemMode};
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -76,6 +92,128 @@ pub enum WorkerNotice {
     EventsFailed(Error),
 }
 
+/// The notice slots behind [`Worker::notice`]. Each slot is set and cleared
+/// by its own cause, so one notice never replaces another back and forth:
+///
+/// - `reload_failed`: cleared by the next successful load;
+/// - `events_failed`: cleared by the next successful event poll;
+/// - `skipped`: replaced by every successful load; the user can dismiss it,
+///   and it stays dismissed until the set of skipped keys changes.
+///
+/// Shown in that order of priority.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Notices {
+    pub reload_failed: Option<Error>,
+    pub events_failed: Option<Error>,
+    pub skipped: Vec<(u8, Error)>,
+    pub skipped_dismissed: bool,
+}
+
+impl Notices {
+    pub fn current(&self) -> Option<WorkerNotice> {
+        if let Some(e) = &self.reload_failed {
+            return Some(WorkerNotice::ReloadFailed(e.clone()));
+        }
+        if let Some(e) = &self.events_failed {
+            return Some(WorkerNotice::EventsFailed(e.clone()));
+        }
+        if !self.skipped.is_empty() && !self.skipped_dismissed {
+            return Some(WorkerNotice::KeysSkipped(self.skipped.clone()));
+        }
+        None
+    }
+
+    /// A load succeeded with these skipped keys.
+    pub fn loaded(&mut self, skipped: Vec<(u8, Error)>) {
+        self.reload_failed = None;
+        if skipped != self.skipped {
+            self.skipped_dismissed = false;
+        }
+        self.skipped = skipped;
+    }
+
+    /// Hides the current notice if it is the skipped-keys one (the others
+    /// clear themselves once their cause is gone).
+    pub fn dismiss(&mut self) {
+        if matches!(self.current(), Some(WorkerNotice::KeysSkipped(_))) {
+            self.skipped_dismissed = true;
+        }
+    }
+}
+
+/// What a batch of keyboard events asks the worker to do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventEffects {
+    /// The newest profile reported by the keyboard (patched in at once).
+    pub profile: Option<u8>,
+    /// The newest Win/Mac mode reported by the keyboard.
+    pub system_mode: Option<Option<openhe_proto::SystemMode>>,
+    /// Re-read the snapshot (debounced).
+    pub reload: bool,
+    /// The lighting changed on the keyboard.
+    pub lighting: bool,
+}
+
+/// Maps keyboard events to worker effects. `Other` (e.g. a late RM6X21
+/// header, 0x92) is noise and ignored.
+pub fn event_effects(events: &[DeviceEvent]) -> EventEffects {
+    let mut fx = EventEffects::default();
+    for e in events {
+        match *e {
+            DeviceEvent::ProfileChanged(p) => {
+                fx.profile = Some(p);
+                fx.reload = true;
+            }
+            DeviceEvent::SystemModeChanged(m) => {
+                fx.system_mode = Some(m);
+                fx.reload = true;
+            }
+            DeviceEvent::KeyDataChanged => fx.reload = true,
+            DeviceEvent::LightingChanged => fx.lighting = true,
+            DeviceEvent::Other(_) => {}
+        }
+    }
+    fx
+}
+
+/// Collapses a burst of events into one reload: every event pushes the
+/// reload `window` further out, and it fires once the keyboard has been
+/// quiet that long.
+#[derive(Debug, Clone, Copy)]
+pub struct Debounce {
+    window: Duration,
+    due: Option<Instant>,
+}
+
+impl Debounce {
+    pub fn new(window: Duration) -> Debounce {
+        Debounce { window, due: None }
+    }
+
+    pub fn bump(&mut self, now: Instant) {
+        self.due = Some(now + self.window);
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.due.is_some()
+    }
+
+    /// True (once) when the quiet window has passed.
+    pub fn take_due(&mut self, now: Instant) -> bool {
+        match self.due {
+            Some(t) if now >= t => {
+                self.due = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.due = None;
+    }
+}
+
 /// Opens a keyboard. Called on the worker thread.
 pub type Connector<T> = Box<dyn FnMut() -> Result<Keyboard<T>, Error> + Send>;
 
@@ -118,6 +256,9 @@ type Job<T> = Box<dyn FnOnce(Option<&mut Keyboard<T>>) -> JobDone + Send>;
 struct Msg<T: Transport> {
     label: &'static str,
     job: Job<T>,
+    /// Counted in `outstanding` and shown as the current job (not for
+    /// quiet polling jobs).
+    counted: bool,
 }
 
 type Repaint = Arc<dyn Fn() + Send + Sync>;
@@ -125,7 +266,7 @@ type Repaint = Arc<dyn Fn() + Send + Sync>;
 struct Shared {
     status: ConnectionStatus,
     current: Option<&'static str>,
-    notice: Option<WorkerNotice>,
+    notices: Notices,
     repaint: Option<Repaint>,
 }
 
@@ -136,7 +277,18 @@ struct Control {
     outstanding: AtomicUsize,
     reload: AtomicBool,
     stop: AtomicBool,
+    /// Successful connects (snapshot loaded) so far.
+    connects: AtomicU64,
+    /// Bumped on every `LightingChanged` event.
+    lighting: AtomicU64,
+    /// Pause in ms before reconnecting, when a reconnect was requested
+    /// (`NO_RECONNECT` otherwise).
+    reconnect_ms: AtomicU64,
+    /// Calibration may be running: stop it on (re)connect and on shutdown.
+    calibrating: AtomicBool,
 }
+
+const NO_RECONNECT: u64 = u64::MAX;
 
 impl Control {
     fn lock(&self) -> MutexGuard<'_, Shared> {
@@ -169,12 +321,31 @@ impl Control {
         self.repaint();
     }
 
-    fn set_notice(&self, n: Option<WorkerNotice>) {
+    /// Edits the snapshot in place (no-op while disconnected).
+    fn patch_snapshot(&self, f: impl FnOnce(&mut DeviceSnapshot)) {
+        let patched = {
+            let mut g = self.lock();
+            match &mut g.status {
+                ConnectionStatus::Connected(s) => {
+                    f(s);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if patched {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.repaint();
+        }
+    }
+
+    /// Edits the notice slots; repaints when the shown notice changed.
+    fn notices(&self, f: impl FnOnce(&mut Notices)) {
         let changed = {
             let mut g = self.lock();
-            let changed = g.notice != n;
-            g.notice = n;
-            changed
+            let before = g.notices.current();
+            f(&mut g.notices);
+            g.notices.current() != before
         };
         if changed {
             self.repaint();
@@ -221,12 +392,20 @@ fn guarded<R>(f: impl FnOnce() -> Result<R, Error>) -> (Result<R, Error>, bool) 
     }
 }
 
+/// How long dropping the handle waits for the thread while the calibration
+/// guard is set: a worst-case job in flight (an RM6X21 poll is 2 calls of
+/// up to 3 × 1 s) plus the shutdown stop.
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
+
 /// Handle to the worker thread. Dropping it stops the thread after its
-/// current step (it is not joined, so closing the window never waits on a
-/// slow keyboard).
+/// current step. Normally it is not joined, so closing the window never
+/// waits on a slow keyboard; while the calibration guard is set it is
+/// joined for up to [`SHUTDOWN_WAIT`], so the shutdown `stop_calibration`
+/// goes out before the process ends.
 pub struct Worker<T: Transport + 'static = HidTransport> {
     tx: Sender<Msg<T>>,
     ctl: Arc<Control>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// The result of a submitted job, polled from the UI.
@@ -285,23 +464,31 @@ impl<T: Transport + 'static> Worker<T> {
             shared: Mutex::new(Shared {
                 status: ConnectionStatus::Searching,
                 current: None,
-                notice: None,
+                notices: Notices::default(),
                 repaint: None,
             }),
             generation: AtomicU64::new(0),
             outstanding: AtomicUsize::new(0),
             reload: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            connects: AtomicU64::new(0),
+            lighting: AtomicU64::new(0),
+            reconnect_ms: AtomicU64::new(NO_RECONNECT),
+            calibrating: AtomicBool::new(false),
         });
         let thread_ctl = Arc::clone(&ctl);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("openhe-worker".into())
             .spawn(move || {
                 let _guard = ExitGuard(Arc::clone(&thread_ctl));
                 run(connect, rx, thread_ctl, cfg);
             })
             .expect("spawn the worker thread");
-        Worker { tx, ctl }
+        Worker {
+            tx,
+            ctl,
+            thread: Some(thread),
+        }
     }
 
     /// Queues `job` to run on the worker thread with the open keyboard.
@@ -311,6 +498,27 @@ impl<T: Transport + 'static> Worker<T> {
     pub fn submit<R: Send + 'static>(
         &self,
         label: &'static str,
+        job: impl FnOnce(&mut Keyboard<T>) -> Result<R, Error> + Send + 'static,
+    ) -> Pending<R> {
+        self.enqueue(label, true, job)
+    }
+
+    /// Like [`Worker::submit`], but the job does not make the app busy
+    /// ([`Worker::is_busy`], [`Worker::current_job`]): for frequent read-only
+    /// polling (live depth, calibration progress), which must not disable
+    /// write controls. Keep at most one quiet job in flight per page.
+    pub fn submit_quiet<R: Send + 'static>(
+        &self,
+        label: &'static str,
+        job: impl FnOnce(&mut Keyboard<T>) -> Result<R, Error> + Send + 'static,
+    ) -> Pending<R> {
+        self.enqueue(label, false, job)
+    }
+
+    fn enqueue<R: Send + 'static>(
+        &self,
+        label: &'static str,
+        counted: bool,
         job: impl FnOnce(&mut Keyboard<T>) -> Result<R, Error> + Send + 'static,
     ) -> Pending<R> {
         let (rtx, rrx) = mpsc::channel();
@@ -328,14 +536,18 @@ impl<T: Transport + 'static> Worker<T> {
                 }),
             }
         });
-        self.ctl.outstanding.fetch_add(1, Ordering::SeqCst);
+        if counted {
+            self.ctl.outstanding.fetch_add(1, Ordering::SeqCst);
+        }
         if self
             .tx
             .send(Msg {
                 label,
                 job: wrapped,
+                counted,
             })
             .is_err()
+            && counted
         {
             // The thread is gone; dropping the job drops its sender.
             self.ctl.outstanding.fetch_sub(1, Ordering::SeqCst);
@@ -371,20 +583,7 @@ impl<T: Transport + 'static> Worker<T> {
     /// Edits the current snapshot in place (no-op while disconnected), e.g.
     /// to store key settings a job just read back.
     pub fn patch_snapshot(&self, f: impl FnOnce(&mut DeviceSnapshot)) {
-        let patched = {
-            let mut g = self.ctl.lock();
-            match &mut g.status {
-                ConnectionStatus::Connected(s) => {
-                    f(s);
-                    true
-                }
-                _ => false,
-            }
-        };
-        if patched {
-            self.ctl.generation.fetch_add(1, Ordering::SeqCst);
-            self.ctl.repaint();
-        }
+        self.ctl.patch_snapshot(f);
     }
 
     /// Bumped whenever the status or the snapshot changes.
@@ -405,7 +604,49 @@ impl<T: Transport + 'static> Worker<T> {
     /// What the shell should warn about (stale or incomplete values), if
     /// anything. Cleared by the next successful reload.
     pub fn notice(&self) -> Option<WorkerNotice> {
-        self.ctl.lock().notice.clone()
+        self.ctl.lock().notices.current()
+    }
+
+    /// Hides a [`WorkerNotice::KeysSkipped`] notice until the set of
+    /// skipped keys changes. Other notices clear themselves.
+    pub fn dismiss_notice(&self) {
+        self.ctl.notices(Notices::dismiss);
+    }
+
+    /// Bumped whenever the keyboard reports a lighting change of its own
+    /// (no reload is done for it); pages showing lighting re-read when it
+    /// moves.
+    pub fn lighting_generation(&self) -> u64 {
+        self.ctl.lighting.load(Ordering::SeqCst)
+    }
+
+    /// Number of successful connects so far (each one loaded a fresh
+    /// snapshot). A page that expects the keyboard to re-enumerate waits
+    /// for this to move.
+    pub fn connects(&self) -> u64 {
+        self.ctl.connects.load(Ordering::SeqCst)
+    }
+
+    /// Drops the keyboard when the worker is next between jobs, reports
+    /// `Searching`, and connects again after `pause` (jobs submitted
+    /// meanwhile fail with `Disconnected`). For writes after which the
+    /// keyboard re-enumerates on USB (polling rate, factory reset).
+    pub fn reconnect(&self, pause: Duration) {
+        let ms = u64::try_from(pause.as_millis()).unwrap_or(NO_RECONNECT - 1);
+        self.ctl.reconnect_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// While `on`, the worker sends `stop_calibration` to any keyboard it
+    /// (re)connects to before reading it, and to the open keyboard when the
+    /// worker shuts down. The calibration page sets it before starting and
+    /// clears it once a stop succeeded. Cleared by the worker after it sent
+    /// the stop on a reconnect.
+    pub fn set_calibration_guard(&self, on: bool) {
+        self.ctl.calibrating.store(on, Ordering::SeqCst);
+    }
+
+    pub fn calibration_guard(&self) -> bool {
+        self.ctl.calibrating.load(Ordering::SeqCst)
     }
 
     /// Called from the worker thread whenever something changed, so the UI
@@ -424,18 +665,39 @@ impl<T: Transport + 'static> Worker<T> {
 
     /// Test hook for UI tests: overrides the notice.
     pub(crate) fn inject_notice(&self, n: Option<WorkerNotice>) {
-        self.ctl.set_notice(n);
+        self.ctl.notices(|slots| {
+            *slots = Notices::default();
+            match n {
+                Some(WorkerNotice::ReloadFailed(e)) => slots.reload_failed = Some(e),
+                Some(WorkerNotice::EventsFailed(e)) => slots.events_failed = Some(e),
+                Some(WorkerNotice::KeysSkipped(k)) => slots.skipped = k,
+                None => {}
+            }
+        });
     }
 }
 
 impl<T: Transport + 'static> Drop for Worker<T> {
     fn drop(&mut self) {
         self.ctl.stop.store(true, Ordering::SeqCst);
+        // Only an open keyboard can be calibrating.
+        if !self.ctl.calibrating.load(Ordering::SeqCst) || !self.is_connected() {
+            return;
+        }
+        // The keyboard may be calibrating (it types nothing then): give the
+        // thread time to finish its job and send the stop.
+        if let Some(h) = self.thread.take() {
+            let deadline = Instant::now() + SHUTDOWN_WAIT;
+            while !h.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }
 
-/// Reads everything the UI shows. Refuses a keyboard in bootloader mode
-/// before sending anything else.
+/// Reads everything the UI shows. Starts with the handshake (SYNC), which
+/// refuses a keyboard in bootloader mode (`Unsupported("bootloader")`)
+/// before anything else is sent.
 ///
 /// A key whose settings cannot be parsed (`Io` or `Frame` errors, e.g. an
 /// unknown Mode value) is left out and listed in the second value, so one
@@ -444,11 +706,7 @@ impl<T: Transport + 'static> Drop for Worker<T> {
 pub fn load_snapshot<T: Transport>(
     kb: &mut Keyboard<T>,
 ) -> Result<(DeviceSnapshot, Vec<(u8, Error)>), Error> {
-    // TODO(A3): use `handshake()` once Track A3 is merged.
-    let info = kb.info()?;
-    if info.in_bootloader {
-        return Err(Error::Unsupported("bootloader".into()));
-    }
+    let info = kb.handshake()?;
     let system_mode = kb.system_mode()?;
     let profile = kb.profile()?;
     let polling = kb.polling_rate()?;
@@ -477,26 +735,11 @@ pub fn load_snapshot<T: Transport>(
     Ok((snap, skipped))
 }
 
-/// Event adapter: drains unsolicited reports without blocking.
-///
-/// Track F swaps the body for `Keyboard::poll_events` (Track A3) and maps
-/// `DeviceEvent`s instead of raw replies.
-pub fn poll_events<T: Transport>(kb: &mut Keyboard<T>) -> Result<Vec<Response>, Error> {
-    let mut fresh = Vec::new();
-    while let Some(raw) = kb.session_mut().transport_mut().read(0)? {
-        if let Ok(r) = Response::decode(&raw) {
-            fresh.push(r);
-        }
-    }
-    let mut events = kb.take_events();
-    events.extend(fresh);
-    Ok(events)
-}
-
-/// Profile (order 0x70) or system-mode (order 0x21) changes made on the
-/// keyboard itself invalidate the snapshot.
-pub fn needs_reload(r: &Response) -> bool {
-    r.cmd == 0x00 && matches!(r.body()[1], 0x70 | 0x21)
+/// Event adapter: the keyboard's own reports, drained without blocking
+/// (`Keyboard::poll_events`: events queued by earlier calls, then whatever
+/// input is waiting).
+pub fn poll_events<T: Transport>(kb: &mut Keyboard<T>) -> Result<Vec<DeviceEvent>, Error> {
+    kb.poll_events()
 }
 
 fn connect_error_status(e: &Error) -> ConnectionStatus {
@@ -511,10 +754,6 @@ fn load_error_status(e: &Error) -> ConnectionStatus {
         Error::Disconnected => ConnectionStatus::Searching,
         other => ConnectionStatus::Error(i18n::device_error(other)),
     }
-}
-
-fn skipped_notice(skipped: Vec<(u8, Error)>) -> Option<WorkerNotice> {
-    (!skipped.is_empty()).then_some(WorkerNotice::KeysSkipped(skipped))
 }
 
 /// Backoff state for failed background reloads.
@@ -546,6 +785,31 @@ impl Retry {
     fn is_due(&self) -> bool {
         self.due.is_some_and(|t| Instant::now() >= t)
     }
+
+    /// True (once) when due; the next `schedule` keeps the longer delay.
+    fn take_due(&mut self) -> bool {
+        if self.is_due() {
+            self.due = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// How long the keyboard must stay quiet before an event-driven reload.
+fn debounce_window(cfg: &WorkerConfig) -> Duration {
+    cfg.idle_poll * 4
+}
+
+/// The handle is gone: leave the keyboard usable (stop a calibration that
+/// may still be running) before the thread ends.
+fn shutdown<T: Transport>(ctl: &Control, kb: Option<&mut Keyboard<T>>) {
+    if let Some(k) = kb {
+        if ctl.calibrating.load(Ordering::SeqCst) {
+            let _ = guarded(|| k.stop_calibration());
+        }
+    }
 }
 
 fn run<T: Transport>(
@@ -556,40 +820,72 @@ fn run<T: Transport>(
 ) {
     let mut kb: Option<Keyboard<T>> = None;
     let mut retry = Retry::new(cfg.retry_interval);
+    // Reloads after failed event polls back off on their own: a reload
+    // that works does not reset it, only a poll that works does.
+    let mut event_retry = Retry::new(cfg.retry_interval);
+    let mut debounce = Debounce::new(debounce_window(&cfg));
+    let mut last_idle = Instant::now();
+    // When to try to connect next (a requested reconnect pauses first).
+    let mut connect_at = Instant::now();
     loop {
         if ctl.stop.load(Ordering::SeqCst) {
+            shutdown(&ctl, kb.as_mut());
             return;
         }
+        let pause = ctl.reconnect_ms.swap(NO_RECONNECT, Ordering::SeqCst);
+        if pause != NO_RECONNECT {
+            kb = None;
+            ctl.set_status(ConnectionStatus::Searching);
+            connect_at = Instant::now() + Duration::from_millis(pause);
+        }
         let Some(k) = kb.as_mut() else {
-            match guarded(&mut connect).0 {
-                Ok(mut k) => {
-                    ctl.set_current(Some(LOAD_LABEL));
-                    let (loaded, _) = guarded(|| load_snapshot(&mut k));
-                    ctl.set_current(None);
-                    match loaded {
-                        Ok((snap, skipped)) => {
-                            ctl.reload.store(false, Ordering::SeqCst);
-                            retry.reset();
-                            ctl.set_notice(skipped_notice(skipped));
-                            ctl.set_status(ConnectionStatus::Connected(snap));
-                            kb = Some(k);
-                            continue;
+            if Instant::now() >= connect_at {
+                match guarded(&mut connect).0 {
+                    Ok(mut k) => {
+                        ctl.set_current(Some(LOAD_LABEL));
+                        if ctl.calibrating.load(Ordering::SeqCst)
+                            && guarded(|| k.stop_calibration()).0.is_ok()
+                        {
+                            // A stop that failed is tried again next connect.
+                            ctl.calibrating.store(false, Ordering::SeqCst);
                         }
-                        Err(e) => ctl.set_status(load_error_status(&e)),
+                        let (loaded, _) = guarded(|| load_snapshot(&mut k));
+                        ctl.set_current(None);
+                        match loaded {
+                            Ok((snap, skipped)) => {
+                                ctl.reload.store(false, Ordering::SeqCst);
+                                retry.reset();
+                                debounce.cancel();
+                                ctl.notices(|n| {
+                                    n.events_failed = None;
+                                    n.loaded(skipped);
+                                });
+                                ctl.connects.fetch_add(1, Ordering::SeqCst);
+                                ctl.set_status(ConnectionStatus::Connected(snap));
+                                kb = Some(k);
+                                last_idle = Instant::now();
+                                continue;
+                            }
+                            Err(e) => ctl.set_status(load_error_status(&e)),
+                        }
                     }
+                    Err(e) => ctl.set_status(connect_error_status(&e)),
                 }
-                Err(e) => ctl.set_status(connect_error_status(&e)),
+                connect_at = Instant::now() + cfg.retry_interval;
             }
-            // Wait before retrying; jobs arriving meanwhile fail at once.
-            let deadline = Instant::now() + cfg.retry_interval;
+            // Wait for the next attempt; jobs arriving meanwhile fail at once.
             loop {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() || ctl.stop.load(Ordering::SeqCst) {
+                let left = connect_at.saturating_duration_since(Instant::now());
+                if left.is_zero()
+                    || ctl.stop.load(Ordering::SeqCst)
+                    || ctl.reconnect_ms.load(Ordering::SeqCst) != NO_RECONNECT
+                {
                     break;
                 }
-                match rx.recv_timeout(left) {
-                    Ok(msg) => finish(&ctl, (msg.job)(None)),
-                    Err(RecvTimeoutError::Timeout) => break,
+                // Short slices, so a stop or reconnect request is seen soon.
+                match rx.recv_timeout(left.min(Duration::from_millis(100))) {
+                    Ok(msg) => finish(&ctl, msg.counted, (msg.job)(None)),
+                    Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
@@ -598,28 +894,74 @@ fn run<T: Transport>(
 
         match rx.recv_timeout(cfg.idle_poll) {
             Ok(msg) => {
-                ctl.set_current(Some(msg.label));
+                if msg.counted {
+                    ctl.set_current(Some(msg.label));
+                }
                 let done = (msg.job)(Some(k));
-                ctl.set_current(None);
-                if done.disconnected || done.panicked {
+                if msg.counted {
+                    ctl.set_current(None);
+                }
+                let lost = done.disconnected || done.panicked;
+                if lost {
                     // After a panic the keyboard state is unknown: reopen it.
                     kb = None;
                     ctl.set_status(ConnectionStatus::Searching);
                 }
-                finish(&ctl, done);
-                continue;
+                finish(&ctl, msg.counted, done);
+                // Busy with jobs (e.g. live-depth polling): still look for
+                // events at least every `idle_poll`.
+                if lost || last_idle.elapsed() < cfg.idle_poll {
+                    continue;
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => {
+                shutdown(&ctl, Some(k));
+                return;
+            }
+        }
+        let Some(k) = kb.as_mut() else {
+            continue;
+        };
+        if ctl.reconnect_ms.load(Ordering::SeqCst) != NO_RECONNECT {
+            continue;
         }
 
-        // Idle: look for events from the keyboard, then reload if asked or
-        // if a failed reload is due for another try.
-        match guarded(|| poll_events(k)).0 {
+        // Idle: look for events from the keyboard, then reload if asked, if
+        // events settled, or if a failed reload is due for another try.
+        last_idle = Instant::now();
+        let (polled, panicked) = guarded(|| poll_events(k));
+        match polled {
             Ok(events) => {
-                if events.iter().any(needs_reload) {
-                    ctl.reload.store(true, Ordering::SeqCst);
+                event_retry.reset();
+                ctl.notices(|n| n.events_failed = None);
+                let fx = event_effects(&events);
+                if fx.profile.is_some() || fx.system_mode.is_some() {
+                    // Show the keyboard's new profile / mode at once; the
+                    // debounced reload brings the rest.
+                    ctl.patch_snapshot(|s| {
+                        if let Some(p) = fx.profile {
+                            s.profile = p;
+                        }
+                        if let Some(m) = fx.system_mode {
+                            s.system_mode = m;
+                        }
+                    });
                 }
+                if fx.lighting {
+                    ctl.lighting.fetch_add(1, Ordering::SeqCst);
+                    ctl.repaint();
+                }
+                if fx.reload {
+                    debounce.bump(Instant::now());
+                }
+            }
+            // A panic while reading events leaves the transport in an
+            // unknown state: treat it like a disconnect and reopen.
+            Err(_) if panicked => {
+                kb = None;
+                ctl.set_status(ConnectionStatus::Searching);
+                continue;
             }
             Err(Error::Disconnected) => {
                 kb = None;
@@ -627,20 +969,30 @@ fn run<T: Transport>(
                 continue;
             }
             Err(e) => {
-                ctl.set_notice(Some(WorkerNotice::EventsFailed(e)));
-                if retry.due.is_none() {
-                    retry.schedule();
+                ctl.notices(|n| n.events_failed = Some(e));
+                if event_retry.due.is_none() {
+                    event_retry.schedule();
                 }
             }
         }
-        if ctl.reload.swap(false, Ordering::SeqCst) || retry.is_due() {
+        // While calibration may be running, every reload (asked for, after
+        // events, or a retry) waits until it stopped: the flags and timers
+        // stay pending meanwhile.
+        if ctl.calibrating.load(Ordering::SeqCst) {
+            continue;
+        }
+        let asked = ctl.reload.swap(false, Ordering::SeqCst);
+        let settled = debounce.take_due(Instant::now());
+        let events_retry = event_retry.take_due();
+        if asked || settled || events_retry || retry.is_due() {
+            debounce.cancel();
             ctl.set_current(Some(LOAD_LABEL));
             let (loaded, panicked) = guarded(|| load_snapshot(k));
             ctl.set_current(None);
             match loaded {
                 Ok((snap, skipped)) => {
                     retry.reset();
-                    ctl.set_notice(skipped_notice(skipped));
+                    ctl.notices(|n| n.loaded(skipped));
                     ctl.set_status(ConnectionStatus::Connected(snap));
                 }
                 Err(_) if panicked => {
@@ -653,7 +1005,7 @@ fn run<T: Transport>(
                 }
                 // Keep the old snapshot and the connection, warn, retry later.
                 Err(e) => {
-                    ctl.set_notice(Some(WorkerNotice::ReloadFailed(e)));
+                    ctl.notices(|n| n.reload_failed = Some(e));
                     retry.schedule();
                 }
             }
@@ -661,9 +1013,11 @@ fn run<T: Transport>(
     }
 }
 
-fn finish(ctl: &Control, done: JobDone) {
+fn finish(ctl: &Control, counted: bool, done: JobDone) {
     (done.deliver)();
-    ctl.outstanding.fetch_sub(1, Ordering::SeqCst);
+    if counted {
+        ctl.outstanding.fetch_sub(1, Ordering::SeqCst);
+    }
     ctl.repaint();
 }
 
@@ -898,6 +1252,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reloads_wait_while_calibration_may_be_running() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                push_snapshot(&mut m, 2);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        w.set_calibration_guard(true);
+        w.request_reload();
+        // A profile event still shows at once, but nothing is re-read.
+        let mut p = w.submit("event", |kb| {
+            kb.session_mut()
+                .transport_mut()
+                .push_pending(order_reply(0x70, 3));
+            Ok(())
+        });
+        assert_eq!(wait_result(&mut p), Ok(()));
+        wait_for("patched", || w.snapshot().is_some_and(|s| s.profile == 3));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(w.snapshot().unwrap().profile, 3, "no reload yet");
+        // Calibration stopped: the deferred reload runs (snapshot: 2).
+        w.set_calibration_guard(false);
+        wait_for("reload", || w.snapshot().is_some_and(|s| s.profile == 2));
+        assert_eq!(w.notice(), None);
+    }
+
+    #[test]
+    fn event_poll_retries_keep_backing_off() {
+        // The retry after a failed event poll is not reset by the reload it
+        // triggers, so repeated poll errors wait 1, 2, 4, ... intervals.
+        let base = Duration::from_millis(40);
+        let mut r = Retry::new(base);
+        let mut delays = Vec::new();
+        for _ in 0..4 {
+            let t0 = Instant::now();
+            r.schedule();
+            delays.push(r.due.unwrap() - t0);
+            assert!(!r.take_due(), "not due at once");
+            r.due = Some(Instant::now()); // time passes
+            assert!(r.take_due());
+            assert!(!r.take_due(), "taken once");
+        }
+        for (i, d) in delays.iter().enumerate() {
+            let want = base * 2u32.pow(i as u32);
+            assert!(
+                *d >= want && *d < want + Duration::from_millis(20),
+                "{i}: {d:?}"
+            );
+        }
+        r.reset();
+        r.schedule();
+        assert!(
+            r.due.unwrap() - Instant::now() <= base,
+            "a good poll resets it"
+        );
+    }
+
+    #[test]
     fn reload_on_request_and_on_profile_event() {
         let w = Worker::spawn_with(
             Box::new(|| {
@@ -1065,13 +1481,17 @@ pub(crate) mod tests {
             shared: Mutex::new(Shared {
                 status: ConnectionStatus::Connected(test_snapshot()),
                 current: Some("job"),
-                notice: None,
+                notices: Notices::default(),
                 repaint: None,
             }),
             generation: AtomicU64::new(0),
             outstanding: AtomicUsize::new(2),
             reload: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            connects: AtomicU64::new(0),
+            lighting: AtomicU64::new(0),
+            reconnect_ms: AtomicU64::new(NO_RECONNECT),
+            calibrating: AtomicBool::new(false),
         });
         let c = Arc::clone(&ctl);
         let _ = std::thread::spawn(move || {
@@ -1102,11 +1522,381 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn needs_reload_matches_profile_and_mode_reports_only() {
-        let d = |raw: [u8; 64]| Response::decode(&raw).unwrap();
-        assert!(needs_reload(&d(order_reply(0x70, 1))));
-        assert!(needs_reload(&d(order_reply(0x21, 1))));
-        assert!(!needs_reload(&d(order_reply(0x50, 1))));
-        assert!(!needs_reload(&d(key_reply(0x70, 4, 0))));
+    fn event_effects_map_events_to_reload_patch_and_lighting() {
+        use openhe_proto::SystemMode as M;
+        assert_eq!(event_effects(&[]), EventEffects::default());
+        let fx = event_effects(&[
+            DeviceEvent::ProfileChanged(1),
+            DeviceEvent::ProfileChanged(3),
+        ]);
+        assert_eq!(fx.profile, Some(3), "the newest profile wins");
+        assert!(fx.reload && !fx.lighting);
+        let fx = event_effects(&[DeviceEvent::SystemModeChanged(Some(M::Mac))]);
+        assert_eq!(fx.system_mode, Some(Some(M::Mac)));
+        assert!(fx.reload);
+        assert!(event_effects(&[DeviceEvent::KeyDataChanged]).reload);
+        let fx = event_effects(&[DeviceEvent::LightingChanged]);
+        assert!(fx.lighting && !fx.reload);
+        // Late RM6X21 headers and other noise do nothing.
+        assert_eq!(
+            event_effects(&[DeviceEvent::Other(0x92), DeviceEvent::Other(0x99)]),
+            EventEffects::default()
+        );
+    }
+
+    #[test]
+    fn debounce_fires_once_after_a_quiet_window() {
+        let t0 = Instant::now();
+        let w = Duration::from_millis(100);
+        let mut d = Debounce::new(w);
+        assert!(!d.take_due(t0 + w * 10));
+        d.bump(t0);
+        d.bump(t0 + Duration::from_millis(60)); // the burst goes on
+        assert!(!d.take_due(t0 + Duration::from_millis(120)));
+        assert!(d.is_pending());
+        assert!(d.take_due(t0 + Duration::from_millis(160)));
+        assert!(!d.take_due(t0 + Duration::from_millis(500)), "fires once");
+        d.bump(t0);
+        d.cancel();
+        assert!(!d.take_due(t0 + w * 10));
+    }
+
+    #[test]
+    fn notices_are_stable_and_skipped_keys_can_be_dismissed() {
+        let skipped = vec![(0x04, Error::Io("unknown key mode".into()))];
+        let mut n = Notices::default();
+        n.loaded(skipped.clone());
+        assert!(matches!(n.current(), Some(WorkerNotice::KeysSkipped(_))));
+        n.dismiss();
+        assert_eq!(n.current(), None);
+        // A reload with the same skipped keys does not bring it back.
+        n.loaded(skipped.clone());
+        assert_eq!(n.current(), None);
+        // Other keys skipped: shown again.
+        n.loaded(vec![(0x1A, Error::Io("x".into()))]);
+        assert!(matches!(n.current(), Some(WorkerNotice::KeysSkipped(_))));
+
+        // Failures outrank the skipped keys and clear only by their cause.
+        n.events_failed = Some(Error::Timeout);
+        assert_eq!(
+            n.current(),
+            Some(WorkerNotice::EventsFailed(Error::Timeout))
+        );
+        n.dismiss(); // not dismissable
+        assert_eq!(
+            n.current(),
+            Some(WorkerNotice::EventsFailed(Error::Timeout))
+        );
+        n.loaded(vec![(0x1A, Error::Io("x".into()))]);
+        assert_eq!(
+            n.current(),
+            Some(WorkerNotice::EventsFailed(Error::Timeout)),
+            "a reload does not hide a failing event poll"
+        );
+        n.reload_failed = Some(Error::Timeout);
+        assert_eq!(
+            n.current(),
+            Some(WorkerNotice::ReloadFailed(Error::Timeout))
+        );
+        n.loaded(Vec::new());
+        n.events_failed = None;
+        assert_eq!(n.current(), None);
+    }
+
+    #[test]
+    fn handshake_starts_the_load() {
+        let mut m = MockTransport::new();
+        push_snapshot(&mut m, 0);
+        let mut kb = Keyboard::new(m, Model::Win68HeMax);
+        load_snapshot(&mut kb).unwrap();
+        let first = kb.session_mut().transport().written()[0];
+        assert_eq!(
+            &first[..10],
+            &[0x5C, 0x06, 0x01, 0x97, 1, 2, 3, 4, 0xFF, 0xFF]
+        );
+    }
+
+    #[test]
+    fn bootloader_sends_nothing_after_the_handshake() {
+        let mut m = MockTransport::new();
+        m.push_reply(reply(0x01, &[(7, &[1])]));
+        let mut kb = Keyboard::new(m, Model::Win68HeMax);
+        assert_eq!(
+            load_snapshot(&mut kb).unwrap_err(),
+            Error::Unsupported("bootloader".into())
+        );
+        assert_eq!(kb.session_mut().transport().written().len(), 1);
+    }
+
+    /// A `MockTransport` that logs every write to a shared list (readable
+    /// after the keyboard is gone) and can panic once on a zero-timeout
+    /// read (the event poll).
+    pub(crate) struct Probe {
+        pub(crate) inner: MockTransport,
+        log: Arc<Mutex<Vec<[u8; 64]>>>,
+        panic_once: Arc<AtomicBool>,
+    }
+
+    impl Probe {
+        /// A transport that logs its writes into `log`.
+        pub(crate) fn logging(inner: MockTransport, log: Arc<Mutex<Vec<[u8; 64]>>>) -> Probe {
+            Probe {
+                inner,
+                log,
+                panic_once: Arc::default(),
+            }
+        }
+    }
+
+    impl Transport for Probe {
+        fn write(&mut self, r: &[u8; 64]) -> Result<(), Error> {
+            self.log.lock().unwrap().push(*r);
+            self.inner.write(r)
+        }
+
+        fn read(&mut self, t: u32) -> Result<Option<[u8; 64]>, Error> {
+            if t == 0 && self.panic_once.swap(false, Ordering::SeqCst) {
+                panic!("read bug");
+            }
+            self.inner.read(t)
+        }
+    }
+
+    pub(crate) const STOP_CALIBRATION: [u8; 7] = [0x5C, 0x03, 0x00, 0x93, 0x0D, 0xFF, 0xFF];
+
+    pub(crate) fn wrote_stop(log: &Mutex<Vec<[u8; 64]>>) -> bool {
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|w| w[..7] == STOP_CALIBRATION)
+    }
+
+    #[test]
+    fn a_profile_change_on_the_keyboard_shows_at_once_then_reloads() {
+        // Review Focus 3.
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        let g = w.generation();
+        let mut p = w.submit("fn+key", |kb| {
+            let m = kb.session_mut().transport_mut();
+            m.push_pending(order_reply(0x70, 2));
+            push_snapshot(m, 2);
+            Ok(())
+        });
+        assert_eq!(wait_result(&mut p), Ok(()));
+        wait_for("patched", || w.snapshot().is_some_and(|s| s.profile == 2));
+        assert!(w.generation() > g);
+        // The debounced reload consumed the queued snapshot without errors.
+        wait_for("reloaded", || !w.is_busy());
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(w.notice(), None);
+    }
+
+    #[test]
+    fn a_burst_of_key_data_events_reloads_once() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        let mut p = w.submit("burst", |kb| {
+            let m = kb.session_mut().transport_mut();
+            for v in [1000, 1100, 1200] {
+                m.push_pending(key_reply(0x1A, 4, v));
+            }
+            // Exactly one snapshot: a second reload would time out and
+            // raise a ReloadFailed notice.
+            push_snapshot(m, 3);
+            Ok(())
+        });
+        assert_eq!(wait_result(&mut p), Ok(()));
+        wait_for("reload", || w.snapshot().is_some_and(|s| s.profile == 3));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(w.notice(), None, "one reload for the whole burst");
+    }
+
+    #[test]
+    fn lighting_events_bump_a_counter_and_noise_is_ignored() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        assert_eq!(w.lighting_generation(), 0);
+        let mut p = w.submit("light", |kb| {
+            let m = kb.session_mut().transport_mut();
+            m.push_pending(reply(0x18, &[(1, &[1])])); // 0x98: lighting
+            m.push_pending(reply(0x12, &[(1, &[2])])); // 0x92: late RM6X21
+            Ok(())
+        });
+        assert_eq!(wait_result(&mut p), Ok(()));
+        wait_for("lighting", || w.lighting_generation() == 1);
+        // No reload was attempted (none is queued, so it would fail).
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(w.notice(), None);
+        assert_eq!(w.snapshot().unwrap().profile, 0);
+    }
+
+    #[test]
+    fn events_are_polled_while_quiet_jobs_keep_the_worker_busy() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            WorkerConfig {
+                retry_interval: Duration::from_millis(5),
+                idle_poll: Duration::from_millis(20),
+            },
+        );
+        wait_for("connect", || w.is_connected());
+        let mut p = w.submit("event", |kb| {
+            kb.session_mut()
+                .transport_mut()
+                .push_pending(order_reply(0x70, 1));
+            Ok(())
+        });
+        assert_eq!(wait_result(&mut p), Ok(()));
+        // A quiet job every few ms, faster than idle_poll: the worker never
+        // times out waiting, yet the event is still seen.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.snapshot().is_none_or(|s| s.profile != 1) {
+            assert!(Instant::now() < deadline, "event never polled");
+            let mut q = w.submit_quiet("poll", |_kb| Ok(()));
+            assert!(!w.is_busy(), "quiet jobs never mark the app busy");
+            assert_eq!(wait_result(&mut q), Ok(()));
+            std::thread::sleep(Duration::from_millis(3));
+        }
+    }
+
+    #[test]
+    fn a_panic_while_polling_events_reconnects() {
+        // Deferred Track B issue: treated like a disconnect.
+        let opened = Arc::new(AtomicUsize::new(0));
+        let panic_once = Arc::new(AtomicBool::new(false));
+        let (o, flag) = (opened.clone(), panic_once.clone());
+        let w = Worker::spawn_with(
+            Box::new(move || {
+                o.fetch_add(1, Ordering::SeqCst);
+                let mut inner = MockTransport::new();
+                push_snapshot(&mut inner, 1);
+                let t = Probe {
+                    inner,
+                    log: Arc::default(),
+                    panic_once: flag.clone(),
+                };
+                Ok(Keyboard::new(t, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        panic_once.store(true, Ordering::SeqCst);
+        wait_for("reconnect", || {
+            opened.load(Ordering::SeqCst) == 2 && w.is_connected()
+        });
+        assert!(!panic_once.load(Ordering::SeqCst));
+        let mut r = w.submit("after", |kb| Ok(kb.model));
+        assert_eq!(wait_result(&mut r), Ok(Model::Win68HeMax));
+    }
+
+    #[test]
+    fn reconnect_drops_the_keyboard_and_connects_again() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let w = Worker::spawn_with(
+            pluggable(Arc::new(AtomicBool::new(true)), opened.clone()),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        assert_eq!(w.connects(), 1);
+        w.reconnect(Duration::from_millis(30));
+        wait_for("searching", || w.status() == ConnectionStatus::Searching);
+        let mut p = w.submit("during-pause", |kb| Ok(kb.model));
+        assert_eq!(wait_result(&mut p), Err(Error::Disconnected));
+        wait_for("reconnect", || w.is_connected() && w.connects() == 2);
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn calibration_guard_stops_calibration_on_reconnect() {
+        let log: Arc<Mutex<Vec<[u8; 64]>>> = Arc::default();
+        let l = log.clone();
+        let w = Worker::spawn_with(
+            Box::new(move || {
+                let mut inner = MockTransport::new();
+                inner.push_reply(order_reply(0x0D, 1)); // stop, if sent
+                push_snapshot(&mut inner, 0);
+                Ok(Keyboard::new(
+                    Probe {
+                        inner,
+                        log: l.clone(),
+                        panic_once: Arc::default(),
+                    },
+                    Model::Win68HeMax,
+                ))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        assert!(!wrote_stop(&log), "no guard, no stop");
+        w.set_calibration_guard(true);
+        w.reconnect(Duration::from_millis(1));
+        wait_for("guard cleared", || !w.calibration_guard());
+        wait_for("reconnect", || w.is_connected() && w.connects() == 2);
+        let writes = log.lock().unwrap().clone();
+        let stop_at = writes
+            .iter()
+            .position(|w| w[..7] == STOP_CALIBRATION)
+            .expect("stop sent");
+        // Sent first on the new connection, before the handshake.
+        assert_eq!(writes[stop_at + 1][..4], [0x5C, 0x06, 0x01, 0x97]);
+    }
+
+    #[test]
+    fn calibration_guard_stops_calibration_when_the_app_closes() {
+        let log: Arc<Mutex<Vec<[u8; 64]>>> = Arc::default();
+        let l = log.clone();
+        let w = Worker::spawn_with(
+            Box::new(move || {
+                let mut inner = MockTransport::new();
+                push_snapshot(&mut inner, 0);
+                inner.push_reply(order_reply(0x0D, 1));
+                Ok(Keyboard::new(
+                    Probe {
+                        inner,
+                        log: l.clone(),
+                        panic_once: Arc::default(),
+                    },
+                    Model::Win68HeMax,
+                ))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        w.set_calibration_guard(true);
+        // A slow job (like an RM6X21 poll timing out) is running when the
+        // app closes: dropping the handle waits for it and for the stop.
+        let _slow = w.submit_quiet("slow-poll", |_kb| {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(())
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        drop(w);
+        assert!(wrote_stop(&log), "stop sent before drop returned");
     }
 }
