@@ -48,7 +48,9 @@
 //! the worker with `MockTransport`; the app uses the `HidTransport` default.
 
 use crate::i18n;
-use openhe_device::{DeviceEvent, Error, HidTransport, KeySettings, Keyboard, Transport};
+use openhe_device::{
+    DeviceEvent, Error, HidTransport, KeySettings, Keyboard, Transport, WriteOutcome,
+};
 use openhe_proto::{DeviceInfo, Matrix, Model, PollingRate, SystemMode};
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -558,6 +560,27 @@ impl<T: Transport + 'static> Worker<T> {
         self.enqueue(label, false, job)
     }
 
+    /// Like [`Worker::submit`], for a write after which the keyboard
+    /// re-enumerates on USB (polling rate, factory reset, profile switch).
+    ///
+    /// When the job returns `Ok(_)` (`Done` or `Reenumerating`) or
+    /// `Err(Disconnected)`, the worker thread itself marks the worker
+    /// restarting ([`Worker::is_restarting`]) and schedules the reconnect
+    /// after `pause`, **before** the result is delivered and before the
+    /// next message is taken. So writes never unlock between the job and
+    /// the reconnect, the idle state poll never talks to the dying
+    /// connection, and the UI never has to call [`Worker::reconnect`] (a
+    /// late call could drop the fresh connection). Any other error leaves
+    /// the connection alone.
+    pub fn submit_restart(
+        &self,
+        label: &'static str,
+        pause: Duration,
+        job: impl FnOnce(&mut Keyboard<T>) -> Result<WriteOutcome, Error> + Send + 'static,
+    ) -> Pending<WriteOutcome> {
+        enqueue_restart(&self.tx, &self.ctl, label, pause, job)
+    }
+
     fn enqueue<R: Send + 'static>(
         &self,
         label: &'static str,
@@ -652,6 +675,11 @@ impl<T: Transport + 'static> Worker<T> {
     /// `Searching`, and connects again after `pause` (jobs submitted
     /// meanwhile fail with `Disconnected`). For writes after which the
     /// keyboard re-enumerates on USB (polling rate, factory reset).
+    ///
+    /// For a write that re-enumerates the keyboard use
+    /// [`Worker::submit_restart`] instead: it schedules this on the worker
+    /// thread right after the write, so there is no unlocked gap and no
+    /// late call that could drop the fresh connection.
     pub fn reconnect(&self, pause: Duration) {
         self.ctl.request_reconnect(pause);
     }
@@ -702,6 +730,16 @@ impl<T: Transport + 'static> Clone for WorkerHandle<T> {
 }
 
 impl<T: Transport + 'static> WorkerHandle<T> {
+    /// See [`Worker::submit_restart`].
+    pub fn submit_restart(
+        &self,
+        label: &'static str,
+        pause: Duration,
+        job: impl FnOnce(&mut Keyboard<T>) -> Result<WriteOutcome, Error> + Send + 'static,
+    ) -> Pending<WriteOutcome> {
+        enqueue_restart(&self.tx, &self.ctl, label, pause, job)
+    }
+
     /// Like [`Worker::submit`] (counted: the app is busy meanwhile).
     pub fn submit<R: Send + 'static>(
         &self,
@@ -739,11 +777,6 @@ impl<T: Transport + 'static> WorkerHandle<T> {
         self.ctl.connects.load(Ordering::SeqCst)
     }
 
-    /// See [`Worker::reconnect`].
-    pub fn reconnect(&self, pause: Duration) {
-        self.ctl.request_reconnect(pause);
-    }
-
     /// See [`Worker::snapshot`].
     pub fn snapshot(&self) -> Option<DeviceSnapshot> {
         match &self.ctl.lock().status {
@@ -776,6 +809,25 @@ pub(crate) fn pending_channel<R>(label: &'static str) -> (Sender<Result<R, Error
             done: false,
         },
     )
+}
+
+/// [`Worker::submit_restart`]: the job, then (on the worker thread, before
+/// the result is delivered) the restart mark and the reconnect request.
+fn enqueue_restart<T: Transport + 'static>(
+    tx: &Sender<Msg<T>>,
+    ctl: &Arc<Control>,
+    label: &'static str,
+    pause: Duration,
+    job: impl FnOnce(&mut Keyboard<T>) -> Result<WriteOutcome, Error> + Send + 'static,
+) -> Pending<WriteOutcome> {
+    let c = Arc::clone(ctl);
+    enqueue(tx, ctl, label, true, move |kb| {
+        let r = job(kb);
+        if matches!(r, Ok(_) | Err(Error::Disconnected)) {
+            c.request_reconnect(pause);
+        }
+        r
+    })
 }
 
 /// Queues a job on the worker thread (shared by [`Worker`] and
@@ -1176,8 +1228,10 @@ fn run<T: Transport>(
         }
         // The keyboard reports no event for a Win/Mac switch (Fn+A / Fn+S),
         // so re-read profile and OS mode now and then. Only when nothing
-        // else is going on: no job queued, no reload asked for or pending.
+        // else is going on: no job queued, no reload asked for or pending,
+        // not restarting.
         if last_state.elapsed() >= cfg.state_poll
+            && !ctl.restarting.load(Ordering::SeqCst)
             && ctl.outstanding.load(Ordering::SeqCst) == 0
             && !ctl.reload.load(Ordering::SeqCst)
             && !debounce.is_pending()
@@ -1502,6 +1556,76 @@ pub(crate) mod tests {
                 == ConnectionStatus::Error(i18n::device_error(&Error::Permission("x".into())))
         });
         wait_for("retries", || tries.load(Ordering::SeqCst) >= 3);
+    }
+
+    /// A restart job: the reconnect is scheduled on the worker thread
+    /// before the result is delivered, so there is no moment where the job
+    /// is over and writes are unlocked, the idle state poll never talks to
+    /// the dying connection, and no late reconnect from the UI can drop
+    /// the fresh one.
+    #[test]
+    fn a_restart_job_schedules_the_reconnect_before_its_result_is_seen() {
+        let log: Arc<Mutex<Vec<[u8; 64]>>> = Arc::default();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let (l, o) = (log.clone(), opened.clone());
+        let w = Worker::spawn_with(
+            Box::new(move || {
+                let n = o.fetch_add(1, Ordering::SeqCst);
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, if n == 0 { 0 } else { 2 });
+                // Connection 1 logs its writes; later ones do not.
+                let log = if n == 0 { l.clone() } else { Arc::default() };
+                Ok(Keyboard::new(Probe::logging(m, log), Model::Win68HeMax))
+            }),
+            WorkerConfig {
+                retry_interval: Duration::from_millis(5),
+                idle_poll: Duration::from_millis(2),
+                state_poll: Duration::from_millis(1), // as often as possible
+            },
+        );
+        wait_for("connect", || w.is_connected());
+        let before = w.connects();
+        let writes_before = log.lock().unwrap().len();
+        let mut p = w.submit_restart("set-profile", Duration::from_millis(80), |_kb| {
+            Ok(WriteOutcome::Reenumerating)
+        });
+        let r = wait_result(&mut p);
+        assert_eq!(r, Ok(WriteOutcome::Reenumerating));
+        assert!(w.is_restarting(), "locked the moment the result is seen");
+        wait_for("back", || w.connects() > before);
+        assert!(!w.is_restarting());
+        assert_eq!(
+            log.lock().unwrap().len(),
+            writes_before,
+            "nothing (no state poll) sent on the dying connection"
+        );
+        // The fresh connection stays: nobody drops it afterwards.
+        let after = w.connects();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(w.connects(), after);
+        assert!(w.is_connected());
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_restart_job_that_fails_before_writing_does_not_reconnect() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        let before = w.connects();
+        let mut p = w.submit_restart("x", Duration::from_millis(10), |_kb| {
+            Err::<WriteOutcome, _>(Error::InvalidInput("no".into()))
+        });
+        assert!(matches!(wait_result(&mut p), Err(Error::InvalidInput(_))));
+        assert!(!w.is_restarting());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(w.connects(), before);
     }
 
     /// From a requested reconnect (a write after which the keyboard

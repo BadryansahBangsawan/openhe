@@ -391,9 +391,11 @@ impl OpenHeApp {
             self.profile_switch.start(
                 RestartKind::Profile(idx),
                 connects,
-                self.worker.submit("set-profile", move |kb| {
-                    pages::settings::profile_job(kb, idx)
-                }),
+                self.worker.submit_restart(
+                    "set-profile",
+                    pages::settings::RECONNECT_PAUSE,
+                    move |kb| pages::settings::profile_job(kb, idx),
+                ),
             );
         } else if let Some(mode) = action.mode {
             self.shell_error = None;
@@ -513,7 +515,7 @@ impl OpenHeApp {
 
         let worker_notice = snapshot.and(self.worker.notice());
         let closing = self.close.waiting();
-        let reconnecting = self.profile_switch.is_busy();
+        let reconnecting = self.profile_switch.is_busy() || self.settings.auto_reconnecting();
         if reconnecting
             || worker_notice.is_some()
             || self.data_notice.is_some()
@@ -1170,7 +1172,7 @@ mod tests {
         flow.start(
             RestartKind::Profile(idx),
             w.connects(),
-            w.submit("set-profile", move |kb| {
+            w.submit_restart("set-profile", pages::settings::RECONNECT_PAUSE, move |kb| {
                 pages::settings::profile_job(kb, idx)
             }),
         );
@@ -1213,23 +1215,30 @@ mod tests {
         );
         assert!(app.profile_switch.is_busy());
         assert_eq!(app.profile_target(), Some(2), "shown in the top bar");
-        // The offline worker ends the job with Disconnected: that is the
-        // keyboard restarting, not an error. It waits for the reconnect.
+        // The offline worker never runs the job (Disconnected, nothing
+        // written): "Perintah tidak terkirim", not a reconnect.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while matches!(app.profile_switch.state, Restart::Sending { .. }) {
+        while app.profile_switch.is_busy() {
             assert!(std::time::Instant::now() < deadline);
             app.run_topbar(TopbarAction::default(), None);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert!(matches!(
-            app.profile_switch.state,
-            Restart::Reconnecting {
-                kind: RestartKind::Profile(2),
-                ..
-            }
-        ));
-        assert_eq!(app.shell_error, None);
-        // Nothing else starts meanwhile (another profile, or Win/Mac).
+        let (text, _) = app.shell_error.clone().expect("reported");
+        assert!(
+            text.starts_with(i18n::events::PROFILE_SWITCH_FAILED),
+            "{text}"
+        );
+        assert!(text.contains("Perintah tidak terkirim"), "{text}");
+    }
+
+    #[test]
+    fn nothing_else_starts_while_a_topbar_profile_switch_reconnects() {
+        let mut app = OpenHeApp::with_worker(offline_worker(), AppData::default());
+        app.profile_switch.state = Restart::Reconnecting {
+            kind: RestartKind::Profile(2),
+            connects: u64::MAX,
+            since: std::time::Instant::now(),
+        };
         app.run_topbar(
             TopbarAction {
                 profile: Some(3),
@@ -1239,6 +1248,7 @@ mod tests {
         );
         assert_eq!(app.profile_target(), Some(2));
         assert!(app.switch.is_none());
+        assert_eq!(app.shell_error, None);
     }
 
     #[test]

@@ -184,8 +184,12 @@ impl Restart {
         Restart::Sending { kind, connects }
     }
 
-    /// The write job finished. `Done`, `Reenumerating` and `Disconnected`
-    /// all mean "the keyboard restarts": wait for it to come back.
+    /// The write job finished. `Done` and `Reenumerating` mean "the keyboard
+    /// restarts": wait for it to come back. `Disconnected` means the same
+    /// for a polling change or factory reset; for a profile switch it means
+    /// the SET was never written (`Keyboard::set_profile` reports a
+    /// disconnect after the write as `Reenumerating`), so it is a failed
+    /// write.
     pub fn job_done(&mut self, r: Result<WriteOutcome, Error>, now: Instant) -> RestartAction {
         let Restart::Sending { kind, connects } = *self else {
             return RestartAction::None;
@@ -200,12 +204,25 @@ impl Restart {
                 RestartAction::Reconnect
             }
             // The worker has dropped the keyboard already.
-            Err(Error::Disconnected) => {
+            Err(Error::Disconnected) if !matches!(kind, RestartKind::Profile(_)) => {
                 *self = Restart::Reconnecting {
                     kind,
                     connects,
                     since: now,
                 };
+                RestartAction::None
+            }
+            // A profile SET that never went out; the keyboard is gone and
+            // the worker reloads when it is back.
+            Err(Error::Disconnected) => {
+                *self = Restart::Failed(
+                    format!(
+                        "{} {}",
+                        t::WRITE_FAILED,
+                        i18n::device_error(&Error::Disconnected)
+                    ),
+                    Some(i18n::technical(&Error::Disconnected)),
+                );
                 RestartAction::None
             }
             Err(e) => {
@@ -259,21 +276,18 @@ impl Restart {
 }
 
 /// What a restart flow needs from the worker: [`crate::worker::Worker`]
-/// and [`WorkerHandle`] in the app.
+/// and [`WorkerHandle`] in the app. The reconnect itself is scheduled by
+/// the worker thread ([`crate::worker::Worker::submit_restart`]); the flow
+/// only observes it.
 pub trait RestartPort {
     /// [`crate::worker::Worker::connects`].
     fn connects(&self) -> u64;
-    /// Drop the keyboard and reconnect after `pause`.
-    fn reconnect(&self, pause: Duration);
     fn request_reload(&self);
 }
 
 impl<T: Transport + 'static> RestartPort for crate::worker::Worker<T> {
     fn connects(&self) -> u64 {
         crate::worker::Worker::connects(self)
-    }
-    fn reconnect(&self, pause: Duration) {
-        crate::worker::Worker::reconnect(self, pause);
     }
     fn request_reload(&self) {
         crate::worker::Worker::request_reload(self);
@@ -283,9 +297,6 @@ impl<T: Transport + 'static> RestartPort for crate::worker::Worker<T> {
 impl<T: Transport + 'static> RestartPort for WorkerHandle<T> {
     fn connects(&self) -> u64 {
         WorkerHandle::<T>::connects(self)
-    }
-    fn reconnect(&self, pause: Duration) {
-        WorkerHandle::<T>::reconnect(self, pause);
     }
     fn request_reload(&self) {
         WorkerHandle::request_reload(self);
@@ -302,8 +313,9 @@ pub struct RestartRun {
 }
 
 impl RestartRun {
-    /// The write `job` was submitted for `kind`; `connects` is the
-    /// worker's count at that moment.
+    /// The write `job` was submitted for `kind` with
+    /// [`crate::worker::Worker::submit_restart`] (which reconnects on its
+    /// own); `connects` is the worker's count at that moment.
     pub fn start(&mut self, kind: RestartKind, connects: u64, job: Pending<WriteOutcome>) {
         self.state = Restart::begin(kind, connects);
         self.job = Some(job);
@@ -313,8 +325,10 @@ impl RestartRun {
         self.state.is_busy()
     }
 
-    /// Collects the write job (asking the worker to reconnect, or to
-    /// reload after a failed write) and follows the reconnect.
+    /// Collects the write job (asking for a reload after a failed write;
+    /// the worker already scheduled the reconnect itself) and follows the
+    /// reconnect. Never calls `reconnect`: a late call could drop the
+    /// fresh connection.
     pub fn pump(
         &mut self,
         port: &impl RestartPort,
@@ -323,10 +337,8 @@ impl RestartRun {
     ) {
         if let Some(r) = self.job.as_mut().and_then(Pending::poll) {
             self.job = None;
-            match self.state.job_done(r, now) {
-                RestartAction::Reconnect => port.reconnect(RECONNECT_PAUSE),
-                RestartAction::Reload => port.request_reload(),
-                RestartAction::None => {}
+            if self.state.job_done(r, now) == RestartAction::Reload {
+                port.request_reload();
             }
         }
         self.state.observe(port.connects(), snapshot, now);
@@ -434,7 +446,9 @@ impl<T: Transport + 'static> SwitchPort for WorkerHandle<T> {
     }
 
     fn switch(&self, profile: u8) -> Pending<WriteOutcome> {
-        self.submit("auto-profile", move |kb| profile_job(kb, profile))
+        self.submit_restart("auto-profile", RECONNECT_PAUSE, move |kb| {
+            profile_job(kb, profile)
+        })
     }
 }
 
@@ -451,12 +465,20 @@ pub struct AutoShared {
     pub ui_lock: AtomicBool,
     /// A failed automatic switch, for the shell to show.
     error: Mutex<Option<String>>,
+    /// An automatic switch is running (write or reconnect).
+    reconnecting: AtomicBool,
 }
 
 impl AutoShared {
     pub fn set_rules(&self, rules: Vec<(String, u8)>) {
         *self.rules.lock().unwrap_or_else(|p| p.into_inner()) = rules;
         self.rules_changed.store(true, Ordering::SeqCst);
+    }
+
+    /// A per-app switch is waiting for the keyboard to reconnect (the
+    /// shell shows "Menyambung ulang…").
+    pub fn reconnecting(&self) -> bool {
+        self.reconnecting.load(Ordering::SeqCst)
     }
 
     pub fn set_ui_lock(&self, on: bool) {
@@ -518,6 +540,9 @@ impl AutoSwitcher {
                 other => self.run.state = other,
             }
         }
+        shared
+            .reconnecting
+            .store(self.run.is_busy(), Ordering::SeqCst);
         if self.run.is_busy() || shared.ui_lock.load(Ordering::SeqCst) || port.locked() {
             return finished;
         }
@@ -528,6 +553,7 @@ impl AutoSwitcher {
             let connects = port.connects();
             self.run
                 .start(RestartKind::Profile(p), connects, port.switch(p));
+            shared.reconnecting.store(true, Ordering::SeqCst);
         }
         finished
     }
@@ -933,6 +959,12 @@ impl Page {
         }
     }
 
+    /// A per-app switch is reconnecting the keyboard (for the shell's
+    /// notice).
+    pub fn auto_reconnecting(&self) -> bool {
+        self.auto.reconnecting()
+    }
+
     /// Automatic profile switches wait: a switch, restart or import of this
     /// page is running, or an import is planned and waiting for
     /// "Terapkan" (a switch would change the profile it was planned for).
@@ -1083,7 +1115,9 @@ impl Page {
             RestartKind::Polling(rate),
             ctx.worker.connects(),
             ctx.worker
-                .submit("set-polling", move |kb| polling_job(kb, rate)),
+                .submit_restart("set-polling", RECONNECT_PAUSE, move |kb| {
+                    polling_job(kb, rate)
+                }),
         );
     }
 
@@ -1097,7 +1131,9 @@ impl Page {
             kind,
             ctx.worker.connects(),
             ctx.worker
-                .submit("set-profile", move |kb| profile_job(kb, idx)),
+                .submit_restart("set-profile", RECONNECT_PAUSE, move |kb| {
+                    profile_job(kb, idx)
+                }),
         );
     }
 
@@ -1108,7 +1144,8 @@ impl Page {
         self.restart.start(
             RestartKind::FactoryReset,
             ctx.worker.connects(),
-            ctx.worker.submit("factory-reset", reset_job),
+            ctx.worker
+                .submit_restart("factory-reset", RECONNECT_PAUSE, reset_job),
         );
     }
 
@@ -1804,12 +1841,21 @@ mod tests {
             f,
             Restart::Failed(format!("{} 1.", t::PROFILE_MISMATCH), None)
         );
-        // A disconnect while sending: the worker reconnects on its own.
+        // `set_profile` reports Disconnected only when nothing was written
+        // (after the write it is Reenumerating): the command did not go
+        // out, so say so instead of a profile mismatch after the reconnect.
         let mut f = Restart::begin(RestartKind::Profile(1), 1);
         assert_eq!(
             f.job_done(Err(Error::Disconnected), t0),
             RestartAction::None
         );
+        match &f {
+            Restart::Failed(msg, _) => assert!(msg.starts_with(t::WRITE_FAILED), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        // Polling and reset keep treating a disconnect as the restart.
+        let mut f = Restart::begin(RestartKind::Polling(PollingRate::Hz1000), 1);
+        f.job_done(Err(Error::Disconnected), t0);
         assert!(f.is_busy());
     }
 
@@ -2008,14 +2054,14 @@ mod tests {
 
     /// A worker stand-in: its connection count and snapshot, whether it
     /// is locked, the switches asked for (their results are sent by the
-    /// test), and the reconnects and reloads requested.
+    /// test), and the reloads requested. (The reconnect is the worker's
+    /// own business: `switch` stands for `submit_restart`.)
     #[derive(Default)]
     struct FakePort {
         snapshot: RefCell<Option<DeviceSnapshot>>,
         connects: Cell<u64>,
         locked: Cell<bool>,
         sent: RefCell<Vec<(u8, Reply)>>,
-        reconnects: Cell<usize>,
         reloads: Cell<usize>,
     }
 
@@ -2040,9 +2086,6 @@ mod tests {
     impl RestartPort for FakePort {
         fn connects(&self) -> u64 {
             self.connects.get()
-        }
-        fn reconnect(&self, _pause: Duration) {
-            self.reconnects.set(self.reconnects.get() + 1);
         }
         fn request_reload(&self) {
             self.reloads.set(self.reloads.get() + 1);
@@ -2090,10 +2133,11 @@ mod tests {
             .send(Ok(WriteOutcome::Reenumerating))
             .unwrap();
         assert!(!sw.tick(Some("Valorant"), &port, &shared));
-        assert_eq!(port.reconnects.get(), 1);
+        assert!(shared.reconnecting(), "the shell shows menyambung ulang");
         // Back on profile 1: done, no error, nothing more to do.
         port.connect(1);
         assert!(sw.tick(Some("Valorant"), &port, &shared), "finished");
+        assert!(!shared.reconnecting(), "notice gone");
         assert_eq!(shared.take_error(), None);
         sw.tick(Some("Valorant"), &port, &shared);
         assert_eq!(port.sent.borrow().len(), 1, "already on 1");
@@ -2121,7 +2165,7 @@ mod tests {
             sw.tick(Some(app), &port, &shared);
         }
         assert_eq!(port.sent.borrow().len(), 1, "no second switch");
-        assert_eq!(port.reconnects.get(), 1, "one reconnect");
+        assert!(shared.reconnecting());
         // The keyboard comes back on another profile: reported once, and
         // not retried in a loop.
         port.connect(0);
@@ -2170,7 +2214,7 @@ mod tests {
         assert!(e.starts_with(i18n::events::AUTO_SWITCH_FAILED), "{e}");
         assert_eq!(shared.take_error(), None, "taken once");
         assert_eq!(port.reloads.get(), 1, "the state is re-read");
-        assert_eq!(port.reconnects.get(), 0);
+        assert!(!shared.reconnecting());
         sw.tick(Some("Valorant"), &port, &shared);
         assert_eq!(port.sent.borrow().len(), 1, "no retry loop");
         // Edited rules start over.
