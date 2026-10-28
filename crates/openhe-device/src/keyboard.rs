@@ -113,9 +113,18 @@ impl<T: Transport> Keyboard<T> {
     /// is matched by the usual rules. Afterwards every entry is read with
     /// `key_param` and compared with the value written; a difference is an
     /// `Error::Io` that starts with "verify failed". Nothing is read back after a
-    /// failed SET, and an empty `entries` does no I/O. Entries should be unique
-    /// per `(key, param)`: with duplicates only the last write can verify.
+    /// failed SET, and an empty `entries` does no I/O. A `(key, param)` that
+    /// appears twice is `Error::InvalidInput`, returned before any I/O.
     pub fn set_key_params(&mut self, entries: &[(u8, KeyParam, u16)]) -> Result<(), Error> {
+        let mut seen = std::collections::HashSet::new();
+        for &(key, param, _) in entries {
+            if !seen.insert((key, param)) {
+                return Err(Error::InvalidInput(format!(
+                    "duplicate entry for key 0x{key:02X} layout {}",
+                    param.layout()
+                )));
+            }
+        }
         if entries.is_empty() {
             return Ok(());
         }
@@ -344,6 +353,39 @@ mod tests {
             e,
             Error::Io("verify failed: key 0x0A layout 4: wrote 1500, read 2000".to_string())
         );
+    }
+
+    #[test]
+    fn duplicate_entries_are_rejected_before_any_io() {
+        let mut k = kb(MockTransport::new());
+        let e = k
+            .set_key_params(&[
+                (0x0A, KeyParam::Actuation, 1500),
+                (0x0B, KeyParam::Actuation, 1500),
+                (0x0A, KeyParam::Actuation, 1600),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            e,
+            Error::InvalidInput("duplicate entry for key 0x0A layout 4".to_string())
+        );
+        assert!(k.session_mut().transport().written().is_empty());
+    }
+
+    #[test]
+    fn same_param_on_different_layers_or_keys_is_not_a_duplicate() {
+        use openhe_proto::key::Layer;
+        let entries = [
+            (0x0A, KeyParam::Layer(Layer::Base), 0x0A),
+            (0x0A, KeyParam::Layer(Layer::Fn1), 0x0B),
+            (0x0B, KeyParam::Layer(Layer::Base), 0x0B),
+        ];
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x0A, 0, 0x0A)); // SET echo (first entry)
+        for (key, p, v) in entries {
+            m.push_reply(key_reply(key, p.layout(), v)); // read-backs
+        }
+        assert_eq!(kb(m).set_key_params(&entries), Ok(()));
     }
 
     #[test]

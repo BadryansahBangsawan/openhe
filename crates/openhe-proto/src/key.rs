@@ -5,17 +5,35 @@ use crate::frame::{Cmd, Request, Response};
 /// Entries per SET packet: 1 + 14 * 4 = 57 bytes <= MAX_PAYLOAD.
 const ENTRIES_PER_PACKET: usize = 14;
 
+/// A keymap layer: the base layer and the three Fn layers.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Layer {
+    Base = 0,
+    Fn1 = 1,
+    Fn2 = 2,
+    Fn3 = 3,
+}
+
+/// One of the four DKS binding slots.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Slot {
+    S1 = 0,
+    S2 = 1,
+    S3 = 2,
+    S4 = 3,
+}
+
 /// A per-key parameter slot.
-///
-/// `Layer(n)`, `DksBinding(n)` and `DksTrps(n)` take `n` in `0..=3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyParam {
-    Layer(u8),
+    Layer(Layer),
     Actuation,
     DksFirst,
     Mode,
-    DksBinding(u8),
-    DksTrps(u8),
+    DksBinding(Slot),
+    DksTrps(Slot),
     MtDelay,
     RtPress,
     RtRelease,
@@ -25,25 +43,15 @@ pub enum KeyParam {
 }
 
 impl KeyParam {
-    /// Layout index on the wire. `n` outside `0..=3` is a programming error:
-    /// debug builds assert, release builds mask with `n & 3`.
+    /// Layout index on the wire.
     pub fn layout(self) -> u8 {
         match self {
-            KeyParam::Layer(n) => {
-                debug_assert!(n <= 3);
-                n & 3
-            }
+            KeyParam::Layer(l) => l as u8,
             KeyParam::Actuation => 4,
             KeyParam::DksFirst => 5,
             KeyParam::Mode => 8,
-            KeyParam::DksBinding(n) => {
-                debug_assert!(n <= 3);
-                9 + (n & 3)
-            }
-            KeyParam::DksTrps(n) => {
-                debug_assert!(n <= 3);
-                13 + (n & 3)
-            }
+            KeyParam::DksBinding(s) => 9 + s as u8,
+            KeyParam::DksTrps(s) => 13 + s as u8,
             KeyParam::MtDelay => 19,
             KeyParam::RtPress => 20,
             KeyParam::RtRelease => 21,
@@ -180,12 +188,36 @@ mod tests {
 
     #[test]
     fn layouts() {
-        assert_eq!(KeyParam::Layer(3).layout(), 3);
-        assert_eq!(KeyParam::DksBinding(3).layout(), 12);
-        assert_eq!(KeyParam::DksTrps(0).layout(), 13);
-        assert_eq!(KeyParam::DksTrps(3).layout(), 16);
-        assert_eq!(KeyParam::Switch.layout(), 25);
-        assert_eq!(KeyParam::BottomDeadzone.layout(), 23);
+        use KeyParam as P;
+        let table = [
+            (P::Layer(Layer::Base), 0),
+            (P::Layer(Layer::Fn1), 1),
+            (P::Layer(Layer::Fn2), 2),
+            (P::Layer(Layer::Fn3), 3),
+            (P::Actuation, 4),
+            (P::DksFirst, 5),
+            (P::Mode, 8),
+            (P::DksBinding(Slot::S1), 9),
+            (P::DksBinding(Slot::S2), 10),
+            (P::DksBinding(Slot::S3), 11),
+            (P::DksBinding(Slot::S4), 12),
+            (P::DksTrps(Slot::S1), 13),
+            (P::DksTrps(Slot::S2), 14),
+            (P::DksTrps(Slot::S3), 15),
+            (P::DksTrps(Slot::S4), 16),
+            (P::MtDelay, 19),
+            (P::RtPress, 20),
+            (P::RtRelease, 21),
+            (P::TopDeadzone, 22),
+            (P::BottomDeadzone, 23),
+            (P::Switch, 25),
+        ];
+        for (p, want) in table {
+            assert_eq!(p.layout(), want, "{p:?}");
+        }
+        let distinct: std::collections::HashSet<u8> =
+            table.iter().map(|(p, _)| p.layout()).collect();
+        assert_eq!(distinct.len(), table.len());
     }
 
     #[test]

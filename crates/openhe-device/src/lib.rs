@@ -27,6 +27,8 @@ pub enum Error {
     Frame(FrameError),
     #[error("I/O error: {0}")]
     Io(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 impl From<FrameError> for Error {

@@ -346,6 +346,13 @@ mod tests {
     }
 
     #[test]
+    fn invalid_input_exits_with_code_1_and_is_not_fatal() {
+        let e = Error::InvalidInput("duplicate entry".into());
+        assert_eq!(exit_code(&e), 1);
+        assert!(!is_fatal(&e));
+    }
+
+    #[test]
     fn disconnect_aborts_dump() {
         let mut k = kb(MockTransport::new());
         k.session_mut()
