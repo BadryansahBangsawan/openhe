@@ -72,6 +72,69 @@ impl AppCtx<'_> {
     }
 }
 
+/// Longest the window stays open after a close request while a write job
+/// runs.
+pub const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the shell does with the window this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// Nothing to do.
+    Idle,
+    /// Let the requested close happen.
+    Allow,
+    /// Cancel the requested close: a write is still running.
+    Cancel,
+    /// Still waiting for the write (repaint soon).
+    Wait,
+    /// The write finished (or the wait ran out): close the window now.
+    Close,
+}
+
+/// Holds a window close while a write job runs (closing mid-write could
+/// leave the keyboard half-written), for at most [`CLOSE_WAIT`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CloseGuard {
+    since: Option<std::time::Instant>,
+    releasing: bool,
+}
+
+impl CloseGuard {
+    /// One frame: `requested` is the window's close request, `busy` the
+    /// worker's [`Worker::is_busy`].
+    pub fn frame(&mut self, requested: bool, busy: bool, now: std::time::Instant) -> CloseAction {
+        let done = |since: std::time::Instant| !busy || now.duration_since(since) >= CLOSE_WAIT;
+        if requested {
+            if self.releasing {
+                return CloseAction::Allow;
+            }
+            return match self.since {
+                Some(since) if done(since) => CloseAction::Allow,
+                Some(_) => CloseAction::Cancel,
+                None if busy => {
+                    self.since = Some(now);
+                    CloseAction::Cancel
+                }
+                None => CloseAction::Allow,
+            };
+        }
+        match self.since {
+            Some(_) if self.releasing => CloseAction::Idle,
+            Some(since) if done(since) => {
+                self.releasing = true;
+                CloseAction::Close
+            }
+            Some(_) => CloseAction::Wait,
+            None => CloseAction::Idle,
+        }
+    }
+
+    /// A close is being held ("Menunggu perubahan selesai…").
+    pub fn waiting(&self) -> bool {
+        self.since.is_some() && !self.releasing
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageId {
     Performance,
@@ -138,6 +201,7 @@ pub struct OpenHeApp {
     switch: Option<TopbarSwitch>,
     /// An error from the top bar, shown as a dismissable notice.
     shell_error: Option<(String, Option<String>)>,
+    close: CloseGuard,
 }
 
 /// A running top-bar switch and the value it asked for (shown meanwhile).
@@ -185,12 +249,21 @@ impl OpenHeApp {
             settings: Default::default(),
             switch: None,
             shell_error: None,
+            close: CloseGuard::default(),
         }
     }
 }
 
 impl eframe::App for OpenHeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let requested = ctx.input(|i| i.viewport().close_requested());
+        let now = std::time::Instant::now();
+        match self.close.frame(requested, self.worker.is_busy(), now) {
+            CloseAction::Cancel => ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose),
+            CloseAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            CloseAction::Wait => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+            CloseAction::Allow | CloseAction::Idle => {}
+        }
         self.draw(ctx);
     }
 
@@ -390,10 +463,12 @@ impl OpenHeApp {
         );
 
         let worker_notice = snapshot.and(self.worker.notice());
+        let closing = self.close.waiting();
         if worker_notice.is_some()
             || self.data_notice.is_some()
             || self.shell_error.is_some()
             || stop_owed
+            || closing
         {
             egui::TopBottomPanel::top("notices")
                 .show_separator_line(false)
@@ -404,6 +479,9 @@ impl OpenHeApp {
                     bottom: 0,
                 }))
                 .show(ctx, |ui| {
+                    if closing {
+                        notice_line(ui, i18n::common::CLOSING);
+                    }
                     if stop_owed
                         && notice_bar(
                             ui,
@@ -538,6 +616,22 @@ pub fn data_notice_text(n: &LoadNotice) -> String {
         ),
         LoadNotice::Unreadable(_) => i18n::storage::UNREADABLE.to_string(),
     }
+}
+
+/// An amber notice row without a button.
+fn notice_line(ui: &mut Ui, text: &str) {
+    Card::new()
+        .fill(color::ACCENT_SOFT)
+        .stroke(color::ACCENT.gamma_multiply(0.5))
+        .padding(10)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.add(egui::Label::new(RichText::new(text).color(color::TEXT)).wrap());
+            });
+        });
+    ui.add_space(4.0);
 }
 
 /// An amber notice row with one button; true when the button was clicked.
@@ -1021,6 +1115,33 @@ mod tests {
         theme::apply(&egui_ctx);
         let mut app = app;
         run_frames(&egui_ctx, 2, |c| app.draw(c));
+    }
+
+    #[test]
+    fn closing_waits_for_a_running_write_at_most_ten_seconds() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut g = CloseGuard::default();
+        // Idle: the window closes at once.
+        assert_eq!(g.frame(true, false, t0), CloseAction::Allow);
+        // A write runs: hold the close, show "Menunggu perubahan selesai…".
+        let mut g = CloseGuard::default();
+        assert_eq!(g.frame(true, true, t0), CloseAction::Cancel);
+        assert!(g.waiting());
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(g.frame(false, true, t1), CloseAction::Wait);
+        // A second click while still busy keeps waiting (same deadline).
+        assert_eq!(g.frame(true, true, t1), CloseAction::Cancel);
+        // The write finished: close now.
+        assert_eq!(g.frame(false, false, t1), CloseAction::Close);
+        // ... and the close that follows goes through.
+        assert_eq!(g.frame(true, false, t1), CloseAction::Allow);
+        // A keyboard that never answers: close after CLOSE_WAIT anyway.
+        let mut g = CloseGuard::default();
+        g.frame(true, true, t0);
+        assert_eq!(g.frame(false, true, t0 + CLOSE_WAIT), CloseAction::Close);
+        assert_eq!(g.frame(true, true, t0 + CLOSE_WAIT), CloseAction::Allow);
+        assert!(CLOSE_WAIT <= Duration::from_secs(10));
     }
 
     #[test]

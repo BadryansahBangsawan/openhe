@@ -22,6 +22,8 @@ pub mod common {
     pub const DISMISS: &str = "Tutup";
     pub const RELOAD: &str = "Muat ulang";
     pub const TECH_DETAIL: &str = "Detail teknis";
+    pub const CLOSING: &str =
+        "Menunggu perubahan selesai… OpenHE ditutup sesudahnya (paling lama 10 detik).";
 }
 
 /// Error texts. Every user-facing error goes through [`device_error`], so no
