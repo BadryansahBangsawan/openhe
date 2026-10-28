@@ -285,6 +285,24 @@ pub fn apply_effects(result: Result<ApplyOutcome, Error>) -> ApplyEffects {
 
 // ------------------------------------------------------------------ page
 
+/// The keyboard state a job was submitted against: its profile and the
+/// worker's connection count. A result read back under another profile or
+/// after a reconnect is not patched into the (newer) snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentOn {
+    pub profile: u8,
+    pub connects: u64,
+}
+
+impl SentOn {
+    pub fn now(ctx: &AppCtx) -> Option<SentOn> {
+        ctx.snapshot.map(|s| SentOn {
+            profile: s.profile,
+            connects: ctx.worker.connects(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Actuation,
@@ -298,6 +316,8 @@ pub struct Page {
     /// Selection and worker generation the form was loaded from.
     loaded_from: Option<(BTreeSet<u8>, u64)>,
     pending: Option<Pending<ApplyOutcome>>,
+    /// Profile and connection count when the pending job was submitted.
+    sent_on: Option<SentOn>,
     /// The last change sent, for "Coba lagi".
     last_sent: Option<(Vec<u8>, PerformanceChange)>,
     error: Option<String>,
@@ -318,6 +338,7 @@ impl Default for Page {
             touched: Touched::default(),
             loaded_from: None,
             pending: None,
+            sent_on: None,
             last_sent: None,
             error: None,
             error_technical: None,
@@ -363,9 +384,29 @@ impl Page {
         };
         self.pending = None;
         let fx = apply_effects(result);
+        let sent_on = self.sent_on.take();
+        if sent_on.is_none() || sent_on != SentOn::now(ctx) {
+            // Read only now, after a profile switch or a reconnect: the
+            // values belong to the keyboard state of back then and the
+            // snapshot was loaded afresh since. Nothing is patched; the
+            // form reloads from the current snapshot.
+            self.error = fx.error;
+            self.error_technical = fx.technical;
+            self.applied = false;
+            if fx.applied {
+                self.touched = Touched::default();
+                self.clamped = false;
+                self.loaded_from = None;
+            }
+            return;
+        }
+        let profile = sent_on.map(|s| s.profile);
         if !fx.patch.is_empty() {
             let fresh = fx.patch.clone();
             ctx.worker.patch_snapshot(move |s| {
+                if Some(s.profile) != profile {
+                    return;
+                }
                 for (k, v) in fresh {
                     s.keys.insert(k, v);
                 }
@@ -453,6 +494,7 @@ impl Page {
         self.applied = false;
         self.last_sent = Some((keys.clone(), change.clone()));
         self.error_technical = None;
+        self.sent_on = SentOn::now(ctx);
         self.pending = Some(
             ctx.worker
                 .submit("performance-apply", move |kb| apply_job(kb, &keys, &change)),

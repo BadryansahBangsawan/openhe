@@ -119,3 +119,35 @@ fn a_rejected_write_shows_the_error_and_the_values_the_keyboard_kept() {
     assert_eq!(w.sim().p().key(0x14, ACT), 1500);
     assert!(!w.has("Gagal menerapkan"));
 }
+
+/// Top-bar switch to profile `label` ("3"), waiting for the reconnect.
+fn switch_profile(w: &mut World, label: &str) {
+    let want: u8 = label.parse::<u8>().unwrap() - 1;
+    w.click(label);
+    w.until("profile switched", 20, |w| {
+        w.worker.snapshot().is_some_and(|s| s.profile == want) && !w.worker.is_restarting()
+    });
+    w.idle();
+}
+
+/// An apply finishing while another page is shown is only read by this
+/// page later; by then the keyboard may be on another profile, whose
+/// snapshot must not get the old profile's values.
+#[test]
+fn an_apply_read_after_a_profile_switch_is_not_patched_into_the_new_profile() {
+    let mut w = World::new();
+    w.click_key(0x14, false);
+    w.edit_value("2.000 mm", 0, "1.5");
+    w.sim().set_delay = std::time::Duration::from_millis(20);
+    w.click("Terapkan ke keyboard");
+    assert!(w.worker.is_busy());
+    w.page("Remap");
+    w.sim().set_delay = std::time::Duration::ZERO;
+    w.idle();
+    assert_eq!(w.sim().profiles[0].key(0x14, ACT), 1500);
+    switch_profile(&mut w, "3");
+    w.page("Performa");
+    w.frames(5);
+    assert_eq!(w.sim().p().key(0x14, ACT), 2000);
+    assert_eq!(w.snapshot().keys[&0x14].actuation.0, 2000, "stale patch");
+}

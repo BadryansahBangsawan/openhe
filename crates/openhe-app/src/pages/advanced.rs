@@ -13,6 +13,7 @@
 use super::remap::{code_field, code_name, FN_KEY};
 use crate::app::{page_with_right_panel, AppCtx};
 use crate::i18n;
+use crate::pages::performance::SentOn;
 use crate::theme::{color, font, line, size};
 use crate::widgets::card::{self, Card};
 use crate::widgets::keyboard::{reference_matrix, KeyDecoration, KeyboardView, Selection};
@@ -981,6 +982,8 @@ pub struct Page {
     read_failed: BTreeSet<u8>,
     read_error: Option<(String, String)>,
     pending: Option<Pending<ApplyOutcome>>,
+    /// Profile and connection count when the pending apply was submitted.
+    sent_on: Option<SentOn>,
     last_sent: Option<(u8, AdvancedConfig, Vec<u8>)>,
     error: Option<String>,
     error_technical: Option<String>,
@@ -1059,8 +1062,19 @@ impl Page {
     }
 
     fn finish_apply(&mut self, ctx: &AppCtx, result: Result<ApplyOutcome, Error>) {
-        let sent = self.last_sent.clone();
         let fx = apply_effects(result);
+        let sent_on = self.sent_on.take();
+        if sent_on.is_none() || sent_on != SentOn::now(ctx) {
+            // Read only after a profile switch or a reconnect: the snapshot
+            // and the cache were loaded afresh since, so nothing read back
+            // then is applied to them.
+            self.error = fx.error;
+            self.error_technical = fx.technical;
+            self.applied = false;
+            return;
+        }
+        let profile = sent_on.map(|s| s.profile);
+        let sent = self.last_sent.clone();
         if let Some((key, _, affected)) = sent {
             // Cached configs of every affected key are stale now.
             for k in &affected {
@@ -1092,6 +1106,9 @@ impl Page {
         if !fx.patch.is_empty() {
             let fresh = fx.patch;
             ctx.worker.patch_snapshot(move |s| {
+                if Some(s.profile) != profile {
+                    return;
+                }
                 for (k, v) in fresh {
                     s.keys.insert(k, v);
                 }
@@ -1131,7 +1148,8 @@ impl Page {
             self.read_failed.clear();
             self.editor = None;
             self.picking_partner = false;
-            self.profile = None;
+            // `profile` is kept: a reconnect onto another profile is still
+            // seen as a profile change below.
             return;
         };
         if self.profile.is_some_and(|p| p != snap.profile) {
@@ -1139,6 +1157,11 @@ impl Page {
             self.read_failed.clear();
             self.read_error = None;
             self.editor = None;
+            // "Coba lagi" must not resend the old profile's write here.
+            self.last_sent = None;
+            self.error = None;
+            self.error_technical = None;
+            self.applied = false;
         }
         self.profile = Some(snap.profile);
         self.selection.retain_present(&snap.matrix);
@@ -1238,6 +1261,7 @@ impl Page {
         self.error_technical = None;
         self.applied = false;
         self.last_sent = Some((key, cfg, affected.clone()));
+        self.sent_on = SentOn::now(ctx);
         self.pending = Some(ctx.worker.submit("advanced-apply", move |kb| {
             apply_job(kb, key, &cfg, &affected)
         }));
