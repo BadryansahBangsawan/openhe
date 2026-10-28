@@ -110,23 +110,30 @@ impl Advanced {
     }
 }
 
+/// The Mode value (LAYOUT 8): `(touch << 4) | advanced` in the low byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyMode {
     pub touch: TouchMode,
     pub advanced: Advanced,
+    /// The high byte, meaning unknown; kept as read so that writing a mode
+    /// back after changing touch or advanced does not clear it.
+    pub high: u8,
 }
 
 impl KeyMode {
     pub fn to_u16(self) -> u16 {
-        (u16::from(self.touch as u8) << 4) | u16::from(self.advanced as u8)
+        let low = (self.touch as u8) << 4 | self.advanced as u8;
+        u16::from_le_bytes([low, self.high])
     }
 
-    /// Uses only the low byte: touch = high nibble, advanced = low nibble.
+    /// Low byte: touch = high nibble, advanced = low nibble. The high byte is
+    /// kept in `high`.
     pub fn from_u16(v: u16) -> Option<KeyMode> {
-        let low = (v & 0xFF) as u8;
+        let [low, high] = v.to_le_bytes();
         Some(KeyMode {
             touch: TouchMode::from_u8(low >> 4)?,
             advanced: Advanced::from_u8(low & 0xF)?,
+            high,
         })
     }
 }
@@ -252,6 +259,7 @@ mod tests {
         let m = KeyMode {
             touch: TouchMode::RapidTrigger,
             advanced: Advanced::None,
+            high: 0,
         };
         assert_eq!(m.to_u16(), 0x20);
         assert_eq!(KeyMode::from_u16(0x20), Some(m));
@@ -259,15 +267,32 @@ mod tests {
             KeyMode::from_u16(0x13),
             Some(KeyMode {
                 touch: TouchMode::Single,
-                advanced: Advanced::Mt
+                advanced: Advanced::Mt,
+                high: 0,
             })
         );
         assert_eq!(KeyMode::from_u16(0x07), None);
         assert_eq!(KeyMode::from_u16(0x30), None);
+    }
+
+    #[test]
+    fn mode_keeps_the_high_byte() {
+        let m = KeyMode::from_u16(0xAB13).unwrap();
         assert_eq!(
-            KeyMode::from_u16(0xAB13).map(|m| m.advanced),
-            Some(Advanced::Mt)
+            m,
+            KeyMode {
+                touch: TouchMode::Single,
+                advanced: Advanced::Mt,
+                high: 0xAB,
+            }
         );
+        assert_eq!(m.to_u16(), 0xAB13);
+        // A read-modify-write that changes only the touch mode keeps the rest.
+        let rt = KeyMode {
+            touch: TouchMode::RapidTrigger,
+            ..m
+        };
+        assert_eq!(rt.to_u16(), 0xAB23);
     }
 
     #[test]

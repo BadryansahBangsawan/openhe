@@ -228,7 +228,8 @@ mod tests {
             KeySettings {
                 mode: KeyMode {
                     touch: TouchMode::RapidTrigger,
-                    advanced: Advanced::None
+                    advanced: Advanced::None,
+                    high: 0,
                 },
                 actuation: Micrometers(1500),
                 rt_press: Micrometers(100),
