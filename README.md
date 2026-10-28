@@ -20,7 +20,8 @@ OpenHE tidak berafiliasi dengan AULA.
 > **Status: dalam pengembangan.**
 > - Alat CLI `openhe` sudah berfungsi. Perintah baca-saja (`list`, `info`, `dump`) sudah diverifikasi pada
 >   satu AULA WIN 68 HE MAX sungguhan, dan satu penulisan (`set-actuation`) sudah diverifikasi dan dipulihkan.
-> - Aplikasi GUI (`openhe-app`) sedang dibangun. Halaman-halamannya belum selesai.
+> - Aplikasi GUI (`openhe-app`) sudah punya semua halaman, tetapi penulisannya ke keyboard belum diuji di
+>   perangkat keras.
 > - Belum ada rilis yang dipublikasikan, dan fitur tulis lainnya belum diuji di perangkat keras.
 
 ## Keyboard yang didukung
@@ -77,8 +78,7 @@ Aturan udev ini juga diperlukan untuk menjalankan CLI hasil build dari source di
 
 ## Build dari source
 
-Butuh Rust stable (1.85 atau lebih baru). Crate `openhe-app` masih dalam pengerjaan; yang sudah ada saat ini
-adalah `openhe-cli`.
+Butuh Rust stable (1.85 atau lebih baru).
 
 ```sh
 git clone <repository-url> openhe
@@ -92,14 +92,16 @@ Di Linux pasang dulu pustaka sistem:
 
 ```sh
 sudo apt install libudev-dev pkg-config libxkbcommon-dev libgl1-mesa-dev \
-  libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+  libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+  libdbus-1-dev libxcb1-dev
 ```
 
 Paket per platform:
 
 - macOS: `packaging/macos/build-app.sh` membuat `dist/macos/OpenHE.app` (opsi `--zip`)
 - Linux: `packaging/linux/build-appimage.sh` membuat AppImage dengan linuxdeploy
-- Windows: ikon di-embed lewat `build.rs`, lihat [`packaging/windows/README.md`](packaging/windows/README.md)
+- Windows: ikon dan info versi di-embed ke `openhe-app.exe` oleh `build.rs` (crate `winresource`), lihat
+  [`packaging/windows/README.md`](packaging/windows/README.md)
 
 ## Alat CLI `openhe`
 
@@ -146,7 +148,8 @@ OpenHE is not affiliated with AULA.
 > **Status: in development.**
 > - The `openhe` CLI works today. Its read-only commands (`list`, `info`, `dump`) have been verified on one
 >   real WIN 68 HE MAX, and one write (`set-actuation`) has been verified and restored.
-> - The GUI app (`openhe-app`) is under construction. Its pages are not finished.
+> - The GUI app (`openhe-app`) has all its pages, but its writes to the keyboard have not been tested on
+>   hardware yet.
 > - No release has been published yet, and the other write features have not been tested on hardware.
 
 ## Supported keyboards
@@ -202,8 +205,7 @@ The rule is also needed to run a CLI built from source on Linux. Then unplug and
 
 ## Build from source
 
-You need stable Rust (1.85 or newer). The `openhe-app` crate is still being built; what exists today is
-`openhe-cli`.
+You need stable Rust (1.85 or newer).
 
 ```sh
 git clone <repository-url> openhe
@@ -217,14 +219,16 @@ On Linux, install the system libraries first:
 
 ```sh
 sudo apt install libudev-dev pkg-config libxkbcommon-dev libgl1-mesa-dev \
-  libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+  libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+  libdbus-1-dev libxcb1-dev
 ```
 
 Per-platform packages:
 
 - macOS: `packaging/macos/build-app.sh` builds `dist/macos/OpenHE.app` (`--zip` also writes a zip)
 - Linux: `packaging/linux/build-appimage.sh` builds an AppImage with linuxdeploy
-- Windows: the icon is embedded by a `build.rs`, see [`packaging/windows/README.md`](packaging/windows/README.md)
+- Windows: the icon and version info are embedded into `openhe-app.exe` by `build.rs` (the `winresource`
+  crate), see [`packaging/windows/README.md`](packaging/windows/README.md)
 
 ## The `openhe` CLI
 

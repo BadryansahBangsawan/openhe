@@ -9,4 +9,4 @@ Icon=openhe
 Terminal=false
 Categories=Settings;HardwareSettings;Utility;
 Keywords=keyboard;aula;hall;rapid trigger;actuation;
-StartupWMClass=openhe-app
+StartupWMClass=dev.openhe.OpenHE

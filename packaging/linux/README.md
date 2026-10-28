@@ -52,8 +52,8 @@ The result is `dist/linux/OpenHE-<version>-x86_64.AppImage`. Run it with `chmod 
 `./OpenHE-*.AppImage`. On systems without FUSE 2 use `./OpenHE-*.AppImage --appimage-extract-and-run`.
 
 `packaging/linux/openhe.desktop` and the PNG icons from `assets/icons/png/` are embedded by the script.
-The window class in the desktop file (`StartupWMClass=openhe-app`) must match the `app_id` the app sets
-in eframe; adjust it if the app uses another one.
+The window class in the desktop file (`StartupWMClass=dev.openhe.OpenHE`) matches the `app_id` the app
+sets in eframe (`crates/openhe-app/src/lib.rs`); change both together.
 
 Notes:
 - eframe loads Wayland, X11 and OpenGL libraries at run time (`dlopen`), so the AppImage uses the
