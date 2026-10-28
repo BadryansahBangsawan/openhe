@@ -178,8 +178,11 @@ mod tests {
         // Checksum: 0x91 + LEN 4 + CMD 0 + last payload byte 0xFF = 0x194 -> 0x94.
         assert_eq!(&w[0][..4], &[0x5C, 0x04, 0x00, 0x94]);
         assert_eq!(payload(&w[0]), [0x47, 0x01, 0xFF, 0xFF]);
-        assert_eq!(&w[1][..4], &[0x5C, 0x2C, 0x18, 0xD5]);
-        assert_eq!(w[1][4], 0x00, "GET uses flag 00");
+        // The LEN-15 GET (flag 00 + 14 zeros); the keyboard rejects LEN 44.
+        // Checksum: 0x91 + 0x0F + 0x18 + 0 = 0xB8.
+        let mut get = [0u8; 64];
+        get[..4].copy_from_slice(&[0x5C, 0x0F, 0x18, 0xB8]);
+        assert_eq!(w[1], get, "GET uses flag 00 and LEN 15");
     }
 
     #[test]
@@ -195,7 +198,7 @@ mod tests {
         assert_eq!(&w[0][..4], &[0x5C, 0x2C, 0x18, 0xD8]);
         assert_eq!(w[0][4], 0x01, "SET uses flag 01");
         assert_eq!(payload(&w[1]), [0x47, 0x01, 0xFF, 0xFF]);
-        assert_eq!(w[2][4], 0x00);
+        assert_eq!(&w[2][..5], &[0x5C, 0x0F, 0x18, 0xB8, 0x00]);
     }
 
     #[test]

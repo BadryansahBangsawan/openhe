@@ -1,5 +1,6 @@
 use crate::{transport::Transport, Error};
-use openhe_proto::frame::{FrameError, Request, Response};
+use openhe_proto::frame::{Cmd, FrameError, Request, Response};
+use openhe_proto::lighting;
 
 use std::time::{Duration, Instant};
 
@@ -126,6 +127,7 @@ impl<T: Transport> Session<T> {
         attempts: usize,
         wrote: &mut bool,
     ) -> Result<Vec<[u8; 64]>, Error> {
+        refuse_malformed_prgb_get(req)?;
         let frame = req.encode()?;
         for _ in 0..attempts {
             self.drain()?;
@@ -162,6 +164,21 @@ impl<T: Transport> Session<T> {
         }
         Err(Error::Timeout)
     }
+}
+
+/// Every PRGB request that is not a SET (flag 01) must be exactly
+/// `lighting::get()`. The keyboard rejects any other GET (a LEN-44 GET got a
+/// 0xFF DeviceFail reply) and right after that rejection it stopped sensing
+/// keys until it was replugged (PROTOCOL 7.x finding 14), so nothing may
+/// reach the transport that way.
+fn refuse_malformed_prgb_get(req: &Request) -> Result<(), Error> {
+    if req.cmd == Cmd::Prgb && req.payload.first() != Some(&0x01) && *req != lighting::get() {
+        return Err(Error::InvalidInput(format!(
+            "PRGB GET must be the LEN-15 form, not LEN {}",
+            req.payload.len()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -474,5 +491,59 @@ mod tests {
         s.transport_mut().fail_with(Error::Disconnected);
         assert_eq!(s.try_poll().unwrap_err(), Error::Disconnected);
         assert!(s.poll().is_empty());
+    }
+
+    /// A PRGB GET other than the LEN-15 form is refused before any write:
+    /// the keyboard rejects a LEN-44 GET and then stopped sensing keys until
+    /// it was replugged (PROTOCOL 7.x finding 14).
+    #[test]
+    fn a_malformed_prgb_get_is_never_written() {
+        use openhe_proto::frame::Cmd;
+        use openhe_proto::lighting;
+        let bad = [
+            vec![0u8; 44],
+            vec![0u8; 14],
+            vec![0u8; 16],
+            Vec::new(),
+            {
+                let mut p = vec![0u8; 15];
+                p[5] = 1;
+                p
+            },
+            vec![0x02; 15],
+        ];
+        for payload in bad {
+            let req = Request {
+                cmd: Cmd::Prgb,
+                payload: payload.clone(),
+            };
+            let mut s = Session::new(MockTransport::new());
+            for r in [s.call(&req), s.call_once(&req)] {
+                assert!(
+                    matches!(r, Err(Error::InvalidInput(_))),
+                    "{payload:?}: {r:?}"
+                );
+            }
+            assert!(s.call_many(&req, 1).is_err());
+            assert!(s.transport().written().is_empty(), "{payload:?}");
+        }
+        // The canonical GET and a SET (flag 01) still go out.
+        let mut m = MockTransport::new();
+        let mut r = [0u8; 64];
+        r[0] = 0x5C;
+        r[2] = 0x98;
+        m.push_reply(r);
+        let mut s = Session::new(m);
+        assert!(s.call(&lighting::get()).is_ok());
+        let set = Request {
+            cmd: Cmd::Prgb,
+            payload: {
+                let mut p = vec![0u8; 44];
+                p[0] = 1;
+                p
+            },
+        };
+        let _ = s.call_once(&set);
+        assert_eq!(s.transport().written().len(), 2);
     }
 }

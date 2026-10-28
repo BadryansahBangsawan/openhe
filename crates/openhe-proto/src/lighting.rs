@@ -1,7 +1,7 @@
 //! CMD 0x18 PRGB (main light) and CMD 0x2A KRGB (per-key custom colour).
 //!
-//! PRGB uses the "1.0.9" layout of PROTOCOL 3.8 (LEN 44, always 7 colours in
-//! B, G, R, 0xFF order). KRGB sets one key per packet in R, G, B order and is
+//! PRGB SET uses the "1.0.9" layout of PROTOCOL 3.8 (LEN 44, always 7 colours
+//! in B, G, R, 0xFF order); PRGB GET is a fixed LEN-15 packet (see `get`). KRGB sets one key per packet in R, G, B order and is
 //! made permanent by a commit packet (`[01, FE, FE, FE, FE]`).
 
 use crate::frame::{Cmd, Request, Response};
@@ -166,11 +166,21 @@ pub fn set(l: &Lighting) -> Result<Request, LightingError> {
     })
 }
 
-/// PRGB GET: the same LEN-44 packet with flag 00 and an empty body.
+/// Length of the only PRGB GET the keyboard accepts.
+const PRGB_GET_LEN: usize = 15;
+
+/// PRGB GET, LEN 15: flag 00 followed by 14 zero bytes.
+///
+/// This is what AULA HUB sends for its first read (`getLighting` with an
+/// empty state: pad(4), no colours, pad(4), flags, brightness, mode, speed,
+/// sleep, static colour). The keyboard (FW App V1.1.3) rejects a LEN-44 GET
+/// with a 0xFF DeviceFail reply, and right after that rejection it stopped
+/// sensing keys until it was replugged, so this is the only GET OpenHE can
+/// build. The reply still carries the full 44-byte layout (see `parse`).
 pub fn get() -> Request {
     Request {
         cmd: Cmd::Prgb,
-        payload: vec![0u8; PRGB_LEN],
+        payload: vec![0u8; PRGB_GET_LEN],
     }
 }
 
@@ -373,11 +383,24 @@ mod tests {
         assert_eq!(out[4 + 37], 0x10);
     }
 
+    // The keyboard rejects a LEN-44 GET (reply 0xFF, DeviceFail; hardware
+    // finding 14). AULA HUB's first GET is flag 00 + 14 zero bytes:
+    // pad(4), no colours, pad(4), flags, brightness, mode, speed, sleep,
+    // static colour. Checksum: 0x91 + 0x0F + 0x18 + 0 = 0xB8.
     #[test]
-    fn get_is_len_44_flag_zero() {
-        // Checksum: 0x91 + 0x2C + 0x18 + 0 = 0xD5.
+    fn get_is_the_15_byte_form_the_keyboard_accepts() {
         let out = get().encode().unwrap();
-        assert_eq!(out, frame(&[0x5C, 0x2C, 0x18, 0xD5]));
+        assert_eq!(
+            out,
+            frame(&[
+                0x5C, 0x0F, 0x18, 0xB8, // header, LEN 15
+                0x00, // flag: get
+                0x00, 0x00, 0x00, 0x00, // pad
+                0x00, 0x00, 0x00, 0x00, // pad (no colours)
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // flags .. static colour
+            ])
+        );
+        assert_eq!(get().payload.len(), PRGB_GET_LEN);
     }
 
     #[test]
