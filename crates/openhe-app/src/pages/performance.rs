@@ -25,8 +25,11 @@ use openhe_device::keyboard::performance::{PerformanceChange, MAX_DEADZONE_UM, M
 use openhe_device::{Error, KeySettings};
 use openhe_device::{Keyboard, Transport};
 use openhe_proto::model::MIN_ACTUATION_UM;
+use openhe_proto::travel::TravelFrame;
 use openhe_proto::{Micrometers, Model, TouchMode};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 /// Factory default actuation (PROTOCOL 7.x finding 9).
 pub const DEFAULT_ACTUATION_UM: u16 = 2000;
@@ -303,6 +306,8 @@ pub struct Page {
     /// Values were clamped to a newly chosen switch's travel.
     clamped: bool,
     view: View,
+    /// Live key depth, polled while the "Kedalaman live" view is shown.
+    live: LiveDepth,
 }
 
 impl Default for Page {
@@ -319,6 +324,7 @@ impl Default for Page {
             applied: false,
             clamped: false,
             view: View::Actuation,
+            live: LiveDepth::default(),
         }
     }
 }
@@ -327,6 +333,8 @@ impl Page {
     pub fn ui(&mut self, ctx: &AppCtx, ui: &mut Ui) {
         self.poll_pending(ctx);
         self.sync_form(ctx);
+        self.live
+            .pump(ctx, self.view == View::Live && ctx.connected(), ui.ctx());
         page_with_right_panel(
             ui,
             "performance-right",
@@ -334,6 +342,16 @@ impl Page {
             |page, ui| page.center(ctx, ui),
             |page, ui| page.right(ctx, ui),
         );
+    }
+
+    /// Screenshot hook: the live view with these depths and selection.
+    /// Sends nothing.
+    #[cfg(feature = "preview")]
+    pub fn preview_live(&mut self, depths: &[(u8, u16)], select: &[u8]) {
+        self.view = View::Live;
+        self.live.depth = depths.iter().copied().collect();
+        self.live.last = Some(Instant::now() + Duration::from_secs(3600));
+        self.selection.set(select.iter().copied());
     }
 
     fn poll_pending(&mut self, ctx: &AppCtx) {
@@ -471,20 +489,21 @@ impl Page {
                     (View::Actuation, t::VIEW_ACTUATION),
                     (View::Live, t::VIEW_LIVE),
                 ];
-                Segmented::new(&views)
-                    .disable(View::Live)
-                    .hover_text(t::LIVE_SOON)
-                    .show(ui, &mut self.view);
+                Segmented::new(&views).show(ui, &mut self.view);
             });
         });
         ui.add_space(12.0);
 
         let snap = ctx.snapshot;
+        let live = (self.view == View::Live).then_some(&self.live);
         ui.vertical_centered(|ui| {
             KeyboardView::new(model, matrix).enabled(connected).show(
                 ui,
                 &mut self.selection,
-                |code| decorate(snap, code),
+                |code| match live {
+                    Some(l) => live_decoration(snap, l, code),
+                    None => decorate(snap, code),
+                },
             );
         });
         if !connected {
@@ -529,35 +548,86 @@ impl Page {
         });
     }
 
-    fn travel_card(&self, ctx: &AppCtx, ui: &mut Ui, h: f32) {
+    /// "Gerak tombol": the travel bar of the selected key, or, in the live
+    /// view, of the deepest key right now (among the selection, if any).
+    fn travel_card(&mut self, ctx: &AppCtx, ui: &mut Ui, h: f32) {
+        let codes = self.ordered(ctx);
+        let live = self.view == View::Live;
+        // In the live view: the deepest key, its depth and its own form
+        // (when nothing is selected the form is that key's).
+        let focus = match (live, ctx.snapshot) {
+            (true, Some(s)) => {
+                let pool: Vec<u8> = if codes.is_empty() {
+                    s.matrix.keys().map(|(_, _, c)| c).collect()
+                } else {
+                    codes.clone()
+                };
+                self.live.deepest(&pool).map(|(code, depth)| {
+                    let form = if codes.is_empty() {
+                        Form::from_keys(&[code], s).unwrap_or_default()
+                    } else {
+                        self.form
+                    };
+                    (code, depth, form)
+                })
+            }
+            _ => None,
+        };
+        let mut retry = false;
         Card::new().show(ui, |ui| {
             ui.set_min_size(egui::vec2(ui.available_width(), h - 42.0));
-            let codes = self.ordered(ctx);
             ui.horizontal(|ui| {
-                let title = match codes.first() {
-                    Some(&c) => format!("{} · {}", t::TRAVEL, openhe_proto::keycodes::legend(c)),
+                let title_code = focus.map(|f| f.0).or(codes.first().copied());
+                let title = match title_code {
+                    Some(c) => format!("{} · {}", t::TRAVEL, openhe_proto::keycodes::legend(c)),
                     None => t::TRAVEL.to_string(),
                 };
                 card::title(ui, title);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(t::LIVE_SOON)
-                            .font(font::small())
-                            .color(color::MUTED),
-                    );
+                    let hint = match (live, codes.first()) {
+                        (false, _) => live_strings::SWITCH_TO_LIVE.to_string(),
+                        (true, Some(&c)) if codes.len() == 1 => format!(
+                            "{} {} {}",
+                            live_strings::PRESS,
+                            openhe_proto::keycodes::legend(c),
+                            live_strings::TO_SEE_LIVE
+                        ),
+                        (true, _) => live_strings::PRESS_ANY.to_string(),
+                    };
+                    ui.label(RichText::new(hint).font(font::small()).color(color::MUTED));
                 });
             });
             ui.add_space(12.0);
-            let max = match ctx.snapshot {
-                Some(s) if !codes.is_empty() => max_travel(s, &codes, &self.form, &self.touched),
-                _ => 3400,
-            };
-            if ctx.snapshot.is_some() && !codes.is_empty() {
-                paint_travel(ui, &self.form, max);
-            } else {
-                card::hint(ui, t::NOTHING_SELECTED_BODY);
+            if let (true, Some((msg, tech))) = (live, &self.live.error) {
+                retry = card::error_box(
+                    ui,
+                    live_strings::FAILED,
+                    msg,
+                    Some(i18n::common::RETRY),
+                    Some(tech),
+                );
+                return;
+            }
+            match (ctx.snapshot, focus) {
+                (Some(s), Some((code, depth, form))) => {
+                    let max = max_travel(s, &[code], &form, &Touched::default());
+                    let max = if codes.is_empty() {
+                        max
+                    } else {
+                        max_travel(s, &codes, &self.form, &self.touched)
+                    };
+                    paint_travel(ui, &form, max, Some(depth));
+                }
+                (Some(s), None) if !codes.is_empty() => {
+                    let max = max_travel(s, &codes, &self.form, &self.touched);
+                    paint_travel(ui, &self.form, max, None);
+                }
+                _ => card::hint(ui, t::NOTHING_SELECTED_BODY),
             }
         });
+        if retry {
+            self.live.retry();
+        }
     }
 
     // --------------------------------------------------------- right panel
@@ -995,11 +1065,13 @@ fn waiting_banner(ui: &mut Ui, ctx: &AppCtx) {
     });
 }
 
-/// A static travel bar: deadzones hatched at both ends, the actuation point
-/// marked, a scale underneath. Live depth arrives with Track F.
-fn paint_travel(ui: &mut Ui, form: &Form, max: u16) {
+/// The travel bar: deadzones hatched at both ends, the actuation point
+/// marked, a scale underneath. With `depth` (live view) the bar fills to the
+/// key's current depth, marked with a white line and its value; otherwise it
+/// fills to the actuation point.
+fn paint_travel(ui: &mut Ui, form: &Form, max: u16, depth: Option<u16>) {
     let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 120.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 134.0), Sense::hover());
     let p = ui.painter_at(rect.expand(2.0));
     let bar = Rect::from_min_size(rect.min + egui::vec2(0.0, 26.0), egui::vec2(width, 56.0));
     let span = f32::from(max.max(1));
@@ -1013,12 +1085,20 @@ fn paint_travel(ui: &mut Ui, form: &Form, max: u16) {
         StrokeKind::Inside,
     );
     let ax = x_of(form.actuation);
-    let fill = Rect::from_min_max(bar.min, egui::pos2(ax, bar.max.y));
-    p.rect_filled(
-        fill,
-        CornerRadius::same(8),
-        color::ACCENT.gamma_multiply(0.28),
-    );
+    let fill_to = depth.map_or(ax, x_of);
+    let fill = Rect::from_min_max(bar.min, egui::pos2(fill_to, bar.max.y));
+    if fill.width() >= 1.0 {
+        let strength = if depth.is_some_and(|d| d >= form.actuation) {
+            0.55
+        } else {
+            0.28
+        };
+        p.rect_filled(
+            fill,
+            CornerRadius::same(8),
+            color::ACCENT.gamma_multiply(strength),
+        );
+    }
 
     let hatch = |from: f32, to: f32| {
         let zone = Rect::from_min_max(egui::pos2(from, bar.top()), egui::pos2(to, bar.bottom()));
@@ -1055,8 +1135,24 @@ fn paint_travel(ui: &mut Ui, form: &Form, max: u16) {
         font::small(),
         color::ACCENT,
     );
+    if let Some(d) = depth {
+        let dx = x_of(d);
+        p.line_segment(
+            [egui::pos2(dx, bar.top()), egui::pos2(dx, bar.bottom())],
+            line(2.5, color::TEXT),
+        );
+        p.text(
+            egui::pos2(dx.max(bar.left() + 24.0), bar.bottom() + 4.0),
+            Align2::CENTER_TOP,
+            format!("{} mm", mm_short(d)),
+            font::small(),
+            color::TEXT,
+        );
+    }
 
-    // Scale: every 0.5 mm (kept clear of the end label), plus the end.
+    // Scale: every 0.5 mm (kept clear of the end label), plus the end;
+    // pushed down a line when the live depth value sits under the bar.
+    let scale_y = bar.bottom() + if depth.is_some() { 26.0 } else { 12.0 };
     let mut um = 0u16;
     while um < max && x_of(max) - x_of(um) > 64.0 {
         let align = if um == 0 {
@@ -1065,7 +1161,7 @@ fn paint_travel(ui: &mut Ui, form: &Form, max: u16) {
             Align2::CENTER_TOP
         };
         p.text(
-            egui::pos2(x_of(um), bar.bottom() + 12.0),
+            egui::pos2(x_of(um), scale_y),
             align,
             format!("{:.1}", f32::from(um) / 1000.0),
             font::tiny(),
@@ -1074,7 +1170,7 @@ fn paint_travel(ui: &mut Ui, form: &Form, max: u16) {
         um += 500;
     }
     p.text(
-        egui::pos2(bar.right(), bar.bottom() + 12.0),
+        egui::pos2(bar.right(), scale_y),
         Align2::RIGHT_TOP,
         format!("{} mm", mm_short(max)),
         font::tiny(),
@@ -1108,6 +1204,131 @@ fn paint_travel(ui: &mut Ui, form: &Form, max: u16) {
             .font(font::small())
             .color(color::MUTED),
     );
+}
+
+// ------------------------------------------------- live depth (Track F)
+
+mod live_strings {
+    pub const FAILED: &str = "Kedalaman live tidak terbaca";
+    pub const PRESS: &str = "Tekan tombol";
+    pub const TO_SEE_LIVE: &str = "untuk melihat secara live";
+    pub const PRESS_ANY: &str = "Tekan tombol mana saja untuk melihat kedalamannya";
+    pub const SWITCH_TO_LIVE: &str = "Pilih \"Kedalaman live\" untuk melihat gerak tombol";
+    pub const FRAME_HINT: &str = "Data jarak tekan dari keyboard tidak dikenali.";
+}
+
+/// Poll period of the live view (the official app polls every 10 ms; one
+/// RM6X21 frame is 6 reports, so this keeps the queue light).
+pub const LIVE_INTERVAL: Duration = Duration::from_millis(40);
+
+/// Live key depth: one quiet `travel()` job in flight at a time while the
+/// live view is shown; stops on its own when the page or view is left. A
+/// failed read pauses polling until "Coba lagi".
+#[derive(Default)]
+pub struct LiveDepth {
+    pending: Option<Pending<TravelFrame>>,
+    last: Option<Instant>,
+    /// Current depth per key, µm.
+    pub depth: BTreeMap<u8, u16>,
+    /// Indonesian text and technical detail of the last failure.
+    pub error: Option<(String, String)>,
+}
+
+impl LiveDepth {
+    /// Whether a new poll should go out now.
+    pub fn due(&self, active: bool, now: Instant) -> bool {
+        active
+            && self.pending.is_none()
+            && self.error.is_none()
+            && self
+                .last
+                .is_none_or(|t| now.duration_since(t) >= LIVE_INTERVAL)
+    }
+
+    fn pump(&mut self, ctx: &AppCtx, active: bool, egui_ctx: &egui::Context) {
+        if let Some(r) = self.pending.as_mut().and_then(Pending::poll) {
+            self.pending = None;
+            match (r, ctx.snapshot) {
+                (Ok(frame), Some(s)) => self.apply(s, &frame),
+                (Ok(_), None) => {}
+                (Err(e), _) => self.fail(&e),
+            }
+        }
+        let now = Instant::now();
+        if self.due(active, now) {
+            self.last = Some(now);
+            self.pending = Some(ctx.worker.submit_quiet("live-depth", |kb| kb.travel()));
+        }
+        if active {
+            egui_ctx.request_repaint_after(LIVE_INTERVAL);
+        }
+    }
+
+    /// Stores one frame: the depth of every matrix key at its DEFKEY
+    /// position.
+    pub fn apply(&mut self, snap: &DeviceSnapshot, frame: &TravelFrame) {
+        for (row, col, code) in snap.matrix.keys() {
+            if let Some(v) = frame
+                .um
+                .get(usize::from(row))
+                .and_then(|r| r.get(usize::from(col)))
+            {
+                self.depth.insert(code, *v);
+            }
+        }
+    }
+
+    pub fn fail(&mut self, e: &Error) {
+        let msg = match e {
+            Error::Io(_) | Error::Frame(_) => {
+                format!("{} {}", live_strings::FRAME_HINT, i18n::device_error(e))
+            }
+            other => i18n::device_error(other),
+        };
+        self.error = Some((msg, i18n::technical(e)));
+        // A disconnect needs no retry click: the next connection resumes.
+        if *e == Error::Disconnected {
+            self.error = None;
+            self.depth.clear();
+        }
+    }
+
+    pub fn retry(&mut self) {
+        self.error = None;
+        self.last = None;
+    }
+
+    /// The deepest key among `keys` (the first one on a tie).
+    pub fn deepest(&self, keys: &[u8]) -> Option<(u8, u16)> {
+        keys.iter()
+            .map(|&c| (c, self.depth.get(&c).copied().unwrap_or(0)))
+            .fold(None, |best: Option<(u8, u16)>, (c, d)| match best {
+                Some((_, bd)) if bd >= d => best,
+                _ => Some((c, d)),
+            })
+    }
+}
+
+/// Live view decoration: the depth in mm under the legend, the key tinted by
+/// how deep it is, and an accent border once it is past its actuation point.
+fn live_decoration(snap: Option<&DeviceSnapshot>, live: &LiveDepth, code: u8) -> KeyDecoration {
+    let Some(s) = snap else {
+        return KeyDecoration::default();
+    };
+    let depth = live.depth.get(&code).copied().unwrap_or(0);
+    let (actuation, max) = match s.keys.get(&code) {
+        Some(k) => (k.actuation.0, switch_max(s.model, k.switch)),
+        None => (DEFAULT_ACTUATION_UM, SAFE_MAX_TRAVEL_UM),
+    };
+    let frac = f32::from(depth.min(max)) / f32::from(max.max(1));
+    KeyDecoration {
+        label2: Some(mm_short(depth)),
+        fill: (depth > 0).then(|| {
+            color::KEY.lerp_to_gamma(Color32::from_rgb(0x5A, 0x40, 0x10), frac.clamp(0.0, 1.0))
+        }),
+        stroke: (depth > 0 && depth >= actuation).then_some(color::ACCENT),
+        badge: None,
+    }
 }
 
 #[cfg(test)]
@@ -1574,5 +1795,83 @@ mod tests {
         assert_eq!(w.label2.as_deref(), Some("2.00"));
         assert!(w.stroke.is_none() && w.badge.is_none());
         assert_eq!(decorate(None, 0x04), KeyDecoration::default());
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use crate::app::test_support::snapshot68;
+
+    fn frame(snap: &DeviceSnapshot, f: impl Fn(u8) -> u16) -> TravelFrame {
+        let mut um = [[0u16; 21]; 6];
+        for (r, c, code) in snap.matrix.keys() {
+            um[usize::from(r)][usize::from(c)] = f(code);
+        }
+        TravelFrame { um }
+    }
+
+    #[test]
+    fn frames_map_to_keys_by_matrix_position() {
+        let snap = snapshot68();
+        let mut l = LiveDepth::default();
+        l.apply(&snap, &frame(&snap, |c| if c == 0x1A { 1290 } else { 0 }));
+        assert_eq!(l.depth[&0x1A], 1290);
+        assert_eq!(l.depth[&0x04], 0);
+        assert_eq!(l.depth.len(), snap.matrix.len());
+        // The deepest key, overall or among a selection.
+        let all: Vec<u8> = snap.matrix.keys().map(|(_, _, c)| c).collect();
+        assert_eq!(l.deepest(&all), Some((0x1A, 1290)));
+        assert_eq!(l.deepest(&[0x04, 0x16]), Some((0x04, 0)));
+        assert_eq!(l.deepest(&[]), None);
+    }
+
+    #[test]
+    fn one_poll_in_flight_paced_and_paused_after_an_error() {
+        let t0 = Instant::now();
+        let mut l = LiveDepth::default();
+        assert!(!l.due(false, t0), "only while the live view is shown");
+        assert!(l.due(true, t0));
+        l.last = Some(t0);
+        assert!(!l.due(true, t0 + Duration::from_millis(10)));
+        assert!(l.due(true, t0 + LIVE_INTERVAL));
+        // A frame that does not parse: a clear message, polling paused.
+        l.fail(&Error::Io("RM6X21 answered with SUB 3".into()));
+        let (msg, tech) = l.error.clone().unwrap();
+        assert!(msg.starts_with(live_strings::FRAME_HINT), "{msg}");
+        assert!(tech.contains("RM6X21"));
+        assert!(!l.due(true, t0 + Duration::from_secs(9)));
+        l.retry();
+        assert!(l.due(true, t0 + Duration::from_secs(9)));
+        // A disconnect needs no retry; old depths are dropped.
+        l.depth.insert(0x1A, 500);
+        l.fail(&Error::Disconnected);
+        assert!(l.error.is_none());
+        assert!(l.depth.is_empty());
+    }
+
+    #[test]
+    fn keys_past_their_actuation_point_are_outlined() {
+        let snap = snapshot68(); // W A S D at 0.40 mm, the rest at 2.00 mm
+        let mut l = LiveDepth::default();
+        l.apply(
+            &snap,
+            &frame(&snap, |c| match c {
+                0x1A => 500,  // W, past 0.40
+                0x0A => 1000, // G, short of 2.00
+                _ => 0,
+            }),
+        );
+        let w = live_decoration(Some(&snap), &l, 0x1A);
+        assert_eq!(w.label2.as_deref(), Some("0.50"));
+        assert_eq!(w.stroke, Some(color::ACCENT));
+        assert!(w.fill.is_some());
+        let g = live_decoration(Some(&snap), &l, 0x0A);
+        assert_eq!(g.stroke, None);
+        assert!(g.fill.is_some());
+        let rest = live_decoration(Some(&snap), &l, 0x29);
+        assert_eq!(rest.fill, None);
+        assert_eq!(rest.label2.as_deref(), Some("0.00"));
+        assert_eq!(live_decoration(None, &l, 0x1A), KeyDecoration::default());
     }
 }

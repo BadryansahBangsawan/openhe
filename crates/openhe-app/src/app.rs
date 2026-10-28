@@ -229,6 +229,12 @@ impl OpenHeApp {
         self.calibration.preview(done, pressed);
     }
 
+    /// Screenshot hook: see `pages::performance::Page::preview_live`.
+    #[cfg(feature = "preview")]
+    pub fn preview_live_depth(&mut self, depths: &[(u8, u16)], select: &[u8]) {
+        self.performance.preview_live(depths, select);
+    }
+
     /// Polls the top-bar switch job and starts a new one if asked.
     fn run_topbar(&mut self, action: TopbarAction) {
         if let Some(sw) = self.switch.as_mut() {
