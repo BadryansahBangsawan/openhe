@@ -2,9 +2,13 @@
 //! `docs/design/mockups/06-kalibrasi.png`, PROTOCOL 3.4).
 //!
 //! Flow: `start_calibration`, then poll live travel and the calibration
-//! values every 60 ms (one quiet job in flight at a time). A key counts as
-//! calibrated once its travel reaches `max travel - top deadzone - bottom
-//! deadzone - 0.1 mm` ([`calibrated_threshold`]). "Simpan" and "Batal" both
+//! values as fast as the replies come back (one quiet job in flight, at
+//! least [`MIN_POLL_GAP`] between starts). A key counts as calibrated once
+//! its peak travel this session reaches `max travel - top deadzone - bottom
+//! deadzone - 0.1 mm` ([`calibrated_threshold`]); the peak is held, so the
+//! key stays marked after release. A press that bottoms out entirely
+//! between two samples is still invisible to the app; fast polling keeps
+//! that window short. "Simpan" and "Batal" both
 //! end with `stop_calibration` (the protocol has only one close command).
 //!
 //! The keyboard types nothing while it calibrates, so calibration is
@@ -85,8 +89,11 @@ mod strings {
 }
 use strings as t;
 
-/// How often progress is polled while calibrating (PROTOCOL 2.3).
-pub const POLL_INTERVAL: Duration = Duration::from_millis(60);
+/// Shortest time between the starts of two progress polls. A poll (four
+/// RM6X21 requests) usually takes longer, so polling runs back to back:
+/// the official app's fixed 60 ms (PROTOCOL 3.4) missed quick presses on
+/// hardware.
+pub const MIN_POLL_GAP: Duration = Duration::from_millis(15);
 /// Step 1: the keyboard measures the rest position; keys pressed meanwhile
 /// do not count.
 pub const SETTLE: Duration = Duration::from_secs(2);
@@ -149,7 +156,8 @@ pub fn poll_job<T: Transport>(kb: &mut Keyboard<T>) -> Result<Sample, Error> {
 pub struct Progress {
     /// Travel right now, µm.
     pub current: BTreeMap<u8, u16>,
-    /// Deepest travel seen since the start, µm.
+    /// Deepest travel seen since Mulai (counting samples only), µm. A new
+    /// session starts from an empty `Progress`.
     pub peak: BTreeMap<u8, u16>,
     /// Keys that reached their threshold (sticky).
     pub done: BTreeSet<u8>,
@@ -174,10 +182,11 @@ impl Progress {
             if !count {
                 continue;
             }
+            // Peak hold: the deepest travel of the session decides.
             let peak = self.peak.entry(code).or_insert(0);
             *peak = (*peak).max(*tr);
             let (max, top, bottom) = key_limits(snap.model, snap, code);
-            if *tr >= calibrated_threshold(max, top, bottom) {
+            if *peak >= calibrated_threshold(max, top, bottom) {
                 self.done.insert(code);
             }
         }
@@ -324,7 +333,7 @@ impl Lifecycle {
         }
         if self
             .last_poll
-            .is_some_and(|t| now.duration_since(t) < POLL_INTERVAL)
+            .is_some_and(|t| now.duration_since(t) < MIN_POLL_GAP)
         {
             return None;
         }
@@ -606,7 +615,7 @@ impl Page {
         let cmd = self.life.tick(now);
         self.exec(worker, cmd);
         if self.life.is_active() {
-            ui.request_repaint_after(POLL_INTERVAL);
+            ui.request_repaint_after(MIN_POLL_GAP);
         }
     }
 
@@ -1139,14 +1148,64 @@ mod tests {
         assert!(lo >= 3000 && hi > lo);
     }
 
+    /// The peak of a press is held: a key is marked once any sample of the
+    /// session reached its threshold, even if the next sample shows it
+    /// released or only half pressed.
+    #[test]
+    fn a_quick_press_is_held_by_its_peak() {
+        let snap = snapshot68();
+        let mut p = Progress::default();
+        for depth in [1500, 2950, 400, 0] {
+            p.apply(
+                &snap,
+                &sample(&snap, |c| if c == 0x1A { depth } else { 0 }),
+                true,
+            );
+        }
+        assert_eq!(p.peak[&0x1A], 2950);
+        assert!(p.done.contains(&0x1A));
+        assert_eq!(p.current[&0x1A], 0, "released now");
+        // Two half presses never add up.
+        for depth in [2000, 0, 2100] {
+            p.apply(
+                &snap,
+                &sample(&snap, |c| if c == 0x04 { depth } else { 0 }),
+                true,
+            );
+        }
+        assert!(!p.done.contains(&0x04));
+    }
+
+    #[test]
+    fn mulai_resets_the_peaks() {
+        use crate::app::test_support::offline_worker;
+        let snap = snapshot68();
+        let mut page = Page::default();
+        page.progress.apply(&snap, &sample(&snap, |_| 3400), true);
+        assert!(!page.progress.peak.is_empty() && !page.progress.done.is_empty());
+        let w = offline_worker();
+        let cmd = page.life.start();
+        page.exec(&w, cmd);
+        assert!(
+            page.progress.peak.is_empty(),
+            "peaks of the last session gone"
+        );
+        assert!(page.progress.done.is_empty());
+        w.set_calibration_guard(false);
+    }
+
     fn running(l: &mut Lifecycle, now: Instant) {
         assert_eq!(l.start(), Some(Cmd::Start));
         assert_eq!(l.started(Ok(()), now), None);
         assert!(l.is_running());
     }
 
+    /// A quick press can bottom out between two samples, so polling runs
+    /// as fast as the replies come back: one job in flight, the next as
+    /// soon as it finished, but never sooner than 15 ms after the last one
+    /// started.
     #[test]
-    fn lifecycle_polls_one_at_a_time_every_60ms() {
+    fn lifecycle_polls_one_at_a_time_as_fast_as_replies_allow() {
         let t0 = Instant::now();
         let mut l = Lifecycle::default();
         assert_eq!(l.tick(t0), None, "idle: no polling");
@@ -1154,8 +1213,11 @@ mod tests {
         assert_eq!(l.tick(t0), Some(Cmd::Poll));
         assert_eq!(l.tick(t0 + Duration::from_secs(1)), None, "one in flight");
         assert_eq!(l.polled::<()>(&Ok(())), None);
-        assert_eq!(l.tick(t0 + Duration::from_millis(30)), None, "not due yet");
-        assert_eq!(l.tick(t0 + Duration::from_millis(60)), Some(Cmd::Poll));
+        assert_eq!(l.tick(t0 + Duration::from_millis(10)), None, "minimum gap");
+        assert_eq!(l.tick(t0 + Duration::from_millis(15)), Some(Cmd::Poll));
+        // A slow reply (40 ms): the next poll goes out right away.
+        assert_eq!(l.polled::<()>(&Ok(())), None);
+        assert_eq!(l.tick(t0 + Duration::from_millis(55)), Some(Cmd::Poll));
         assert!(!l.counting(t0 + Duration::from_millis(1999)));
         assert!(l.counting(t0 + SETTLE));
     }
