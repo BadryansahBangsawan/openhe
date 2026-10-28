@@ -476,22 +476,23 @@ impl KeyboardView {
             let is_hover = hovered == Some(k.code);
             // Each key is its own accessibility node (screen readers, UI
             // tests), named like its hover text; clicks go to the board.
-            ui.ctx().accesskit_node_builder(response.id.with(k.code), |n| {
-                n.set_role(egui::accesskit::Role::Button);
-                n.set_label(format!("{} · 0x{:02X}", keycodes::legend(k.code), k.code));
-                n.set_bounds(egui::accesskit::Rect {
-                    x0: r.min.x.into(),
-                    y0: r.min.y.into(),
-                    x1: r.max.x.into(),
-                    y1: r.max.y.into(),
+            ui.ctx()
+                .accesskit_node_builder(response.id.with(k.code), |n| {
+                    n.set_role(egui::accesskit::Role::Button);
+                    n.set_label(format!("{} · 0x{:02X}", keycodes::legend(k.code), k.code));
+                    n.set_bounds(egui::accesskit::Rect {
+                        x0: r.min.x.into(),
+                        y0: r.min.y.into(),
+                        x1: r.max.x.into(),
+                        y1: r.max.y.into(),
+                    });
+                    if selected {
+                        n.set_selected(true);
+                    }
+                    if !self.enabled {
+                        n.set_disabled();
+                    }
                 });
-                if selected {
-                    n.set_selected(true);
-                }
-                if !self.enabled {
-                    n.set_disabled();
-                }
-            });
             let fill = deco.fill.unwrap_or(if selected {
                 Color32::from_rgb(0x33, 0x27, 0x10)
             } else if is_hover {

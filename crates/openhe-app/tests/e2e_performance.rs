@@ -1,8 +1,8 @@
 //! Performa end to end: the real page on the simulated keyboard.
 
 mod support;
-use support::sim::Reject;
 use eframe::egui::accesskit::Role;
+use support::sim::Reject;
 use support::*;
 
 const W: u8 = 0x1A;

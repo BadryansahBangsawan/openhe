@@ -52,7 +52,10 @@ fn mt_create_edit_clear() {
     w.apply("Hapus");
     assert_eq!(nibble(&w, G), 0);
     assert!(!w.has("G · MT"));
-    assert_eq!(w.snapshot().keys[&G].mode.advanced, openhe_proto::key::Advanced::None);
+    assert_eq!(
+        w.snapshot().keys[&G].mode.advanced,
+        openhe_proto::key::Advanced::None
+    );
 }
 
 #[test]
@@ -78,7 +81,10 @@ fn tgl_and_end_and_type_change() {
 fn mpt_three_depths() {
     let mut w = open(H);
     w.click("MPT");
-    for (i, (search, chip)) in [("f1", "F1"), ("esc", "ESC"), ("b", "B")].iter().enumerate() {
+    for (i, (search, chip)) in [("f1", "F1"), ("esc", "ESC"), ("b", "B")]
+        .iter()
+        .enumerate()
+    {
         let _ = i;
         w.pick_code("Kosong", 0, search, chip);
     }

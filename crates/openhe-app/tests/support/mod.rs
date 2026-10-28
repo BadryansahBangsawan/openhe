@@ -152,7 +152,6 @@ impl World {
     pub fn app_mut(&mut self) -> &mut OpenHeApp {
         self.h.state_mut()
     }
-
 }
 
 pub(crate) fn collect(node: &egui_kittest::Node<'_>, out: &mut Vec<String>) {
