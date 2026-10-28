@@ -225,3 +225,24 @@ fn the_fn_key_is_locked_on_base() {
         );
     }
 }
+
+/// Pending changes belong to the profile they were made on. A top-bar
+/// switch while Remap is shown passes through a reconnect (no snapshot);
+/// the changes must still be dropped and never written to the new profile.
+#[test]
+fn pending_changes_are_dropped_on_a_profile_switch_through_the_reconnect() {
+    let mut w = remap();
+    w.click_key(CAPS, false);
+    search_pick(&mut w, "esc", "ESC");
+    assert!(w.has_text("Caps · Base"), "{:?}", w.labels());
+    w.click("3");
+    w.until("profile 3", 20, |w| {
+        w.worker.snapshot().is_some_and(|s| s.profile == 2) && !w.worker.is_restarting()
+    });
+    w.idle();
+    w.frames(3);
+    assert!(!w.has_text("Caps · Base"), "{:?}", w.labels());
+    assert!(w.has_text("Belum ada perubahan"), "{:?}", w.labels());
+    assert!(!w.enabled("Terapkan"));
+    assert_eq!(w.sim().p().key(CAPS, 0), factory_layer(CAPS, 0));
+}

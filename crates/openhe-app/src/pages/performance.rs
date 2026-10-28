@@ -179,6 +179,66 @@ pub fn max_travel(snap: &DeviceSnapshot, keys: &[u8], form: &Form, touched: &Tou
         .unwrap_or(SAFE_MAX_TRAVEL_UM)
 }
 
+/// One batch of an apply: the keys and the change they all get.
+pub type Batch = (Vec<u8>, PerformanceChange);
+
+/// Which of a key's own (untouched) travel values exceed `max`.
+fn over(s: &KeySettings, base: &PerformanceChange, max: u16) -> [bool; 3] {
+    [
+        base.actuation.is_none() && s.actuation.0 > max,
+        base.rt_press.is_none() && s.rt_press.0 > max,
+        base.rt_release.is_none() && s.rt_release.0 > max,
+    ]
+}
+
+/// The writes for an apply: [`build_change`] for every key and, when the
+/// switch changes, each key's own untouched travel values beyond the new
+/// switch clamped to it (`set_performance` refuses to keep them, and the
+/// form only shows the first key's values). Keys needing the same clamps
+/// share a batch; the key order is kept.
+pub fn plan_changes(
+    snap: &DeviceSnapshot,
+    keys: &[u8],
+    form: &Form,
+    touched: &Touched,
+) -> Vec<Batch> {
+    let base = build_change(form, touched);
+    if !touched.switch {
+        return vec![(keys.to_vec(), base)];
+    }
+    let max = switch_max(snap.model, form.switch);
+    let mut groups: Vec<([bool; 3], Vec<u8>)> = Vec::new();
+    for &k in keys {
+        let o = snap
+            .keys
+            .get(&k)
+            .map_or([false; 3], |s| over(s, &base, max));
+        match groups.iter_mut().find(|(g, _)| *g == o) {
+            Some((_, ks)) => ks.push(k),
+            None => groups.push((o, vec![k])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|([a, p, r], ks)| {
+            let mut c = base.clone();
+            let clamp = |on: bool| on.then_some(Micrometers(max));
+            c.actuation = c.actuation.or(clamp(a));
+            c.rt_press = c.rt_press.or(clamp(p));
+            c.rt_release = c.rt_release.or(clamp(r));
+            (ks, c)
+        })
+        .collect()
+}
+
+/// Some selected key has its own value beyond the chosen switch's travel.
+fn needs_clamp(snap: &DeviceSnapshot, keys: &[u8], form: &Form, touched: &Touched) -> bool {
+    touched.switch
+        && plan_changes(snap, keys, form, touched)
+            .iter()
+            .any(|(_, c)| *c != build_change(form, touched))
+}
+
 /// What the apply job hands back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
@@ -202,13 +262,30 @@ pub fn apply_job<T: Transport>(
     keys: &[u8],
     change: &PerformanceChange,
 ) -> Result<ApplyOutcome, Error> {
-    let write = kb.set_performance(keys, change);
+    apply_plan_job(kb, &[(keys.to_vec(), change.clone())])
+}
+
+/// [`apply_job`] for a plan of several batches ([`plan_changes`]): they are
+/// written in order, stopping at the first failure, then every key of the
+/// plan is re-read.
+pub fn apply_plan_job<T: Transport>(
+    kb: &mut Keyboard<T>,
+    plan: &[Batch],
+) -> Result<ApplyOutcome, Error> {
+    let mut write = Ok(());
+    for (keys, change) in plan {
+        write = kb.set_performance(keys, change);
+        if write.is_err() {
+            break;
+        }
+    }
     if write == Err(Error::Disconnected) {
         return Err(Error::Disconnected);
     }
+    let keys: Vec<u8> = plan.iter().flat_map(|(k, _)| k.iter().copied()).collect();
     let mut reloaded = Vec::with_capacity(keys.len());
     let mut reload_error = None;
-    for &k in keys {
+    for &k in &keys {
         match kb.key_settings(k) {
             Ok(s) => reloaded.push((k, s)),
             Err(Error::Disconnected) => return Err(Error::Disconnected),
@@ -285,6 +362,24 @@ pub fn apply_effects(result: Result<ApplyOutcome, Error>) -> ApplyEffects {
 
 // ------------------------------------------------------------------ page
 
+/// The keyboard state a job was submitted against: its profile and the
+/// worker's connection count. A result read back under another profile or
+/// after a reconnect is not patched into the (newer) snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentOn {
+    pub profile: u8,
+    pub connects: u64,
+}
+
+impl SentOn {
+    pub fn now(ctx: &AppCtx) -> Option<SentOn> {
+        ctx.snapshot.map(|s| SentOn {
+            profile: s.profile,
+            connects: ctx.worker.connects(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     Actuation,
@@ -298,8 +393,13 @@ pub struct Page {
     /// Selection and worker generation the form was loaded from.
     loaded_from: Option<(BTreeSet<u8>, u64)>,
     pending: Option<Pending<ApplyOutcome>>,
+    /// Profile and connection count when the pending job was submitted.
+    sent_on: Option<SentOn>,
+    /// Profile the form and its edits belong to. Kept while disconnected,
+    /// so a switch through a reconnect is seen too.
+    profile: Option<u8>,
     /// The last change sent, for "Coba lagi".
-    last_sent: Option<(Vec<u8>, PerformanceChange)>,
+    last_sent: Option<Vec<Batch>>,
     error: Option<String>,
     error_technical: Option<String>,
     applied: bool,
@@ -318,6 +418,8 @@ impl Default for Page {
             touched: Touched::default(),
             loaded_from: None,
             pending: None,
+            sent_on: None,
+            profile: None,
             last_sent: None,
             error: None,
             error_technical: None,
@@ -363,9 +465,29 @@ impl Page {
         };
         self.pending = None;
         let fx = apply_effects(result);
+        let sent_on = self.sent_on.take();
+        if sent_on.is_none() || sent_on != SentOn::now(ctx) {
+            // Read only now, after a profile switch or a reconnect: the
+            // values belong to the keyboard state of back then and the
+            // snapshot was loaded afresh since. Nothing is patched; the
+            // form reloads from the current snapshot.
+            self.error = fx.error;
+            self.error_technical = fx.technical;
+            self.applied = false;
+            if fx.applied {
+                self.touched = Touched::default();
+                self.clamped = false;
+                self.loaded_from = None;
+            }
+            return;
+        }
+        let profile = sent_on.map(|s| s.profile);
         if !fx.patch.is_empty() {
             let fresh = fx.patch.clone();
             ctx.worker.patch_snapshot(move |s| {
+                if Some(s.profile) != profile {
+                    return;
+                }
                 for (k, v) in fresh {
                     s.keys.insert(k, v);
                 }
@@ -415,6 +537,18 @@ impl Page {
         let Some(snap) = ctx.snapshot else {
             return;
         };
+        if self.profile.is_some_and(|p| p != snap.profile) {
+            // Edits (and a retry) made for another profile are dropped,
+            // never written to this one; the form reloads below.
+            self.touched = Touched::default();
+            self.applied = false;
+            self.clamped = false;
+            self.error = None;
+            self.error_technical = None;
+            self.last_sent = None;
+            self.loaded_from = None;
+        }
+        self.profile = Some(snap.profile);
         self.selection.retain_present(&snap.matrix);
         let sel = self.selection.as_set().clone();
         let generation = ctx.worker.generation();
@@ -448,14 +582,15 @@ impl Page {
         }
     }
 
-    fn submit(&mut self, ctx: &AppCtx, keys: Vec<u8>, change: PerformanceChange) {
+    fn submit(&mut self, ctx: &AppCtx, plan: Vec<Batch>) {
         self.error = None;
         self.applied = false;
-        self.last_sent = Some((keys.clone(), change.clone()));
+        self.last_sent = Some(plan.clone());
         self.error_technical = None;
+        self.sent_on = SentOn::now(ctx);
         self.pending = Some(
             ctx.worker
-                .submit("performance-apply", move |kb| apply_job(kb, &keys, &change)),
+                .submit("performance-apply", move |kb| apply_plan_job(kb, &plan)),
         );
     }
 
@@ -600,27 +735,40 @@ impl Page {
         let mut retry = false;
         Card::new().show(ui, |ui| {
             ui.set_min_size(egui::vec2(ui.available_width(), h - 42.0));
-            ui.horizontal(|ui| {
-                let title_code = focus.map(|f| f.0).or(codes.first().copied());
-                let title = match title_code {
-                    Some(c) => format!("{} · {}", t::TRAVEL, openhe_proto::keycodes::legend(c)),
-                    None => t::TRAVEL.to_string(),
-                };
-                card::title(ui, title);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let hint = match (live, codes.first()) {
-                        (false, _) => live_strings::SWITCH_TO_LIVE.to_string(),
-                        (true, Some(&c)) if codes.len() == 1 => format!(
-                            "{} {} {}",
-                            live_strings::PRESS,
-                            openhe_proto::keycodes::legend(c),
-                            live_strings::TO_SEE_LIVE
-                        ),
-                        (true, _) => live_strings::PRESS_ANY.to_string(),
-                    };
-                    ui.label(RichText::new(hint).font(font::small()).color(color::MUTED));
+            let title_code = focus.map(|f| f.0).or(codes.first().copied());
+            let title = match title_code {
+                Some(c) => format!("{} · {}", t::TRAVEL, openhe_proto::keycodes::legend(c)),
+                None => t::TRAVEL.to_string(),
+            };
+            let hint = match (live, codes.first()) {
+                (false, _) => live_strings::SWITCH_TO_LIVE.to_string(),
+                (true, Some(&c)) if codes.len() == 1 => format!(
+                    "{} {} {}",
+                    live_strings::PRESS,
+                    openhe_proto::keycodes::legend(c),
+                    live_strings::TO_SEE_LIVE
+                ),
+                (true, _) => live_strings::PRESS_ANY.to_string(),
+            };
+            // The hint sits right of the title when both fit on one row,
+            // else on its own (wrapped) row below it: never on top.
+            let width = |text: &str, f: egui::FontId| {
+                ui.fonts(|fo| fo.layout_no_wrap(text.to_string(), f, color::TEXT).size().x)
+            };
+            let one_row = width(&title, font::heading()) + 24.0 + width(&hint, font::small())
+                <= ui.available_width();
+            let hint_text = RichText::new(hint).font(font::small()).color(color::MUTED);
+            if one_row {
+                ui.horizontal(|ui| {
+                    card::title(ui, title);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(hint_text);
+                    });
                 });
-            });
+            } else {
+                card::title(ui, title);
+                ui.add(egui::Label::new(hint_text).wrap());
+            }
             ui.add_space(12.0);
             if let (true, Some((msg, tech))) = (live, &self.live.error) {
                 retry = card::error_box(
@@ -745,6 +893,9 @@ impl Page {
 
         let max = max_travel(snap, &codes, &self.form, &self.touched);
         self.clamp_to(max);
+        if needs_clamp(snap, &codes, &self.form, &self.touched) {
+            self.clamped = true;
+        }
         if self.clamped {
             card::hint(ui, format!("{} {} mm.", t::CLAMPED, mm_short(max)));
         }
@@ -869,10 +1020,11 @@ impl Page {
         card::hint(ui, t::SWITCH_HINT);
     }
 
-    /// After the user picks a switch with less travel, values beyond it are
-    /// clamped **and marked touched**, so the clamped value is what gets
-    /// sent (`set_performance` would refuse to keep them) and a note says
-    /// so. Without a switch change nothing is clamped: a value outside the
+    /// After the user picks a switch with less travel, the form's values
+    /// beyond it are clamped for display and a note says so. They are not
+    /// marked touched: [`plan_changes`] clamps each selected key's own value
+    /// (the form only shows the first key's), so other keys keep theirs.
+    /// Without a switch change nothing is clamped: a value outside the
     /// slider's range (another selected key's switch) is shown as it is and
     /// is not sent unless edited.
     fn clamp_to(&mut self, max: u16) {
@@ -882,13 +1034,11 @@ impl Page {
         let f = &mut self.form;
         if f.actuation > max {
             f.actuation = max;
-            self.touched.actuation = true;
             self.clamped = true;
         }
         if f.rt_press > max || f.rt_release > max {
             f.rt_press = f.rt_press.min(max);
             f.rt_release = f.rt_release.min(max);
-            self.touched.rt = true;
             self.clamped = true;
         }
     }
@@ -905,8 +1055,8 @@ impl Page {
                 self.error_technical.as_deref(),
             );
             if clicked {
-                if let Some((keys, change)) = self.last_sent.clone() {
-                    self.submit(ctx, keys, change);
+                if let Some(plan) = self.last_sent.clone() {
+                    self.submit(ctx, plan);
                 }
             }
             ui.add_space(8.0);
@@ -915,8 +1065,11 @@ impl Page {
         let can_apply = idle && !self.selection.is_empty() && self.touched.any();
         if card::primary_button(ui, t::APPLY, can_apply).clicked() {
             let keys = self.ordered(ctx);
-            let change = build_change(&self.form, &self.touched);
-            self.submit(ctx, keys, change);
+            let plan = match ctx.snapshot {
+                Some(snap) => plan_changes(snap, &keys, &self.form, &self.touched),
+                None => vec![(keys, build_change(&self.form, &self.touched))],
+            };
+            self.submit(ctx, plan);
         }
         ui.add_space(6.0);
         ui.vertical_centered(|ui| {
@@ -952,16 +1105,17 @@ impl Page {
 }
 
 /// Per-key decoration: actuation value, a stroke when it differs from the
-/// factory default, and an "RT" badge for rapid-trigger keys.
+/// factory default, and an accent dot (badge) for rapid-trigger keys.
 fn decorate(snap: Option<&DeviceSnapshot>, code: u8) -> KeyDecoration {
     let Some(s) = snap.and_then(|s| s.keys.get(&code)) else {
         return KeyDecoration::default();
     };
     KeyDecoration {
-        label2: Some(mm_short(s.actuation.0)),
+        label2: Some(mm_short(s.actuation.0).into()),
         fill: None,
         stroke: (s.actuation.0 != DEFAULT_ACTUATION_UM).then_some(color::INFO.gamma_multiply(0.7)),
-        badge: (s.mode.touch == TouchMode::RapidTrigger).then(|| ("RT".to_string(), color::ACCENT)),
+        // A dot (the legend explains it): an "RT" pill crowded the legend.
+        badge: (s.mode.touch == TouchMode::RapidTrigger).then(|| (String::new(), color::ACCENT)),
     }
 }
 
@@ -1051,20 +1205,12 @@ fn legend_row(ui: &mut Ui, swatch: Swatch, text: &str) {
             Swatch::Selected => (color::ACCENT_SOFT, line(1.5, color::ACCENT)),
             Swatch::Plain => (color::KEY, line(1.0, color::BORDER_STRONG)),
             Swatch::Changed => (color::KEY, line(1.0, color::INFO.gamma_multiply(0.7))),
-            Swatch::Rt => (
-                color::ACCENT.gamma_multiply(0.18),
-                line(0.0, Color32::TRANSPARENT),
-            ),
+            Swatch::Rt => (color::KEY, line(1.0, color::BORDER_STRONG)),
         };
         p.rect(r, radius, fill, stroke, StrokeKind::Inside);
         if let Swatch::Rt = swatch {
-            p.text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                "RT",
-                egui::FontId::proportional(8.5),
-                color::ACCENT,
-            );
+            // Like the keys: an accent dot in the top-right corner.
+            p.circle_filled(r.right_top() + egui::vec2(-5.5, 5.5), 2.8, color::ACCENT);
         }
         ui.label(RichText::new(text).color(color::TEXT));
     });
@@ -1350,7 +1496,7 @@ fn live_decoration(snap: Option<&DeviceSnapshot>, live: &LiveDepth, code: u8) ->
     };
     let frac = f32::from(depth.min(max)) / f32::from(max.max(1));
     KeyDecoration {
-        label2: Some(mm_short(depth)),
+        label2: Some(mm_short(depth).into()),
         fill: (depth > 0).then(|| {
             color::KEY.lerp_to_gamma(Color32::from_rgb(0x5A, 0x40, 0x10), frac.clamp(0.0, 1.0))
         }),
@@ -1566,7 +1712,7 @@ mod tests {
                 theme: &theme,
                 data: &data,
             };
-            page.submit(&app_ctx, page.selection.codes(), change.clone());
+            page.submit(&app_ctx, vec![(page.selection.codes(), change.clone())]);
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while page.pending.is_some() {
@@ -1574,7 +1720,10 @@ mod tests {
             frame(&mut page, 1);
         }
         assert_eq!(page.error.as_deref(), Some(t::PARTIAL_WRITE));
-        assert_eq!(page.last_sent, Some((vec![0x04, 0x07, 0x16, 0x1A], change)));
+        assert_eq!(
+            page.last_sent,
+            Some(vec![(vec![0x04, 0x07, 0x16, 0x1A], change)])
+        );
         assert!(page.touched.actuation, "edits survive a failed apply");
         assert_eq!(page.form.actuation, 550);
         frame(&mut page, 2); // the error box renders without panicking
@@ -1800,13 +1949,56 @@ mod tests {
         page.clamp_to(3300);
         assert_eq!(page.form.actuation, 3400);
         assert!(!page.touched.any() && !page.clamped);
-        // After choosing a 3.3 mm switch both values are clamped and sent.
+        // After choosing a 3.3 mm switch the form shows the clamped values;
+        // they are sent per key by `plan_changes`, not as edits.
         page.touched.switch = true;
         page.clamp_to(3300);
         assert_eq!((page.form.actuation, page.form.rt_press), (3300, 3300));
-        assert!(page.touched.actuation && page.touched.rt && page.clamped);
-        let c = build_change(&page.form, &page.touched);
-        assert_eq!(c.actuation, Some(Micrometers(3300)));
+        assert!(page.clamped);
+        assert!(!page.touched.actuation && !page.touched.rt);
+    }
+
+    #[test]
+    fn a_switch_change_clamps_each_keys_own_values() {
+        let mut long = settings(TouchMode::RapidTrigger, 3400, 0);
+        long.rt_release = Micrometers(3400);
+        let short = settings(TouchMode::Single, 1000, 0);
+        let s = snap(&[(0x14, short), (0x1A, long), (0x04, short)]);
+        let form = Form {
+            switch: 3, // Magneto, 3.3 mm
+            ..Form::from_keys(&[0x14], &s).unwrap()
+        };
+        // Only the switch: Q and A keep their values, W is clamped.
+        let touched = Touched {
+            switch: true,
+            ..Touched::default()
+        };
+        let plan = plan_changes(&s, &[0x14, 0x1A, 0x04], &form, &touched);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].0, vec![0x14, 0x04]);
+        assert_eq!(plan[0].1.actuation, None);
+        assert_eq!(plan[0].1.switch, Some(3));
+        assert_eq!(plan[1].0, vec![0x1A]);
+        assert_eq!(plan[1].1.actuation, Some(Micrometers(3300)));
+        assert_eq!(plan[1].1.rt_press, None, "0.15 mm fits");
+        assert_eq!(plan[1].1.rt_release, Some(Micrometers(3300)));
+        assert!(needs_clamp(&s, &[0x14, 0x1A], &form, &touched));
+        assert!(!needs_clamp(&s, &[0x14, 0x04], &form, &touched));
+        // An edited actuation goes to every key as it is; W's release is
+        // still clamped.
+        let touched = Touched {
+            actuation: true,
+            ..touched
+        };
+        let plan = plan_changes(&s, &[0x14, 0x1A], &form, &touched);
+        assert_eq!(plan.len(), 2);
+        assert!(plan
+            .iter()
+            .all(|(_, c)| c.actuation == Some(Micrometers(1000))));
+        assert_eq!(plan[1].1.rt_release, Some(Micrometers(3300)));
+        // Without a switch change there is one batch, nothing added.
+        let plan = plan_changes(&s, &[0x14, 0x1A], &form, &Touched::default());
+        assert_eq!(plan, vec![(vec![0x14, 0x1A], PerformanceChange::default())]);
     }
 
     #[test]
@@ -1818,7 +2010,7 @@ mod tests {
         let a = decorate(Some(&s), 0x04);
         assert_eq!(a.label2.as_deref(), Some("0.40"));
         assert!(a.stroke.is_some());
-        assert_eq!(a.badge.map(|b| b.0), Some("RT".to_string()));
+        assert_eq!(a.badge.map(|b| b.0), Some(String::new()));
         let w = decorate(Some(&s), 0x1A);
         assert_eq!(w.label2.as_deref(), Some("2.00"));
         assert!(w.stroke.is_none() && w.badge.is_none());

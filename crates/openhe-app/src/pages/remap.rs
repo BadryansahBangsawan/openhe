@@ -21,6 +21,7 @@
 
 use crate::app::{page_with_right_panel, AppCtx};
 use crate::i18n;
+use crate::pages::performance::SentOn;
 use crate::theme::{color, font, line, size};
 use crate::widgets::card::{self, Card};
 use crate::widgets::keyboard::{
@@ -291,7 +292,9 @@ pub fn short_code_name(code: u16) -> String {
     }
     match keycodes::lookup(code) {
         Some(k) if !k.label.starts_with("i18n:") && !is_placeholder(k) => abbreviate(k.label),
-        _ => unknown(code),
+        // Not in the vendor table (e.g. the factory Fn1 Caps code 0xF344,
+        // PROTOCOL 7 finding 17): the bare code fits a cap, "Kode" does not.
+        _ => format!("0x{code:04X}"),
     }
 }
 
@@ -892,6 +895,12 @@ pub struct Page {
     confirm_reset: bool,
     /// Worker generation and profile the cache belongs to.
     seen: Option<(u64, u8)>,
+    /// Profile the pending changes (and "Coba lagi") belong to. Unlike
+    /// `seen` it survives a disconnect, so a profile switch through a
+    /// reconnect still drops them.
+    profile: Option<u8>,
+    /// Profile and connection count when the pending apply was submitted.
+    sent_on: Option<SentOn>,
 }
 
 impl Default for Page {
@@ -914,6 +923,8 @@ impl Default for Page {
             notice: None,
             confirm_reset: false,
             seen: None,
+            profile: None,
+            sent_on: None,
         }
     }
 }
@@ -939,7 +950,7 @@ pub fn decoration(
 ) -> KeyDecoration {
     if is_locked(layer, key) {
         return KeyDecoration {
-            label2: Some(t::LOCKED_BADGE.to_string()),
+            label2: Some(t::LOCKED_BADGE.into()),
             fill: None,
             stroke: Some(color::FAINT),
             badge: None,
@@ -947,7 +958,7 @@ pub fn decoration(
     }
     if let Some(code) = pending {
         return KeyDecoration {
-            label2: Some(short_code_name(code)),
+            label2: Some(short_code_name(code).into()),
             fill: Some(color::ACCENT_SOFT),
             stroke: Some(color::ACCENT),
             badge: None,
@@ -969,14 +980,14 @@ pub fn decoration(
     }
     if layer == Layer::Base && code == TRANSPARENT {
         return KeyDecoration {
-            label2: Some(layer_short_code_name(layer, code)),
+            label2: Some(layer_short_code_name(layer, code).into()),
             fill: None,
             stroke: Some(color::DANGER),
             badge: None,
         };
     }
     KeyDecoration {
-        label2: Some(short_code_name(code)),
+        label2: Some(short_code_name(code).into()),
         fill: None,
         stroke: (!unchanged).then(|| color::INFO.gamma_multiply(0.7)),
         badge: None,
@@ -1048,6 +1059,16 @@ impl Page {
     fn finish_apply(&mut self, ctx: &AppCtx, result: Result<ApplyOutcome, Error>) {
         let sent = self.last_sent.clone().map(|(e, _)| e).unwrap_or_default();
         let fx = apply_effects(&sent, result);
+        let sent_on = self.sent_on.take();
+        if sent_on.is_none() || sent_on != SentOn::now(ctx) {
+            // Read after a profile switch or a reconnect: the codes read
+            // back then are not this keyboard state's; read the layer again.
+            self.clear_cache();
+            self.error = fx.error;
+            self.error_technical = fx.technical;
+            self.applied = false;
+            return;
+        }
         if fx.invalidate {
             self.clear_cache();
         }
@@ -1100,13 +1121,21 @@ impl Page {
             Some((g, p)) if g != generation || p != snap.profile => {
                 self.clear_cache();
                 self.read_error = None;
-                if p != snap.profile {
-                    self.changes.clear();
-                }
             }
             _ => {}
         }
         self.seen = Some((generation, snap.profile));
+        if self.profile.is_some_and(|p| p != snap.profile) {
+            // Made for another profile: never written to this one.
+            self.changes.clear();
+            self.last_sent = None;
+            self.error = None;
+            self.error_technical = None;
+            self.applied = false;
+            self.notice = None;
+            self.confirm_reset = false;
+        }
+        self.profile = Some(snap.profile);
         if self.read.is_none()
             && self.pending.is_none()
             && self.wants_read(self.layer)
@@ -1130,6 +1159,7 @@ impl Page {
         self.error_technical = None;
         self.applied = false;
         self.last_sent = Some((entries.clone(), kind));
+        self.sent_on = SentOn::now(ctx);
         self.pending = Some(
             ctx.worker
                 .submit("remap-apply", move |kb| apply_job(kb, &entries)),
@@ -1230,6 +1260,12 @@ impl Page {
             }
         };
 
+        let hint = if self.layer == Layer::Base {
+            t::HINT_BASE
+        } else {
+            t::HINT_FN
+        };
+        let mut hint_inline = true;
         ui.horizontal(|ui| {
             ui.set_min_height(40.0);
             ui.label(RichText::new(t::LAYER).color(color::MUTED));
@@ -1240,15 +1276,18 @@ impl Page {
             if self.layer != old {
                 self.confirm_reset = false;
             }
-            ui.label(
-                RichText::new(if self.layer == Layer::Base {
-                    t::HINT_BASE
-                } else {
-                    t::HINT_FN
-                })
-                .font(font::small())
-                .color(color::MUTED),
-            );
+            // The hint goes beside the layers only when it fits left of the
+            // reset button, else on its own row below (never under it).
+            let measure = |text: &str, f: egui::FontId| {
+                ui.fonts(|fo| fo.layout_no_wrap(text.to_string(), f, color::TEXT).size().x)
+            };
+            let button_w = measure(t::RESET, font::body()) + 2.0 * ui.spacing().button_padding.x;
+            hint_inline =
+                measure(hint, font::small()) + button_w + 3.0 * ui.spacing().item_spacing.x
+                    <= ui.available_width();
+            if hint_inline {
+                ui.label(RichText::new(hint).font(font::small()).color(color::MUTED));
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let supported = reset_supported(model, self.layer);
                 let enabled = self.editable(ctx) && supported;
@@ -1266,6 +1305,13 @@ impl Page {
                 }
             });
         });
+        if !hint_inline {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(RichText::new(hint).font(font::small()).color(color::MUTED))
+                    .wrap(),
+            );
+        }
         if self.confirm_reset {
             ui.add_space(8.0);
             Card::new()
@@ -1481,20 +1527,31 @@ impl Page {
                 ui.horizontal(|ui| {
                     let original = code_of(&self.codes, layer, first);
                     let new = self.changes.get(layer, first);
-                    cap_tile(
-                        ui,
-                        t::ORIGINAL,
-                        &original
-                            .map_or(t::UNREAD.to_string(), |c| layer_short_code_name(layer, c)),
-                        false,
-                    );
+                    // "Ikut Base" on a Fn layer: the tile shows the key it
+                    // falls through to, the caption says why.
+                    let follows = |c: Option<u16>| layer != Layer::Base && c == Some(TRANSPARENT);
+                    let legend = openhe_proto::keycodes::legend(first).to_string();
+                    let follow_caption = short_code_name(TRANSPARENT);
+                    let (text, caption) = if follows(original) {
+                        (legend.clone(), follow_caption.as_str())
+                    } else {
+                        (
+                            original
+                                .map_or(t::UNREAD.to_string(), |c| layer_short_code_name(layer, c)),
+                            t::ORIGINAL,
+                        )
+                    };
+                    cap_tile(ui, caption, &text, false);
                     ui.label(RichText::new("→").font(font::title()).color(color::MUTED));
-                    cap_tile(
-                        ui,
-                        t::NEW,
-                        &new.map_or(t::UNCHANGED.to_string(), short_code_name),
-                        new.is_some(),
-                    );
+                    let (text, caption) = if follows(new) {
+                        (legend, follow_caption.as_str())
+                    } else {
+                        (
+                            new.map_or(t::UNCHANGED.to_string(), short_code_name),
+                            t::NEW,
+                        )
+                    };
+                    cap_tile(ui, caption, &text, new.is_some());
                 });
             });
             ui.add_space(10.0);
@@ -1942,6 +1999,7 @@ mod tests {
         // Unknown codes from the factory Fn tables.
         assert_eq!(code_name(0x6152), "Kode 0x6152");
         assert_eq!(code_name(0xF344), "Kode 0xF344");
+        assert_eq!(short_code_name(0xF344), "0xF344");
     }
 
     /// Left and right modifiers carry the same vendor label ("Ctrl"), so
@@ -2547,6 +2605,7 @@ mod tests {
         let mut page = Page::default();
         let entries = vec![(0x1A, Layer::Fn2, 0x52)];
         page.last_sent = Some((entries.clone(), Sent::Changes));
+        page.sent_on = with_ctx(&worker, SentOn::now);
         page.changes.queue(Layer::Fn2, &[0x1A], 0x52, none);
         let ok = ApplyOutcome {
             write: Ok(()),
@@ -2575,6 +2634,7 @@ mod tests {
         page.codes
             .insert(0, BTreeMap::from([(0x04, 0x04), (0x05, 0x05)]));
         page.last_sent = Some((vec![(0x04, Layer::Base, 0x06)], Sent::Changes));
+        page.sent_on = with_ctx(&worker, SentOn::now);
         let gen = worker.generation();
         page.seen = Some((gen.wrapping_sub(1), 1)); // the snapshot reloaded since
         with_ctx(&worker, |c| page.sync(c));

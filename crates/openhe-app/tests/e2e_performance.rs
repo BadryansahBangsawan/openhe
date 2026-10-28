@@ -119,3 +119,77 @@ fn a_rejected_write_shows_the_error_and_the_values_the_keyboard_kept() {
     assert_eq!(w.sim().p().key(0x14, ACT), 1500);
     assert!(!w.has("Gagal menerapkan"));
 }
+
+/// A shorter switch on several keys: a key other than the first one may
+/// hold values beyond it. Each key is clamped to the new travel, the others
+/// keep their own values, and the write goes through.
+#[test]
+fn a_shorter_switch_on_several_keys_clamps_every_key() {
+    let mut w = World::new();
+    w.click_key(W, false);
+    w.edit_value("2.000 mm", 0, "3.4");
+    w.apply("Terapkan ke keyboard");
+    assert_eq!(w.sim().p().key(W, ACT), 3400);
+    w.click_key(0x14, false);
+    w.click_key(W, true);
+    w.click_role(Role::ComboBox, 0);
+    w.click_text("Magneto");
+    assert!(w.has_text("disesuaikan ke batasnya"), "{:?}", w.labels());
+    w.apply("Terapkan ke keyboard");
+    assert!(!w.has("Gagal menerapkan"), "{:?}", w.labels());
+    let s = w.sim();
+    assert_eq!(s.p().key(0x14, AXIS), 3);
+    assert_eq!(s.p().key(W, AXIS), 3);
+    assert_eq!(s.p().key(W, ACT), 3300, "W clamped");
+    assert_eq!(s.p().key(0x14, ACT), 2000, "Q keeps its own value");
+}
+
+/// Top-bar switch to profile `label` ("3"), waiting for the reconnect.
+fn switch_profile(w: &mut World, label: &str) {
+    let want: u8 = label.parse::<u8>().unwrap() - 1;
+    w.click(label);
+    w.until("profile switched", 20, |w| {
+        w.worker.snapshot().is_some_and(|s| s.profile == want) && !w.worker.is_restarting()
+    });
+    w.idle();
+}
+
+/// Unsent edits belong to the profile they were made on: a top-bar switch
+/// (through the reconnect, Performa shown) drops them and the form shows
+/// the new profile's values.
+#[test]
+fn unsent_edits_are_dropped_on_a_profile_switch() {
+    let mut w = World::new();
+    w.sim().profiles[2].keys.insert((0x14, ACT), 1200);
+    w.click_key(0x14, false);
+    w.edit_value("2.000 mm", 0, "1.5");
+    assert!(w.enabled("Terapkan ke keyboard"));
+    switch_profile(&mut w, "3");
+    w.frames(3);
+    assert!(!w.enabled("Terapkan ke keyboard"), "{:?}", w.labels());
+    assert!(w.has_text("=1.200 mm"), "{:?}", w.labels());
+    assert_eq!(w.sim().p().key(0x14, ACT), 1200);
+    assert_eq!(w.sim().sets(0x23).len(), 0, "nothing written");
+}
+
+/// An apply finishing while another page is shown is only read by this
+/// page later; by then the keyboard may be on another profile, whose
+/// snapshot must not get the old profile's values.
+#[test]
+fn an_apply_read_after_a_profile_switch_is_not_patched_into_the_new_profile() {
+    let mut w = World::new();
+    w.click_key(0x14, false);
+    w.edit_value("2.000 mm", 0, "1.5");
+    w.sim().set_delay = std::time::Duration::from_millis(20);
+    w.click("Terapkan ke keyboard");
+    assert!(w.worker.is_busy());
+    w.page("Remap");
+    w.sim().set_delay = std::time::Duration::ZERO;
+    w.idle();
+    assert_eq!(w.sim().profiles[0].key(0x14, ACT), 1500);
+    switch_profile(&mut w, "3");
+    w.page("Performa");
+    w.frames(5);
+    assert_eq!(w.sim().p().key(0x14, ACT), 2000);
+    assert_eq!(w.snapshot().keys[&0x14].actuation.0, 2000, "stale patch");
+}

@@ -13,6 +13,7 @@
 use super::remap::{code_field, code_name, FN_KEY};
 use crate::app::{page_with_right_panel, AppCtx};
 use crate::i18n;
+use crate::pages::performance::SentOn;
 use crate::theme::{color, font, line, size};
 use crate::widgets::card::{self, Card};
 use crate::widgets::keyboard::{reference_matrix, KeyDecoration, KeyboardView, Selection};
@@ -111,6 +112,7 @@ mod strings {
     pub const V_FIRST: &str = "Titik aktuasi pertama harus antara 0.10 dan 3.40 mm.";
     pub const V_MT_KEYS: &str = "Pilih tombol untuk ditahan dan untuk diketuk.";
     pub const V_TGL_KEY: &str = "Pilih tombol yang ditahan.";
+    pub const V_MPT_KEYS: &str = "Pilih setidaknya satu tombol untuk salah satu kedalaman.";
     pub const V_END_KEY: &str = "Pilih tombol yang dikirim saat dilepas.";
     pub const V_DELAY: &str = "Waktu harus antara 10 dan 1000 ms.";
     pub const V_DEPTH_RANGE: &str = "Kedalaman harus antara 0.10 dan 3.40 mm.";
@@ -451,6 +453,10 @@ impl Editor {
             }
             Func::Mpt => {
                 let f = &self.mpt;
+                if f.codes.iter().all(|&c| c == 0) {
+                    // Nothing at any depth: the key would send nothing.
+                    return Err(t::V_MPT_KEYS.into());
+                }
                 if f.depths
                     .iter()
                     .any(|d| !(MIN_DEPTH_UM..=MAX_DEPTH_UM).contains(d))
@@ -938,7 +944,7 @@ pub fn decorate(
     let mut deco = KeyDecoration::default();
     if partner == Some(code) {
         deco.stroke = Some(Func::Socd.color());
-        deco.label2 = Some(Func::Socd.label().to_string());
+        deco.label2 = Some(Func::Socd.label().into());
         deco.badge = Some((DOT.to_string(), Func::Socd.color()));
         return deco;
     }
@@ -955,7 +961,7 @@ pub fn decorate(
     }
     deco.fill = Some(c.gamma_multiply(0.12));
     deco.stroke = Some(c.gamma_multiply(0.8));
-    deco.label2 = Some(text.to_string());
+    deco.label2 = Some(text.into());
     deco.badge = Some((DOT.to_string(), c));
     deco
 }
@@ -981,6 +987,8 @@ pub struct Page {
     read_failed: BTreeSet<u8>,
     read_error: Option<(String, String)>,
     pending: Option<Pending<ApplyOutcome>>,
+    /// Profile and connection count when the pending apply was submitted.
+    sent_on: Option<SentOn>,
     last_sent: Option<(u8, AdvancedConfig, Vec<u8>)>,
     error: Option<String>,
     error_technical: Option<String>,
@@ -1059,8 +1067,19 @@ impl Page {
     }
 
     fn finish_apply(&mut self, ctx: &AppCtx, result: Result<ApplyOutcome, Error>) {
-        let sent = self.last_sent.clone();
         let fx = apply_effects(result);
+        let sent_on = self.sent_on.take();
+        if sent_on.is_none() || sent_on != SentOn::now(ctx) {
+            // Read only after a profile switch or a reconnect: the snapshot
+            // and the cache were loaded afresh since, so nothing read back
+            // then is applied to them.
+            self.error = fx.error;
+            self.error_technical = fx.technical;
+            self.applied = false;
+            return;
+        }
+        let profile = sent_on.map(|s| s.profile);
+        let sent = self.last_sent.clone();
         if let Some((key, _, affected)) = sent {
             // Cached configs of every affected key are stale now.
             for k in &affected {
@@ -1074,19 +1093,27 @@ impl Page {
                         self.cache.insert(s.pos1, c);
                         self.cache.insert(s.pos2, c);
                     }
-                    if fx.applied {
-                        self.editor = Some(Editor::new(key, &c));
-                    } else if let Some(e) = self.editor.as_mut() {
-                        e.loaded = c;
+                    // The user may have selected another key meanwhile:
+                    // only the applied key's own editor is reloaded.
+                    if self.key == Some(key) {
+                        if fx.applied {
+                            self.editor = Some(Editor::new(key, &c));
+                        } else if let Some(e) = self.editor.as_mut().filter(|e| e.key == key) {
+                            e.loaded = c;
+                        }
                     }
                 }
                 // The keyboard's state is unknown: load the editor again.
-                None => self.editor = None,
+                None if self.key == Some(key) => self.editor = None,
+                None => {}
             }
         }
         if !fx.patch.is_empty() {
             let fresh = fx.patch;
             ctx.worker.patch_snapshot(move |s| {
+                if Some(s.profile) != profile {
+                    return;
+                }
                 for (k, v) in fresh {
                     s.keys.insert(k, v);
                 }
@@ -1126,7 +1153,8 @@ impl Page {
             self.read_failed.clear();
             self.editor = None;
             self.picking_partner = false;
-            self.profile = None;
+            // `profile` is kept: a reconnect onto another profile is still
+            // seen as a profile change below.
             return;
         };
         if self.profile.is_some_and(|p| p != snap.profile) {
@@ -1134,6 +1162,11 @@ impl Page {
             self.read_failed.clear();
             self.read_error = None;
             self.editor = None;
+            // "Coba lagi" must not resend the old profile's write here.
+            self.last_sent = None;
+            self.error = None;
+            self.error_technical = None;
+            self.applied = false;
         }
         self.profile = Some(snap.profile);
         self.selection.retain_present(&snap.matrix);
@@ -1168,6 +1201,15 @@ impl Page {
                     .is_some_and(|s| s.mode.advanced == c.advanced())
         });
         let nibble = |k: u8| snap.keys.get(&k).map(|s| s.mode.advanced);
+        // Never edit one key with another key's form.
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| Some(e.key) != self.key)
+        {
+            self.editor = None;
+            self.picking_partner = false;
+        }
         if let (Some(k), Some(e), false) = (self.key, self.editor.as_ref(), settle) {
             if nibble(k).is_some_and(|n| n != e.loaded.advanced()) {
                 self.editor = None;
@@ -1228,6 +1270,7 @@ impl Page {
         self.error_technical = None;
         self.applied = false;
         self.last_sent = Some((key, cfg, affected.clone()));
+        self.sent_on = SentOn::now(ctx);
         self.pending = Some(ctx.worker.submit("advanced-apply", move |kb| {
             apply_job(kb, key, &cfg, &affected)
         }));
@@ -1607,13 +1650,24 @@ fn filter_chip(
     } else {
         (color::BG, color::BORDER_STRONG, color::TEXT)
     };
-    let label = match dot {
-        Some(_) => format!("●  {text}"),
-        None => text.to_string(),
-    };
+    // The dot in the function's own colour, the name in the text colour.
+    let mut label = LayoutJob::default();
+    let style = ui.style();
+    let body = egui::TextStyle::Button.resolve(style);
+    if let Some(c) = dot {
+        label.append(
+            "●  ",
+            0.0,
+            egui::TextFormat::simple(
+                body.clone(),
+                if enabled { c } else { c.gamma_multiply(0.5) },
+            ),
+        );
+    }
+    label.append(text, 0.0, egui::TextFormat::simple(body, text_c));
     ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(label).color(text_c))
+        egui::Button::new(label)
             .fill(fill)
             .stroke(line(1.0, stroke))
             .corner_radius(CornerRadius::same(size::CONTROL_RADIUS + 2))
@@ -2198,6 +2252,17 @@ mod tests {
             assert_eq!(e.build(), Err(t::V_DEPTH_RANGE.to_string()), "{depths:?}");
         }
         e.mpt.depths = [100, 101, 3400];
+        assert!(e.build().is_ok());
+    }
+
+    #[test]
+    fn mpt_needs_at_least_one_key() {
+        let mut e = ed();
+        e.func = Func::Mpt;
+        e.mpt.codes = [0, 0, 0];
+        assert_eq!(e.build(), Err(t::V_MPT_KEYS.to_string()));
+        // One key at any depth is enough.
+        e.mpt.codes = [0, 0x29, 0];
         assert!(e.build().is_ok());
     }
 
