@@ -67,7 +67,8 @@ mod strings {
     pub const STEP3_BODY: &str = "Hasil disimpan di keyboard. Lakukan lagi kalau ganti switch.";
 
     pub const SAVED: &str = "Kalibrasi selesai dan disimpan di keyboard.";
-    pub const CANCELLED: &str = "Kalibrasi dihentikan.";
+    pub const CANCELLED: &str =
+        "Kalibrasi dihentikan. Hasil yang sudah terukur mungkin tersimpan di keyboard.";
     pub const FAILED: &str = "Kalibrasi dihentikan karena ada masalah";
     pub const FRAME_HINT: &str =
         "Data jarak tekan dari keyboard tidak terbaca. Mode kalibrasi sudah diminta berhenti.";

@@ -291,9 +291,10 @@ pub fn reset_job<T: Transport>(kb: &mut Keyboard<T>) -> Result<WriteOutcome, Err
     }
 }
 
-/// The typed confirmation for a factory reset.
+/// The typed confirmation for a factory reset: exactly "RESET" (no
+/// trimming, no other case).
 pub fn reset_confirmed(typed: &str) -> bool {
-    typed.trim() == RESET_WORD
+    typed == RESET_WORD
 }
 
 pub const RESET_WORD: &str = "RESET";
@@ -1622,7 +1623,7 @@ mod tests {
     #[test]
     fn reset_needs_the_exact_word() {
         assert!(reset_confirmed("RESET"));
-        assert!(reset_confirmed("  RESET "));
+        assert!(!reset_confirmed("  RESET "), "no trimming");
         assert!(!reset_confirmed("reset"));
         assert!(!reset_confirmed("RESE"));
         assert!(!reset_confirmed(""));

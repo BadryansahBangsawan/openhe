@@ -785,6 +785,16 @@ impl Retry {
     fn is_due(&self) -> bool {
         self.due.is_some_and(|t| Instant::now() >= t)
     }
+
+    /// True (once) when due; the next `schedule` keeps the longer delay.
+    fn take_due(&mut self) -> bool {
+        if self.is_due() {
+            self.due = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// How long the keyboard must stay quiet before an event-driven reload.
@@ -810,6 +820,9 @@ fn run<T: Transport>(
 ) {
     let mut kb: Option<Keyboard<T>> = None;
     let mut retry = Retry::new(cfg.retry_interval);
+    // Reloads after failed event polls back off on their own: a reload
+    // that works does not reset it, only a poll that works does.
+    let mut event_retry = Retry::new(cfg.retry_interval);
     let mut debounce = Debounce::new(debounce_window(&cfg));
     let mut last_idle = Instant::now();
     // When to try to connect next (a requested reconnect pauses first).
@@ -920,6 +933,7 @@ fn run<T: Transport>(
         let (polled, panicked) = guarded(|| poll_events(k));
         match polled {
             Ok(events) => {
+                event_retry.reset();
                 ctl.notices(|n| n.events_failed = None);
                 let fx = event_effects(&events);
                 if fx.profile.is_some() || fx.system_mode.is_some() {
@@ -956,14 +970,21 @@ fn run<T: Transport>(
             }
             Err(e) => {
                 ctl.notices(|n| n.events_failed = Some(e));
-                if retry.due.is_none() {
-                    retry.schedule();
+                if event_retry.due.is_none() {
+                    event_retry.schedule();
                 }
             }
         }
+        // While calibration may be running, every reload (asked for, after
+        // events, or a retry) waits until it stopped: the flags and timers
+        // stay pending meanwhile.
+        if ctl.calibrating.load(Ordering::SeqCst) {
+            continue;
+        }
         let asked = ctl.reload.swap(false, Ordering::SeqCst);
         let settled = debounce.take_due(Instant::now());
-        if asked || settled || retry.is_due() {
+        let events_retry = event_retry.take_due();
+        if asked || settled || events_retry || retry.is_due() {
             debounce.cancel();
             ctl.set_current(Some(LOAD_LABEL));
             let (loaded, panicked) = guarded(|| load_snapshot(k));
@@ -1228,6 +1249,68 @@ pub(crate) mod tests {
         wait_for("error", || {
             w.status() == ConnectionStatus::Error(i18n::error::BOOTLOADER.into())
         });
+    }
+
+    #[test]
+    fn reloads_wait_while_calibration_may_be_running() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                push_snapshot(&mut m, 2);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        w.set_calibration_guard(true);
+        w.request_reload();
+        // A profile event still shows at once, but nothing is re-read.
+        let mut p = w.submit("event", |kb| {
+            kb.session_mut()
+                .transport_mut()
+                .push_pending(order_reply(0x70, 3));
+            Ok(())
+        });
+        assert_eq!(wait_result(&mut p), Ok(()));
+        wait_for("patched", || w.snapshot().is_some_and(|s| s.profile == 3));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(w.snapshot().unwrap().profile, 3, "no reload yet");
+        // Calibration stopped: the deferred reload runs (snapshot: 2).
+        w.set_calibration_guard(false);
+        wait_for("reload", || w.snapshot().is_some_and(|s| s.profile == 2));
+        assert_eq!(w.notice(), None);
+    }
+
+    #[test]
+    fn event_poll_retries_keep_backing_off() {
+        // The retry after a failed event poll is not reset by the reload it
+        // triggers, so repeated poll errors wait 1, 2, 4, ... intervals.
+        let base = Duration::from_millis(40);
+        let mut r = Retry::new(base);
+        let mut delays = Vec::new();
+        for _ in 0..4 {
+            let t0 = Instant::now();
+            r.schedule();
+            delays.push(r.due.unwrap() - t0);
+            assert!(!r.take_due(), "not due at once");
+            r.due = Some(Instant::now()); // time passes
+            assert!(r.take_due());
+            assert!(!r.take_due(), "taken once");
+        }
+        for (i, d) in delays.iter().enumerate() {
+            let want = base * 2u32.pow(i as u32);
+            assert!(
+                *d >= want && *d < want + Duration::from_millis(20),
+                "{i}: {d:?}"
+            );
+        }
+        r.reset();
+        r.schedule();
+        assert!(
+            r.due.unwrap() - Instant::now() <= base,
+            "a good poll resets it"
+        );
     }
 
     #[test]
