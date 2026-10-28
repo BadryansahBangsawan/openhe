@@ -153,14 +153,21 @@ impl<T: Transport> Keyboard<T> {
     }
 
     /// Restores factory settings. Exactly one attempt, never retried: any
-    /// matching reply is success, no reply is `Error::Timeout`.
+    /// matching reply is `Done`.
     ///
-    /// The board most likely restarts, so `Timeout` or `Disconnected` after a
-    /// reset means "re-read the device state", not necessarily failure.
-    pub fn factory_reset(&mut self) -> Result<(), Error> {
-        self.session
-            .call_once(&order::query(OrderType::FactoryReset))?;
-        Ok(())
+    /// The board most likely restarts, so a timeout or disconnect **after**
+    /// the write is `Reenumerating` (re-read the device state), like
+    /// `set_polling_rate`. An error before the frame was written (e.g. a
+    /// handle that is already dead) propagates: nothing was reset.
+    pub fn factory_reset(&mut self) -> Result<WriteOutcome, Error> {
+        let (res, wrote) = self
+            .session
+            .call_once_tracked(&order::query(OrderType::FactoryReset));
+        match res {
+            Ok(_) => Ok(WriteOutcome::Done),
+            Err(Error::Disconnected | Error::Timeout) if wrote => Ok(WriteOutcome::Reenumerating),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn start_calibration(&mut self) -> Result<(), Error> {
@@ -470,7 +477,7 @@ mod tests {
         let mut m = MockTransport::new();
         m.push_reply(order_reply(0x11, 1));
         let mut k = kb(m);
-        k.factory_reset().unwrap();
+        assert_eq!(k.factory_reset(), Ok(WriteOutcome::Done));
         let w = k.session_mut().transport().written().to_vec();
         assert_eq!(w.len(), 1);
         assert_frame(&w[0], &[0x5C, 0x03, 0x00, 0x93, 0x11, 0xFF, 0xFF]);
@@ -479,8 +486,26 @@ mod tests {
     #[test]
     fn factory_reset_is_never_retried() {
         let mut k = kb(MockTransport::new());
-        assert_eq!(k.factory_reset(), Err(Error::Timeout));
+        assert_eq!(k.factory_reset(), Ok(WriteOutcome::Reenumerating));
         assert_eq!(k.session_mut().transport().written().len(), 1);
+    }
+
+    #[test]
+    fn factory_reset_disconnect_before_or_after_the_write() {
+        // After the write: the board restarts.
+        let mut k = Keyboard::new(
+            GoneAfterWrite {
+                writes: 0,
+                wrote: false,
+                err: Error::Disconnected,
+            },
+            Model::Win68HeMax,
+        );
+        assert_eq!(k.factory_reset(), Ok(WriteOutcome::Reenumerating));
+        // Before the write: nothing was sent.
+        let mut m = MockTransport::new();
+        m.fail_with(Error::Disconnected);
+        assert_eq!(kb(m).factory_reset(), Err(Error::Disconnected));
     }
 
     #[test]

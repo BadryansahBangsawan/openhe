@@ -185,11 +185,11 @@ impl Restart {
     }
 
     /// The write job finished. `Done` and `Reenumerating` mean "the keyboard
-    /// restarts": wait for it to come back. `Disconnected` means the same
-    /// for a polling change or factory reset; for a profile switch it means
-    /// the SET was never written (`Keyboard::set_profile` reports a
-    /// disconnect after the write as `Reenumerating`), so it is a failed
-    /// write.
+    /// restarts": wait for it to come back. `Disconnected` means the frame
+    /// was never written (`set_profile`, `set_polling_rate` and
+    /// `factory_reset` all report a disconnect after the write as
+    /// `Reenumerating`), so it is a failed write: waiting for a restart
+    /// would end in a confusing "reports 8000 Hz" or "Profil 1".
     pub fn job_done(&mut self, r: Result<WriteOutcome, Error>, now: Instant) -> RestartAction {
         let Restart::Sending { kind, connects } = *self else {
             return RestartAction::None;
@@ -203,17 +203,8 @@ impl Restart {
                 };
                 RestartAction::Reconnect
             }
-            // The worker has dropped the keyboard already.
-            Err(Error::Disconnected) if !matches!(kind, RestartKind::Profile(_)) => {
-                *self = Restart::Reconnecting {
-                    kind,
-                    connects,
-                    since: now,
-                };
-                RestartAction::None
-            }
-            // A profile SET that never went out; the keyboard is gone and
-            // the worker reloads when it is back.
+            // A write that never went out; the keyboard is gone and the
+            // worker reloads when it is back.
             Err(Error::Disconnected) => {
                 *self = Restart::Failed(
                     format!(
@@ -353,14 +344,11 @@ pub fn polling_job<T: Transport>(
     kb.set_polling_rate(rate)
 }
 
-/// Factory reset (one attempt). The board restarts, so no reply
-/// (`Timeout`) means "restarting", like a disconnect.
+/// Factory reset (one attempt). The board restarts, so no reply or a
+/// disconnect after the write means "restarting" (see
+/// `Keyboard::factory_reset`).
 pub fn reset_job<T: Transport>(kb: &mut Keyboard<T>) -> Result<WriteOutcome, Error> {
-    match kb.factory_reset() {
-        Ok(()) => Ok(WriteOutcome::Done),
-        Err(Error::Timeout) => Ok(WriteOutcome::Reenumerating),
-        Err(e) => Err(e),
-    }
+    kb.factory_reset()
 }
 
 /// The typed confirmation for a factory reset: exactly "RESET" (no
@@ -1861,10 +1849,19 @@ mod tests {
             Restart::Failed(msg, _) => assert!(msg.starts_with(t::WRITE_FAILED), "{msg}"),
             other => panic!("{other:?}"),
         }
-        // Polling and reset keep treating a disconnect as the restart.
-        let mut f = Restart::begin(RestartKind::Polling(PollingRate::Hz1000), 1);
-        f.job_done(Err(Error::Disconnected), t0);
-        assert!(f.is_busy());
+        // The same for polling and reset: a disconnect is reported by the
+        // device API only when nothing was written.
+        for kind in [
+            RestartKind::Polling(PollingRate::Hz1000),
+            RestartKind::FactoryReset,
+        ] {
+            let mut f = Restart::begin(kind, 1);
+            assert_eq!(
+                f.job_done(Err(Error::Disconnected), t0),
+                RestartAction::None
+            );
+            assert!(matches!(f, Restart::Failed(..)), "{f:?}");
+        }
     }
 
     #[test]
@@ -1901,20 +1898,11 @@ mod tests {
     fn polling_change_reconnects_without_an_error() {
         // Review Focus 4.
         let t0 = Instant::now();
-        for outcome in [
-            Ok(WriteOutcome::Done),
-            Ok(WriteOutcome::Reenumerating),
-            Err(Error::Disconnected),
-        ] {
+        for outcome in [Ok(WriteOutcome::Done), Ok(WriteOutcome::Reenumerating)] {
             let mut f = Restart::begin(RestartKind::Polling(PollingRate::Hz1000), 1);
             assert!(f.is_busy());
             let action = f.job_done(outcome.clone(), t0);
-            let want = if outcome.is_ok() {
-                RestartAction::Reconnect
-            } else {
-                RestartAction::None // the worker already dropped it
-            };
-            assert_eq!(action, want);
+            assert_eq!(action, RestartAction::Reconnect);
             assert!(matches!(f, Restart::Reconnecting { .. }), "{f:?}");
             // Still on the old connection (or none): keep waiting, no error.
             f.observe(1, Some(&snap_with(PollingRate::Hz8000)), t0);

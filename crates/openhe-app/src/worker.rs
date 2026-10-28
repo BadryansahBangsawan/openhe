@@ -590,15 +590,17 @@ impl<T: Transport + 'static> Worker<T> {
     /// Like [`Worker::submit`], for a write after which the keyboard
     /// re-enumerates on USB (polling rate, factory reset, profile switch).
     ///
-    /// When the job returns `Ok(_)` (`Done` or `Reenumerating`) or
-    /// `Err(Disconnected)`, the worker thread itself marks the worker
-    /// restarting ([`Worker::is_restarting`]) and schedules the reconnect
-    /// after `pause`, **before** the result is delivered and before the
-    /// next message is taken. So writes never unlock between the job and
-    /// the reconnect, the idle state poll never talks to the dying
-    /// connection, and the UI never has to call [`Worker::reconnect`] (a
-    /// late call could drop the fresh connection). Any other error leaves
-    /// the connection alone.
+    /// When the job returns `Ok(_)` (`Done` or `Reenumerating`), the worker
+    /// thread itself marks the worker restarting
+    /// ([`Worker::is_restarting`]) and schedules the reconnect after
+    /// `pause`, **before** the result is delivered and before the next
+    /// message is taken. So writes never unlock between the job and the
+    /// reconnect, the idle state poll never talks to the dying connection,
+    /// and the UI never has to call [`Worker::reconnect`] (a late call
+    /// could drop the fresh connection). An error means the frame never
+    /// went out (the device API reports a disconnect after the write as
+    /// `Reenumerating`): `Err(Disconnected)` drops the connection like any
+    /// job's and reconnects as usual; other errors leave it alone.
     pub fn submit_restart(
         &self,
         label: &'static str,
@@ -850,7 +852,12 @@ fn enqueue_restart<T: Transport + 'static>(
     let c = Arc::clone(ctl);
     enqueue(tx, ctl, label, true, move |kb| {
         let r = job(kb);
-        if matches!(r, Ok(_) | Err(Error::Disconnected)) {
+        // Only a write that went out restarts the keyboard: the device API
+        // reports a disconnect after the write as `Reenumerating`, so
+        // `Err(Disconnected)` means nothing was written (the worker drops
+        // that connection and reconnects as usual, without the pause and
+        // without holding writes locked as "restarting").
+        if r.is_ok() {
             c.request_reconnect(pause);
         }
         r
@@ -1653,6 +1660,32 @@ pub(crate) mod tests {
         assert!(!w.is_restarting());
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(w.connects(), before);
+    }
+
+    /// `Err(Disconnected)` from a restart job means the frame never went
+    /// out: the keyboard is reconnected like after any lost connection,
+    /// without the restart pause and without "restarting" locking writes.
+    #[test]
+    fn a_restart_job_disconnected_before_writing_is_not_a_restart() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        let mut p = w.submit_restart("x", Duration::from_secs(3600), |_kb| {
+            Err::<WriteOutcome, _>(Error::Disconnected)
+        });
+        assert_eq!(wait_result(&mut p), Err(Error::Disconnected));
+        assert!(
+            !w.is_restarting(),
+            "a write that never went out restarts nothing"
+        );
+        // Reconnected as usual (no hour-long restart pause).
+        wait_for("reconnect", || w.is_connected());
     }
 
     /// From a requested reconnect (a write after which the keyboard
