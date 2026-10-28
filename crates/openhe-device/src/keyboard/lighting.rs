@@ -23,24 +23,36 @@ fn invalid(e: LightingError) -> Error {
 impl<T: Transport> Keyboard<T> {
     /// Reads the main light state.
     ///
-    /// Sends RGBNACK (order 0x47, arg 1) first, as the official app does
-    /// before reading lighting, then a PRGB GET.
+    /// Sends RGBNACK (order 0x47, arg 1) before the first read of a
+    /// connection, as the official app does before reading lighting, then
+    /// a PRGB GET.
     ///
-    /// FW App V1.1.3 rejects RGBNACK with a 0xFF reply (DeviceFail) while
-    /// the GET after it works (PROTOCOL 7.x finding 22), so that one failure
-    /// is ignored. Any other RGBNACK error (timeout, disconnect) fails the
-    /// read before the GET is sent.
+    /// RGBNACK goes out **once per connection** only: FW App V1.1.3 rejects
+    /// it with a 0xFF reply (DeviceFail) while the GET works without it
+    /// (PROTOCOL 7.x finding 22), so repeating it on every read only adds a
+    /// failing round trip. That DeviceFail is ignored. Any other RGBNACK
+    /// error (timeout, disconnect) fails the read before the GET is sent,
+    /// and RGBNACK is tried again on the next read.
     pub fn lighting(&mut self) -> Result<Lighting, Error> {
-        match self.session.call(&order::set(OrderType::RgbNack, 1)) {
-            Ok(_) | Err(Error::Frame(FrameError::DeviceFail)) => {}
-            Err(e) => return Err(e),
+        if !self.rgbnack_sent {
+            match self.session.call(&order::set(OrderType::RgbNack, 1)) {
+                Ok(_) | Err(Error::Frame(FrameError::DeviceFail)) => self.rgbnack_sent = true,
+                Err(e) => return Err(e),
+            }
         }
         let r = self.session.call(&lighting::get())?;
         Ok(lighting::parse(&r)?)
     }
 
     /// Writes the main light state, then reads it back with `lighting` and
-    /// compares every field.
+    /// compares every field except `extra_flags`.
+    ///
+    /// `extra_flags` (flag bits other than on and reverse, meaning unknown)
+    /// is written as given but not verified: the keyboard may keep or set
+    /// its own bits (it reported 0xC1 where the official app writes 0x10),
+    /// so a state that was not read from this keyboard, such as an older
+    /// profile file, would otherwise always fail. A read value written back
+    /// reads back identically on hardware.
     ///
     /// The speed of static and custom modes is sent as 0, so that is what the
     /// read-back must show. Out-of-range fields are `Error::InvalidInput`,
@@ -50,11 +62,12 @@ impl<T: Transport> Keyboard<T> {
     pub fn set_lighting(&mut self, l: &Lighting) -> Result<(), Error> {
         let req = lighting::set(l).map_err(invalid)?;
         self.session.call(&req)?;
+        let got = self.lighting()?;
         let want = Lighting {
             speed: l.wire_speed(),
+            extra_flags: got.extra_flags,
             ..*l
         };
-        let got = self.lighting()?;
         if got != want {
             return Err(Error::Io(format!(
                 "verify failed: lighting: wrote {want:?}, read {got:?}"
@@ -238,13 +251,56 @@ mod tests {
         let read = k.lighting().unwrap();
         let m = k.session_mut().transport_mut();
         m.push_reply(reply(0x18, &body)); // SET reply
-        m.push_reply(reply(0x7F, &[]));
-        m.push_reply(reply(0x18, &body)); // read-back
+        m.push_reply(reply(0x18, &body)); // read-back (no RGBNACK again)
         assert_eq!(k.set_lighting(&read), Ok(()));
         let w = k.session_mut().transport().written();
+        assert_eq!(w.len(), 4, "RGBNACK, GET, SET, GET");
         assert_eq!(w[2][4], 0x01, "the SET");
         assert_eq!(w[2][4 + 37], 0xC1);
         assert_eq!(w[2][5..48], body[1..44]);
+    }
+
+    /// RGBNACK goes out once per connection: FW App V1.1.3 rejects it
+    /// anyway, and it is not needed for the GET (PROTOCOL 7.x finding 22).
+    #[test]
+    fn rgbnack_is_sent_once_per_connection() {
+        let mut m = MockTransport::new();
+        m.push_reply(reply(0x7F, &[])); // RGBNACK rejected
+        m.push_reply(prgb_reply(&sample()));
+        m.push_reply(prgb_reply(&sample()));
+        let mut k = kb(m);
+        assert_eq!(k.lighting(), Ok(sample()));
+        assert_eq!(k.lighting(), Ok(sample()));
+        let w = k.session_mut().transport().written();
+        let nacks = w.iter().filter(|f| f[2] == 0x00 && f[4] == 0x47).count();
+        assert_eq!(nacks, 1);
+        assert_eq!(w.len(), 3, "RGBNACK, GET, GET");
+    }
+
+    /// The flag bits other than on/reverse are not verified: an import of
+    /// an older file (default 0x10) onto a keyboard reporting 0xC1 must not
+    /// fail. On, reverse and every other field still are.
+    #[test]
+    fn set_lighting_does_not_verify_the_unknown_flag_bits() {
+        let mut body = lighting::set(&sample()).unwrap().payload;
+        body[0] = 0;
+        body[37] = 0xC1; // the keyboard keeps its own bits 6/7, clears bit4
+        let mut m = MockTransport::new();
+        m.push_reply(prgb_reply(&sample())); // SET reply
+        m.push_reply(nack_reply());
+        m.push_reply(reply(0x18, &body)); // read-back
+        assert_eq!(kb(m).set_lighting(&sample()), Ok(()));
+        // An on/off difference is still a verify failure.
+        body[37] = 0xC0;
+        let mut m = MockTransport::new();
+        m.push_reply(prgb_reply(&sample()));
+        m.push_reply(nack_reply());
+        m.push_reply(reply(0x18, &body));
+        let e = kb(m).set_lighting(&sample()).unwrap_err();
+        assert!(
+            matches!(&e, Error::Io(s) if s.starts_with("verify failed")),
+            "{e:?}"
+        );
     }
 
     #[test]

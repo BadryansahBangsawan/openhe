@@ -28,6 +28,8 @@ pub struct KeySettings {
 pub struct Keyboard<T: Transport> {
     pub model: Model,
     session: Session<T>,
+    /// RGBNACK was sent on this connection (see `lighting`).
+    rgbnack_sent: bool,
 }
 
 impl<T: Transport> Keyboard<T> {
@@ -35,6 +37,7 @@ impl<T: Transport> Keyboard<T> {
         Keyboard {
             model,
             session: Session::new(transport),
+            rgbnack_sent: false,
         }
     }
 

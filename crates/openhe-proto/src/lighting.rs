@@ -151,6 +151,8 @@ const OFF_SLEEP: usize = 41;
 const OFF_STATIC: usize = 42;
 const OFF_DYNAMIC: usize = 43;
 const PRGB_LEN: usize = 44;
+/// Length of every PRGB SET (the "1.0.9" layout).
+pub const PRGB_SET_LEN: usize = PRGB_LEN;
 
 /// PRGB SET (flag 01), LEN 44. Fails on any out-of-range field. The flags
 /// byte is `extra_flags` with on (bit0) and reverse (bit1) set from `on` and

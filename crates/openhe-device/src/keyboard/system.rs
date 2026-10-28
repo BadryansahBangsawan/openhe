@@ -210,7 +210,7 @@ impl<T: Transport> Keyboard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MockTransport, Session};
+    use crate::MockTransport;
     use openhe_proto::frame::FrameError;
     use openhe_proto::model::{Model, PollingRate, SystemMode};
     use openhe_proto::travel::{SUB_CALIBRATION, SUB_TRAVEL};
@@ -311,14 +311,14 @@ mod tests {
         let mut k = kb(MockTransport::new());
         assert_eq!(k.set_profile(1), Ok(WriteOutcome::Reenumerating));
         assert_eq!(k.session_mut().transport().written().len(), 1);
-        let mut k = Keyboard {
-            model: Model::Win68HeMax,
-            session: Session::new(GoneAfterWrite {
+        let mut k = Keyboard::new(
+            GoneAfterWrite {
                 writes: 0,
                 wrote: false,
                 err: Error::Disconnected,
-            }),
-        };
+            },
+            Model::Win68HeMax,
+        );
         assert_eq!(k.set_profile(3), Ok(WriteOutcome::Reenumerating));
         assert_eq!(k.session_mut().transport().writes, 1);
     }
@@ -328,14 +328,14 @@ mod tests {
         let mut m = MockTransport::new();
         m.fail_with(Error::Disconnected); // gone before anything was written
         assert_eq!(kb(m).set_profile(1), Err(Error::Disconnected));
-        let mut k = Keyboard {
-            model: Model::Win68HeMax,
-            session: Session::new(GoneAfterWrite {
+        let mut k = Keyboard::new(
+            GoneAfterWrite {
                 writes: 0,
                 wrote: false,
                 err: Error::Io("boom".into()),
-            }),
-        };
+            },
+            Model::Win68HeMax,
+        );
         assert_eq!(k.set_profile(1), Err(Error::Io("boom".into())));
     }
 
@@ -434,14 +434,14 @@ mod tests {
 
     #[test]
     fn set_polling_rate_disconnect_after_the_write_is_reenumerating() {
-        let mut k = Keyboard {
-            model: Model::Win68HeMax,
-            session: Session::new(GoneAfterWrite {
+        let mut k = Keyboard::new(
+            GoneAfterWrite {
                 writes: 0,
                 wrote: false,
                 err: Error::Disconnected,
-            }),
-        };
+            },
+            Model::Win68HeMax,
+        );
         assert_eq!(
             k.set_polling_rate(PollingRate::Hz250),
             Ok(WriteOutcome::Reenumerating)
@@ -451,14 +451,14 @@ mod tests {
 
     #[test]
     fn set_polling_rate_other_errors_propagate() {
-        let mut k = Keyboard {
-            model: Model::Win68HeMax,
-            session: Session::new(GoneAfterWrite {
+        let mut k = Keyboard::new(
+            GoneAfterWrite {
                 writes: 0,
                 wrote: false,
                 err: Error::Io("boom".into()),
-            }),
-        };
+            },
+            Model::Win68HeMax,
+        );
         assert_eq!(
             k.set_polling_rate(PollingRate::Hz250),
             Err(Error::Io("boom".into()))

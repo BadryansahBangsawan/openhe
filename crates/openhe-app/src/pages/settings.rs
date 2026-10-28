@@ -918,6 +918,7 @@ impl Page {
                         keys: Vec::new(),
                         lighting: None,
                         key_colors: Vec::new(),
+                        keep_lighting_flags: false,
                     }),
                     plan: Box::new(ImportPlan {
                         performance: vec![((0x04..0x1E).collect(), Default::default())],
@@ -2258,6 +2259,7 @@ mod tests {
             keys: Vec::new(),
             lighting: None,
             key_colors: Vec::new(),
+            keep_lighting_flags: false,
         })
         .to_json();
         ProfileFile::from_json(&json).unwrap().to_data().unwrap()

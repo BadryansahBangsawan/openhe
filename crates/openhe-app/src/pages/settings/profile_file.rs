@@ -52,6 +52,9 @@ pub struct ProfileData {
     /// `None` when the lighting could not be read.
     pub lighting: Option<Lighting>,
     pub key_colors: Vec<(u8, Rgb)>,
+    /// The file did not say which lighting flag bits (other than on and
+    /// reverse) to write: keep the keyboard's own on import.
+    pub keep_lighting_flags: bool,
 }
 
 /// What an export read, plus the parts it had to leave out.
@@ -105,6 +108,7 @@ pub fn export_job<T: Transport>(kb: &mut Keyboard<T>, keys: &[u8]) -> Result<Exp
             keys: out,
             lighting,
             key_colors,
+            keep_lighting_flags: false,
         },
         skipped,
     })
@@ -196,13 +200,10 @@ pub struct LightingEntry {
     /// Seven `[r, g, b]` colours.
     pub colors: Vec<[u8; 3]>,
     /// Flag bits other than on and reverse, as the keyboard reported them.
-    /// Files without it (older exports) get the default 0x10.
-    #[serde(default = "default_extra_flags")]
-    pub extra_flags: u8,
-}
-
-fn default_extra_flags() -> u8 {
-    DEFAULT_EXTRA_FLAGS
+    /// Older exports do not have it: their import keeps the keyboard's own
+    /// bits instead of guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_flags: Option<u8>,
 }
 
 /// Why a file cannot be used (shown to the user in Indonesian).
@@ -377,7 +378,7 @@ impl ProfileFile {
                 static_color: l.static_color,
                 dynamic_color: l.dynamic_color,
                 colors: l.colors.iter().map(|c| [c.r, c.g, c.b]).collect(),
-                extra_flags: l.extra_flags,
+                extra_flags: Some(l.extra_flags),
             }),
             key_colors: d
                 .key_colors
@@ -450,7 +451,7 @@ impl ProfileFile {
                     static_color: l.static_color,
                     dynamic_color: l.dynamic_color,
                     colors,
-                    extra_flags: l.extra_flags,
+                    extra_flags: l.extra_flags.unwrap_or(DEFAULT_EXTRA_FLAGS),
                 };
                 lighting
                     .validate()
@@ -458,10 +459,15 @@ impl ProfileFile {
                 Some(lighting)
             }
         };
+        let keep_lighting_flags = self
+            .lighting
+            .as_ref()
+            .is_some_and(|l| l.extra_flags.is_none());
         Ok(ProfileData {
             model,
             keys,
             lighting,
+            keep_lighting_flags,
             key_colors: self
                 .key_colors
                 .iter()
@@ -502,6 +508,9 @@ pub struct ImportPlan {
     pub advanced: Vec<(u8, AdvancedConfig)>,
     pub layers: Vec<(u8, Layer, u16)>,
     pub lighting: Option<Lighting>,
+    /// Write the keyboard's current lighting flag bits instead of the
+    /// plan's (an older file without them).
+    pub keep_lighting_flags: bool,
     pub key_colors: Vec<(u8, Rgb)>,
     /// Keys with a macro in the file (not imported).
     pub skipped_macros: Vec<u8>,
@@ -699,6 +708,7 @@ pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPl
         }
     }
     plan.lighting = data.lighting;
+    plan.keep_lighting_flags = data.keep_lighting_flags;
     plan.key_colors = data
         .key_colors
         .iter()
@@ -758,7 +768,17 @@ pub fn import_job<T: Transport>(
         record(ImportStep::Layers, kb.set_layer_codes(&plan.layers))?;
     }
     if let Some(l) = &plan.lighting {
-        record(ImportStep::Lighting, kb.set_lighting(l))?;
+        let mut l = *l;
+        let flags = if plan.keep_lighting_flags {
+            kb.lighting().map(|cur| cur.extra_flags)
+        } else {
+            Ok(l.extra_flags)
+        };
+        let r = flags.and_then(|f| {
+            l.extra_flags = f;
+            kb.set_lighting(&l)
+        });
+        record(ImportStep::Lighting, r)?;
     }
     if !plan.key_colors.is_empty() {
         record(ImportStep::KeyColors, kb.set_key_colors(&plan.key_colors))?;
@@ -811,6 +831,7 @@ mod tests {
 
     fn sample() -> ProfileData {
         ProfileData {
+            keep_lighting_flags: false,
             model: Model::Win68HeMax,
             keys: vec![
                 key(0x29, TouchMode::Global, AdvancedConfig::None),
@@ -893,14 +914,57 @@ mod tests {
     }
 
     #[test]
-    fn lighting_flag_bits_round_trip_and_old_files_get_the_default() {
+    fn lighting_flag_bits_round_trip_and_old_files_keep_the_keyboards() {
         let file = ProfileFile::from_data(&sample());
         let json = file.to_json();
         assert!(json.contains("\"extra_flags\": 192"));
-        // A file written before the field existed: the old 0x10 behaviour.
+        let back = ProfileFile::from_json(&json).unwrap().to_data().unwrap();
+        assert!(!back.keep_lighting_flags);
+        assert_eq!(back.lighting.unwrap().extra_flags, 0xC0);
+        // A file written before the field existed: the keyboard's own bits
+        // are kept on import (no guessed 0x10).
         let old = json.replace("\"extra_flags\": 192", "\"extra_flags_gone\": 0");
         let back = ProfileFile::from_json(&old).unwrap().to_data().unwrap();
-        assert_eq!(back.lighting.unwrap().extra_flags, 0x10);
+        assert!(back.keep_lighting_flags);
+        let plan = plan_import(&back, &snapshot68()).unwrap();
+        assert!(plan.keep_lighting_flags);
+    }
+
+    /// An import with `keep_lighting_flags` reads the keyboard's lighting
+    /// first and writes its flag bits back with the file's other values.
+    #[test]
+    fn an_old_file_import_writes_the_keyboards_own_flag_bits() {
+        use openhe_proto::lighting;
+        let mut l = sample().lighting.unwrap();
+        l.extra_flags = 0x10;
+        let plan = ImportPlan {
+            lighting: Some(l),
+            keep_lighting_flags: true,
+            ..Default::default()
+        };
+        let mut on_kb = l;
+        on_kb.extra_flags = 0xC0;
+        let mut reply = [0u8; 64];
+        reply[..4].copy_from_slice(&[0x5C, 0x2D, 0x98, 0x00]);
+        let body = lighting::set(&on_kb).unwrap().payload;
+        reply[5..4 + body.len()].copy_from_slice(&body[1..]);
+        let mut nack = [0u8; 64];
+        nack[..8].copy_from_slice(&[0x5C, 0x04, 0x80, 0x00, 0x00, 0x47, 0x01, 0xFF]);
+        let mut m = MockTransport::new();
+        m.push_reply(nack);
+        m.push_reply(reply); // the current lighting
+        m.push_reply(reply); // SET reply
+        m.push_reply(reply); // read-back
+        let mut kb = Keyboard::new(m, Model::Win68HeMax);
+        let report = import_job(&mut kb, &plan).unwrap();
+        assert!(report.failed.is_empty(), "{report:?}");
+        let w = kb.session_mut().transport().written();
+        let set = w
+            .iter()
+            .rev()
+            .find(|f| f[2] == 0x18 && f[4] == 0x01)
+            .unwrap();
+        assert_eq!(set[4 + 37], 0xC0 | 0x01, "keyboard bits + on");
     }
 
     #[test]

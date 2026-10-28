@@ -166,16 +166,26 @@ impl<T: Transport> Session<T> {
     }
 }
 
-/// Every PRGB request that is not a SET (flag 01) must be exactly
-/// `lighting::get()`. The keyboard rejects any other GET (a LEN-44 GET got a
+/// A PRGB SET (flag 01) must be the LEN-44 layout, and every other PRGB
+/// request must be exactly `lighting::get()`. The keyboard rejects any other GET (a LEN-44 GET got a
 /// 0xFF DeviceFail reply) and right after that rejection it stopped sensing
 /// keys until it was replugged (PROTOCOL 7.x finding 14), so nothing may
 /// reach the transport that way.
 fn refuse_malformed_prgb_get(req: &Request) -> Result<(), Error> {
-    if req.cmd == Cmd::Prgb && req.payload.first() != Some(&0x01) && *req != lighting::get() {
+    if req.cmd != Cmd::Prgb {
+        return Ok(());
+    }
+    let n = req.payload.len();
+    if req.payload.first() == Some(&0x01) {
+        if n != lighting::PRGB_SET_LEN {
+            return Err(Error::InvalidInput(format!(
+                "PRGB SET must be LEN {}, not LEN {n}",
+                lighting::PRGB_SET_LEN
+            )));
+        }
+    } else if *req != lighting::get() {
         return Err(Error::InvalidInput(format!(
-            "PRGB GET must be the LEN-15 form, not LEN {}",
-            req.payload.len()
+            "PRGB GET must be the LEN-15 form, not LEN {n}"
         )));
     }
     Ok(())
@@ -491,6 +501,26 @@ mod tests {
         s.transport_mut().fail_with(Error::Disconnected);
         assert_eq!(s.try_poll().unwrap_err(), Error::Disconnected);
         assert!(s.poll().is_empty());
+    }
+
+    /// A PRGB SET must be the LEN-44 "1.0.9" layout (flag 01).
+    #[test]
+    fn a_prgb_set_of_another_length_is_never_written() {
+        use openhe_proto::frame::Cmd;
+        for len in [5usize, 15, 43, 45] {
+            let mut payload = vec![0u8; len];
+            payload[0] = 0x01;
+            let req = Request {
+                cmd: Cmd::Prgb,
+                payload,
+            };
+            let mut s = Session::new(MockTransport::new());
+            assert!(
+                matches!(s.call_once(&req), Err(Error::InvalidInput(_))),
+                "{len}"
+            );
+            assert!(s.transport().written().is_empty(), "{len}");
+        }
     }
 
     /// A PRGB GET other than the LEN-15 form is refused before any write:
