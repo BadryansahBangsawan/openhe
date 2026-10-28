@@ -1,0 +1,22 @@
+[package]
+name = "openhe-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OpenHE desktop configurator for AULA WIN 68/60 HE MAX keyboards"
+
+[[bin]]
+name = "openhe-app"
+path = "src/main.rs"
+
+[dependencies]
+openhe-device = { path = "../openhe-device" }
+openhe-proto = { path = "../openhe-proto" }
+# 0.32 is the newest eframe whose rust-version (1.85) fits the workspace MSRV;
+# 0.33+ needs 1.88. Default features only: glow renderer, no persistence,
+# no web or network features.
+eframe = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "5"
