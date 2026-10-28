@@ -124,3 +124,20 @@ fn a_lighting_change_on_another_profile_is_read_after_the_switch() {
     w.frames(5);
     assert!(w.has_text("=1 / 5"), "{:?}", w.labels());
 }
+
+#[test]
+fn a_keyboard_that_ignores_rgbnack_still_shows_its_lighting() {
+    // RGBNACK is optional (the GET works without it): a firmware that
+    // does not answer it at all must not make the page fail.
+    let sim = Sim::new();
+    sim.state().rgbnack_silent = true;
+    let mut w = World::with(sim, Default::default(), fast_config());
+    w.page("Lampu");
+    w.idle();
+    assert!(
+        !w.has_text("Gagal membaca pengaturan lampu"),
+        "{:?}",
+        w.labels()
+    );
+    assert!(w.has_text("=4 / 5"), "{:?}", w.labels());
+}

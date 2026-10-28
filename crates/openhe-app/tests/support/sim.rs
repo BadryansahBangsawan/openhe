@@ -297,6 +297,8 @@ pub struct SimState {
     /// Time every SET takes (a slow keyboard), for tests that must catch
     /// a job while it runs.
     pub set_delay: std::time::Duration,
+    /// RGBNACK gets no reply at all (instead of the 0xFF of FW V1.1.3).
+    pub rgbnack_silent: bool,
     /// Unsolicited reports to deliver on the next read.
     pub events: VecDeque<[u8; 64]>,
 }
@@ -338,6 +340,7 @@ impl SimState {
             unplug_after_sets: None,
             drop_before: None,
             set_delay: std::time::Duration::ZERO,
+            rgbnack_silent: false,
             events: VecDeque::new(),
         }
     }
@@ -746,7 +749,9 @@ impl SimTransport {
             (0x47, _) => {
                 // FW App V1.1.3 rejects RGBNACK (finding 22).
                 s.rgbnack += 1;
-                self.out.push_back(fail());
+                if !s.rgbnack_silent {
+                    self.out.push_back(fail());
+                }
                 return;
             }
             (0x0C, None) => {
