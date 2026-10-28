@@ -287,6 +287,67 @@ fn screenshot_07_pengaturan() {
     shots(&mut w, "07-pengaturan");
 }
 
+fn skin_slug(s: &openhe_app::skin::KeyboardSkin) -> &'static str {
+    use openhe_app::skin::KeyboardSkin::*;
+    match s {
+        GreyYellow => "abu-kuning",
+        BlackRed => "hitam-merah",
+        WhiteBlue => "putih-biru",
+        Gelap => "gelap",
+        Custom { .. } => "kustom",
+    }
+}
+
+/// Performa (as in screenshot 01) in every skin, at 1280×800.
+#[test]
+#[ignore]
+fn screenshot_08_performa_skins() {
+    use openhe_app::skin::KeyboardSkin;
+    for skin in [
+        KeyboardSkin::GreyYellow,
+        KeyboardSkin::BlackRed,
+        KeyboardSkin::WhiteBlue,
+        KeyboardSkin::Gelap,
+        KeyboardSkin::custom([0xD9, 0xD4, 0xC7], [0x3A, 0x3F, 0x4B], [0xE2, 0x72, 0x5B]),
+    ] {
+        let mut data = profile_names();
+        data.keyboard_skins.insert(SIM_SERIAL.into(), skin);
+        let mut w = world(data);
+        w.click("WASD");
+        w.click("Rapid Trigger");
+        w.edit_value("2.000 mm", 0, "0.4");
+        w.apply("Terapkan ke keyboard");
+        shot(
+            &mut w,
+            &format!("08-performa-{}", skin_slug(&skin)),
+            DESKTOP,
+        );
+    }
+}
+
+/// The first-connect dialog (mockup 08c).
+#[test]
+#[ignore]
+fn screenshot_08c_dialog() {
+    let mut w = World::first_connect(profile_names());
+    w.frames(3);
+    shots(&mut w, "08c-warna-dialog");
+}
+
+/// Pengaturan with the "Warna keyboard" row (mockup 08d), and the custom
+/// editor (mockup 08e).
+#[test]
+#[ignore]
+fn screenshot_08d_pengaturan_and_08e_kustom() {
+    let mut w = world(profile_names());
+    w.page("Pengaturan");
+    w.idle();
+    w.click("Abu Kuning");
+    shots(&mut w, "08d-warna-pengaturan");
+    w.click("Kustom…");
+    shots(&mut w, "08e-warna-kustom");
+}
+
 /// The keyboard widget in every skin, WIN 68 and WIN 60, with W selected
 /// and A, S, D marked (compare with mockups 08 and 08b).
 #[test]
