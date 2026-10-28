@@ -7,9 +7,43 @@ use std::time::{Duration, Instant};
 const ATTEMPT_MS: u64 = 1000;
 const MAX_ATTEMPTS: usize = 3;
 
+/// How long after an attempt timed out its reply is still expected (and a
+/// matching report is taken for it rather than for a keyboard event).
+const LATE_WINDOW: Duration = Duration::from_secs(2);
+/// At most this many timed-out attempts are remembered.
+const MAX_LATE: usize = 8;
+/// Quiet wait after a call that needed a retry, so the reply of the
+/// attempt that was not consumed can arrive and be drained.
+const RETRY_SETTLE: Duration = Duration::from_millis(100);
+
+/// An attempt that timed out: its reply may still arrive.
+struct Late {
+    req: Request,
+    until: Instant,
+    /// The call it belonged to (see `Session::calls`).
+    call: u64,
+}
+
+/// Late replies (scan finding 4). A reply that arrives after its attempt's
+/// 1 s deadline is a stray: it can answer the retry (whose own reply then
+/// becomes the stray), turn up as a keyboard event, or, as a 0xFF reject,
+/// abort an unrelated call. The session remembers attempts that timed out
+/// for `LATE_WINDOW` and:
+/// - drops a report that one of them explains (`Request::expects`) instead
+///   of queueing it as an event, so a slow keyboard cannot cause a reload
+///   storm through 0x80 / 0xA3 "events";
+/// - absorbs one 0xFF per such attempt of an earlier call while waiting,
+///   instead of failing the current call (when that leaves the last
+///   attempt unanswered, the result is still `DeviceFail`);
+/// - after a call that needed a retry, waits `RETRY_SETTLE` and drains, so
+///   the duplicate reply cannot answer the next request.
+///
+/// Reports that no remembered attempt explains are handled as before.
 pub struct Session<T: Transport> {
     t: T,
     events: Vec<Response>,
+    late: Vec<Late>,
+    calls: u64,
 }
 
 impl<T: Transport> Session<T> {
@@ -17,6 +51,8 @@ impl<T: Transport> Session<T> {
         Session {
             t,
             events: Vec::new(),
+            late: Vec::new(),
+            calls: 0,
         }
     }
 
@@ -108,22 +144,66 @@ impl<T: Transport> Session<T> {
     fn drain_into(&mut self, out: &mut Vec<Response>) -> Result<(), Error> {
         while let Some(raw) = self.t.read(0)? {
             if let Ok(resp) = Response::decode(&raw) {
-                out.push(resp);
+                if !self.take_late(&resp) {
+                    out.push(resp);
+                }
             }
         }
         Ok(())
     }
 
     /// Reads with a zero timeout until nothing is waiting. Replies become
-    /// events; non-replies and stale failure reports are dropped, since they
-    /// cannot belong to a request that has not been sent yet.
+    /// events (unless they are late replies to our own timed-out attempts);
+    /// non-replies and stale failure reports are dropped, since they cannot
+    /// belong to a request that has not been sent yet.
     fn drain(&mut self) -> Result<(), Error> {
-        while let Some(raw) = self.t.read(0)? {
-            if let Ok(resp) = Response::decode(&raw) {
-                self.events.push(resp);
+        let mut out = Vec::new();
+        let r = self.drain_into(&mut out);
+        self.events.append(&mut out);
+        r
+    }
+
+    /// Forgets timed-out attempts whose reply is no longer expected.
+    fn prune_late(&mut self) {
+        let now = Instant::now();
+        self.late.retain(|l| l.until > now);
+    }
+
+    /// Whether `resp` is the late reply of a remembered timed-out attempt;
+    /// if so, that attempt is forgotten (its reply arrived).
+    fn take_late(&mut self, resp: &Response) -> bool {
+        self.prune_late();
+        match self.late.iter().position(|l| l.req.expects(resp)) {
+            Some(i) => {
+                self.late.remove(i);
+                true
             }
+            None => false,
         }
-        Ok(())
+    }
+
+    /// Whether a 0xFF reject can be blamed on a timed-out attempt of an
+    /// earlier call; if so, the oldest such attempt is forgotten.
+    fn take_late_fail(&mut self, call: u64) -> bool {
+        self.prune_late();
+        match self.late.iter().position(|l| l.call != call) {
+            Some(i) => {
+                self.late.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn remember_late(&mut self, req: &Request, call: u64) {
+        if self.late.len() >= MAX_LATE {
+            self.late.remove(0);
+        }
+        self.late.push(Late {
+            req: req.clone(),
+            until: Instant::now() + LATE_WINDOW,
+            call,
+        });
     }
 
     fn exchange(&mut self, req: &Request, n: usize) -> Result<Vec<[u8; 64]>, Error> {
@@ -140,10 +220,14 @@ impl<T: Transport> Session<T> {
     ) -> Result<Vec<[u8; 64]>, Error> {
         refuse_malformed_prgb_get(req)?;
         let frame = req.encode()?;
-        for _ in 0..attempts {
+        self.calls += 1;
+        let call = self.calls;
+        let mut absorbed_fail = false;
+        for attempt in 0..attempts {
             self.drain()?;
             self.t.write(&frame)?;
             *wrote = true;
+            absorbed_fail = false;
             let deadline = Instant::now() + Duration::from_millis(ATTEMPT_MS);
             let mut got: Vec<[u8; 64]> = Vec::new();
             while got.len() < n {
@@ -161,17 +245,34 @@ impl<T: Transport> Session<T> {
                 let resp = match Response::decode(&raw) {
                     Ok(resp) => resp,
                     Err(FrameError::NotAReply) => continue,
+                    Err(FrameError::DeviceFail) if self.take_late_fail(call) => {
+                        absorbed_fail = true;
+                        continue;
+                    }
                     Err(e) => return Err(e.into()),
                 };
                 if req.expects(&resp) {
                     got.push(raw);
-                } else {
+                } else if !self.take_late(&resp) {
                     self.events.push(resp);
                 }
             }
             if got.len() == n {
+                if attempt > 0 {
+                    // An earlier attempt's reply is still on its way (or
+                    // answered this one, leaving this attempt's reply to
+                    // come): let it arrive and drain it now.
+                    std::thread::sleep(RETRY_SETTLE);
+                    let _ = self.drain();
+                }
                 return Ok(got);
             }
+            self.remember_late(req, call);
+        }
+        if absorbed_fail {
+            // The reject blamed on an earlier request may have been this
+            // one's: a failure is reported, not a timeout.
+            return Err(FrameError::DeviceFail.into());
         }
         Err(Error::Timeout)
     }
@@ -385,12 +486,92 @@ mod tests {
         s.call(s_set).unwrap();
         assert_eq!(s.transport().writes, 2);
         // The late echo looks like an answer to the read-back (same key and
-        // layout). It must be drained, not taken as the stored value.
+        // layout). It must be drained, not taken as the stored value; and
+        // as a reply to our own timed-out attempt it is not a device event.
         let r = s.call(&key::get(0x0A, KeyParam::Actuation)).unwrap();
         assert_eq!(key::parse_value(&r), Some((0x0A, 4, 2000)));
-        let ev = s.take_events();
-        assert_eq!(ev.len(), 1);
-        assert_eq!(key::parse_value(&ev[0]), Some((0x0A, 4, 1500)));
+        assert!(s.take_events().is_empty());
+    }
+
+    /// Scan finding 4: attempt 1 answers after its 1 s deadline, so it
+    /// satisfies attempt 2, and attempt 2's own reply arrives later. A
+    /// retried call that succeeds settles briefly, so that reply cannot
+    /// answer the read-back GET written next (a KEY SET echo is
+    /// byte-identical to the GET reply, 7.x finding 11).
+    #[test]
+    fn a_retried_call_settles_before_the_next_request() {
+        use crate::TimedTransport;
+        let ms = Duration::from_millis;
+        let echo = key_reply(0x0A, 4, 1500);
+        let mut t = TimedTransport::new();
+        t.on_write(vec![(ms(1050), echo)]); // attempt 1: late
+        t.on_write(vec![(ms(30), echo)]); // attempt 2: its own echo
+        t.on_write(vec![(ms(60), key_reply(0x0A, 4, 2000))]); // the stored value
+        let mut s = Session::new(t);
+        s.call(&key::set(&[(0x0A, KeyParam::Actuation, 1500)])[0])
+            .unwrap();
+        let r = s.call(&key::get(0x0A, KeyParam::Actuation)).unwrap();
+        assert_eq!(key::parse_value(&r), Some((0x0A, 4, 2000)));
+        assert_eq!(s.transport().written().len(), 3);
+        assert!(s.take_events().is_empty(), "our own late reply is no event");
+    }
+
+    /// Scan finding 4: a late 0xFF reject of an earlier request that timed
+    /// out (e.g. RGBNACK, sent once) must not abort the next, unrelated
+    /// call. A reject with no earlier timeout to blame is still DeviceFail.
+    #[test]
+    fn a_late_reject_of_a_timed_out_request_does_not_abort_the_next_call() {
+        let nack = order::set(OrderType::RgbNack, 1);
+        let mut s = Session::new(Scripted::new(vec![
+            vec![],                                      // RGBNACK: no reply in time
+            vec![reply(0xFF, 0), key_reply(0x0A, 4, 7)], // its late reject, then the answer
+        ]));
+        assert_eq!(s.call_once(&nack).unwrap_err(), Error::Timeout);
+        let r = s.call(&key::get(0x0A, KeyParam::Actuation)).unwrap();
+        assert_eq!(key::parse_value(&r), Some((0x0A, 4, 7)));
+        assert_eq!(s.transport().writes, 2);
+
+        // The blame is used up: the next reject is this call's own.
+        let mut s = Session::new(Scripted::new(vec![
+            vec![],               // RGBNACK: no reply in time
+            vec![reply(0xFF, 0)], // absorbed as the late reject
+            vec![reply(0xFF, 0)], // the retry's own reject
+        ]));
+        assert_eq!(s.call_once(&nack).unwrap_err(), Error::Timeout);
+        let e = s.call(&key::get(0x0A, KeyParam::Actuation)).unwrap_err();
+        assert_eq!(e, Error::Frame(FrameError::DeviceFail));
+        assert_eq!(s.transport().writes, 3);
+
+        // A single-attempt call reports an absorbed reject, not a timeout.
+        let mut s = Session::new(Scripted::new(vec![vec![], vec![reply(0xFF, 0)]]));
+        assert_eq!(s.call_once(&nack).unwrap_err(), Error::Timeout);
+        let e = s
+            .call_once(&key::get(0x0A, KeyParam::Actuation))
+            .unwrap_err();
+        assert_eq!(e, Error::Frame(FrameError::DeviceFail));
+    }
+
+    /// Scan finding 4: a late reply to our own timed-out request is not a
+    /// keyboard event (0xA3 and 0x80 events start a full reload in the
+    /// app). Replies that no recent request explains still are.
+    #[test]
+    fn late_replies_to_timed_out_requests_are_not_events() {
+        let mut s = Session::new(MockTransport::new());
+        let get = key::get(0x0A, KeyParam::Actuation);
+        assert_eq!(s.call(&get).unwrap_err(), Error::Timeout);
+        assert_eq!(
+            s.call_once(&order::query(OrderType::Profile)).unwrap_err(),
+            Error::Timeout
+        );
+        let m = s.transport_mut();
+        m.push_pending(key_reply(0x0A, 4, 2000)); // late: ours
+        m.push_pending(reply(0x80, 0x70)); // late: ours
+        m.push_pending(key_reply(0x0B, 4, 2000)); // another key: an event
+        m.push_pending(reply(0x80, 0x21)); // Win/Mac: an event
+        let got = s.poll();
+        assert_eq!(got.len(), 2);
+        assert_eq!(key::parse_value(&got[0]), Some((0x0B, 4, 2000)));
+        assert_eq!(got[1].raw[5], 0x21);
     }
 
     #[test]
