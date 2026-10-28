@@ -5,6 +5,7 @@ use openhe_proto::frame::{Cmd, Request, Response};
 use openhe_proto::key::parse_value;
 use openhe_proto::model::PollingRate;
 use openhe_proto::order::{parse_polling, parse_system_mode};
+use openhe_proto::sync;
 
 fn raw(hex: &str) -> [u8; 64] {
     let mut out = [0u8; 64];
@@ -17,6 +18,23 @@ fn raw(hex: &str) -> [u8; 64] {
 const KEY_REPLY: &str = "5C 39 A3 6D 00 29 04 D0 07 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 00 00 00";
 const POLLING_REPLY: &str = "5C 04 80 14 00 50 00 FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
 const MODE_REPLY: &str = "5C 04 80 14 00 21 01 FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+
+/// docs/protocol/captures/win68-info.txt; the serial is redacted as sixteen 0x58 ('X').
+const SYNC_REPLY: &str = "5C 3C 81 4D 00 01 19 02 06 C0 01 00 10 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 10 41 70 70 20 56 31 2E 31 2E 33 00 00 31 36 3A 30 10 4E 6F 76 20 31 34 20 35 30 32 35 38 04 01 03 4C FF";
+
+#[test]
+fn real_sync_reply() {
+    let r = Response::decode(&raw(SYNC_REPLY)).unwrap();
+    assert!(r.checksum_ok());
+    let info = sync::parse(&r);
+    assert_eq!(info.board_id, 0x0602_1901);
+    assert!(!info.in_bootloader);
+    assert_eq!(info.serial, "XXXXXXXXXXXXXXXX");
+    assert_eq!(info.firmware, "App V1.1.3");
+    // The build-date slot is garbled on this firmware and is followed by binary
+    // bytes (04 01 03 ...); the text stops at the first control byte.
+    assert_eq!(info.build_date, "Nov 14 50258");
+}
 
 #[test]
 fn real_key_reply_checksum_and_value() {
