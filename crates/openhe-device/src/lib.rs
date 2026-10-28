@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
+pub mod hid;
 pub mod session;
 pub mod transport;
 
 use openhe_proto::frame::FrameError;
 use thiserror::Error;
 
+pub use hid::{list_devices, DeviceEntry, HidTransport};
 pub use session::Session;
 pub use transport::{MockTransport, Transport};
 

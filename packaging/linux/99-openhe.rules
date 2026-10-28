@@ -1,0 +1,2 @@
+# OpenHE: install with `sudo cp 99-openhe.rules /etc/udev/rules.d/` then `sudo udevadm control --reload-rules && sudo udevadm trigger`
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1ca2", ATTRS{idProduct}=="1901|1902", TAG+="uaccess"

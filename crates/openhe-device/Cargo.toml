@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 openhe-proto = { path = "../openhe-proto" }
+hidapi = "2"
 thiserror = "1"
