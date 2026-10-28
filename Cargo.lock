@@ -1258,6 +1258,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_kittest"
+version = "0.32.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5bb00f16e00af09092c117515246732adba4ca4649463bdbc2ab6114a2944765"
+dependencies = [
+ "eframe",
+ "egui",
+ "kittest",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2105,6 +2116,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "kittest"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c1bfc4cb16136b6f00fb85a281e4b53d026401cf5dff9a427c466bde5891f0b"
+dependencies = [
+ "accesskit",
+ "accesskit_consumer",
+ "parking_lot",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2844,6 +2866,7 @@ dependencies = [
  "auto-launch",
  "directories",
  "eframe",
+ "egui_kittest",
  "fs4",
  "openhe-device",
  "openhe-proto",

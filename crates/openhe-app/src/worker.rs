@@ -45,7 +45,9 @@
 //!   worked.
 //!
 //! The transport is a type parameter with a connector closure, so tests drive
-//! the worker with `MockTransport`; the app uses the `HidTransport` default.
+//! the worker with `MockTransport`. The app uses the [`AppTransport`]
+//! default: a boxed transport that is the HID keyboard in the app and a
+//! keyboard simulator in the end-to-end UI tests.
 
 use crate::i18n;
 use openhe_device::{
@@ -446,7 +448,7 @@ pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(7);
 /// waits on a slow keyboard; while the calibration guard is set it is
 /// joined for up to [`SHUTDOWN_WAIT`], so the shutdown `stop_calibration`
 /// goes out before the process ends.
-pub struct Worker<T: Transport + 'static = HidTransport> {
+pub struct Worker<T: Transport + 'static = AppTransport> {
     tx: Sender<Msg<T>>,
     ctl: Arc<Control>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -489,11 +491,36 @@ impl<T> Pending<T> {
     }
 }
 
-impl Worker<HidTransport> {
+/// The transport of the app's worker: any [`Transport`], boxed. The app
+/// runs it on the HID keyboard ([`Worker::spawn`]); the end-to-end UI tests
+/// run the same app on a keyboard simulator through
+/// [`Worker::spawn_with`].
+pub struct AppTransport(Box<dyn Transport>);
+
+impl AppTransport {
+    pub fn new(t: impl Transport + 'static) -> AppTransport {
+        AppTransport(Box::new(t))
+    }
+}
+
+impl Transport for AppTransport {
+    fn write(&mut self, report: &[u8; 64]) -> Result<(), Error> {
+        self.0.write(report)
+    }
+
+    fn read(&mut self, timeout_ms: u32) -> Result<Option<[u8; 64]>, Error> {
+        self.0.read(timeout_ms)
+    }
+}
+
+impl Worker<AppTransport> {
     /// Starts the worker on the first supported HID keyboard.
-    pub fn spawn() -> Worker<HidTransport> {
+    pub fn spawn() -> Worker<AppTransport> {
         Worker::spawn_with(
-            Box::new(|| HidTransport::open_first().map(|(t, model)| Keyboard::new(t, model))),
+            Box::new(|| {
+                HidTransport::open_first()
+                    .map(|(t, model)| Keyboard::new(AppTransport::new(t), model))
+            }),
             WorkerConfig::default(),
         )
     }
@@ -715,7 +742,7 @@ impl<T: Transport + 'static> Worker<T> {
 /// A cloneable handle to the worker for other threads (see
 /// [`Worker::handle`]). Jobs submitted after the worker is gone fail with
 /// `Err(Disconnected)`.
-pub struct WorkerHandle<T: Transport + 'static = HidTransport> {
+pub struct WorkerHandle<T: Transport + 'static = AppTransport> {
     tx: Sender<Msg<T>>,
     ctl: Arc<Control>,
 }
