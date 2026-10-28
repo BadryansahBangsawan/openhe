@@ -11,6 +11,11 @@ use openhe_proto::model::{Model, PollingRate, SystemMode};
 use openhe_proto::order::{self, OrderType};
 use openhe_proto::sync::{self, DeviceInfo};
 use openhe_proto::units::Micrometers;
+use std::time::Duration;
+
+/// How long `set_key_params` lets late per-entry echoes of a multi-entry
+/// KEY SET arrive (and drains them) before the read-backs.
+const BATCH_SETTLE: Duration = Duration::from_millis(50);
 
 /// All per-key settings, read in one pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +126,9 @@ impl<T: Transport> Keyboard<T> {
     /// Every request from `key::set` goes through the session, so each SET reply
     /// is matched by the usual rules. Afterwards every entry is read with
     /// `key_param` and compared with the value written; a difference is an
-    /// `Error::Io` that starts with "verify failed". Nothing is read back after a
+    /// `Error::Io` that starts with "verify failed". With more than one entry
+    /// the session first waits 50 ms and drains, so a late echo of a
+    /// multi-entry SET cannot answer a read-back. Nothing is read back after a
     /// failed SET, and an empty `entries` does no I/O. A `(key, param)` that
     /// appears twice is `Error::InvalidInput`, returned before any I/O.
     pub fn set_key_params(&mut self, entries: &[(u8, KeyParam, u16)]) -> Result<(), Error> {
@@ -139,6 +146,12 @@ impl<T: Transport> Keyboard<T> {
         }
         for req in key::set(entries) {
             self.session.call(&req)?;
+        }
+        if entries.len() > 1 {
+            // A multi-entry SET may echo every entry (open question 17,
+            // unverified); a late echo is byte-identical to a read-back
+            // GET reply (7.x finding 11). Let them arrive and drain them.
+            self.session.settle(BATCH_SETTLE)?;
         }
         for &(key, param, want) in entries {
             let got = self.key_param(key, param)?;
@@ -470,5 +483,34 @@ mod tests {
         for (frame, &(key, _, _)) in w[2..].iter().zip(&entries) {
             assert_eq!(payload(frame), [0x00, key, 0x04, 0x00, 0x00]);
         }
+    }
+
+    /// Scan finding 5 (open question 17): if a multi-entry KEY SET echoes
+    /// every entry, a later entry's echo (byte-identical to a GET reply,
+    /// 7.x finding 11) could arrive after that entry's read-back GET was
+    /// written and answer it. The batch settles and drains before the
+    /// read-backs.
+    #[test]
+    fn a_late_per_entry_echo_never_answers_a_read_back() {
+        use crate::TimedTransport;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let entries = [
+            (0x0A, KeyParam::Actuation, 1500),
+            (0x0B, KeyParam::Actuation, 1500),
+        ];
+        let mut t = TimedTransport::new();
+        t.on_write(vec![
+            (ms(0), key_reply(0x0A, 4, 1500)),  // first entry: the SET reply
+            (ms(40), key_reply(0x0B, 4, 1500)), // second entry, late
+        ]);
+        t.on_write(vec![(ms(30), key_reply(0x0A, 4, 1500))]);
+        t.on_write(vec![(ms(30), key_reply(0x0B, 4, 2000))]); // not stored
+        let mut k = Keyboard::new(t, Model::Win68HeMax);
+        let e = k.set_key_params(&entries).unwrap_err();
+        assert!(
+            matches!(&e, Error::Io(s) if s.contains("key 0x0B") && s.contains("read 2000")),
+            "{e:?}"
+        );
     }
 }
