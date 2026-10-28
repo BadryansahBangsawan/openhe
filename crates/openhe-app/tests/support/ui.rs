@@ -2,7 +2,7 @@
 
 use super::{collect, World};
 use eframe::egui::accesskit::{Role, Toggled};
-use eframe::egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect};
+use eframe::egui::{self, Event, Key, Modifiers, PointerButton, Pos2, Rect};
 use egui_kittest::kittest::{NodeT, Queryable};
 
 impl World {
@@ -310,9 +310,31 @@ impl World {
         let start = std::time::Instant::now();
         while self.sim().log.len() == before {
             if start.elapsed() > std::time::Duration::from_secs(30) {
+                let rect = self
+                    .h
+                    .query_all_by_label(label)
+                    .next()
+                    .and_then(|n| n.accesskit_node().bounding_box());
+                let ctx = self.h.ctx.clone();
+                let center = rect.map(|r| {
+                    egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32)
+                });
+                let layer = center.and_then(|p| ctx.layer_id_at(p));
+                let popup = egui::Popup::is_any_open(&ctx);
+                let screen = ctx.screen_rect();
+                let ppp = ctx.pixels_per_point();
+                let hits: Vec<String> = center
+                    .map(|p| {
+                        let mut v = Vec::new();
+                        hits_at(&self.h.root(), p, ppp, &mut v);
+                        v
+                    })
+                    .unwrap_or_default();
                 panic!(
                     "{label:?} wrote nothing to the keyboard in 30 s (worker busy: {}, \
-                     frames written before the click: {before}); on screen: {:?}",
+                     frames written before the click: {before}); node rect {rect:?}, \
+                     screen {screen:?} @ {ppp}, layer at centre {layer:?}, popup open {popup}, \
+                     nodes at centre {hits:?}; on screen: {:?}",
                     self.worker.is_busy(),
                     self.labels()
                 );
@@ -320,5 +342,23 @@ impl World {
             self.frames(1);
         }
         self.idle();
+    }
+}
+
+/// Labels (or roles) of every node whose box contains `p` (diagnostics).
+fn hits_at(node: &egui_kittest::Node<'_>, p: egui::Pos2, ppp: f32, out: &mut Vec<String>) {
+    let a = node.accesskit_node();
+    if let Some(b) = a.bounding_box() {
+        let (x, y) = (f64::from(p.x * ppp), f64::from(p.y * ppp));
+        if b.x0 <= x && x <= b.x1 && b.y0 <= y && y <= b.y1 {
+            out.push(format!(
+                "{:?}:{:?}",
+                a.role(),
+                a.label().unwrap_or_default()
+            ));
+        }
+    }
+    for c in node.children() {
+        hits_at(&c, p, ppp, out);
     }
 }
