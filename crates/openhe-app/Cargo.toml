@@ -20,3 +20,7 @@ eframe = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "5"
+
+[features]
+# Hooks that put pages into demo states, for offscreen screenshots only.
+preview = []

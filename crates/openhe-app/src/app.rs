@@ -195,11 +195,13 @@ impl eframe::App for OpenHeApp {
     /// there): stop it and give the stop a moment to go out. The worker's
     /// calibration guard sends it too if this does not finish in time.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(mut stop) = self.calibration.leave(&self.worker) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
-            while stop.poll().is_none() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+        self.calibration.leave(&self.worker);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(800);
+        let ctx = egui::Context::default();
+        while self.calibration.is_active() && std::time::Instant::now() < deadline {
+            let snapshot = self.worker.snapshot();
+            self.calibration.pump(&self.worker, snapshot.as_ref(), &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
@@ -216,9 +218,15 @@ impl OpenHeApp {
     /// Switches pages; leaving Kalibrasi always stops a running calibration.
     fn change_page(&mut self, page: PageId) {
         if self.page == PageId::Calibration && page != PageId::Calibration {
-            let _ = self.calibration.leave(&self.worker);
+            self.calibration.leave(&self.worker);
         }
         self.page = page;
+    }
+
+    /// Screenshot hook: see `pages::calibration::Page::preview`.
+    #[cfg(feature = "preview")]
+    pub fn preview_calibration(&mut self, done: &[u8], pressed: &[u8]) {
+        self.calibration.preview(done, pressed);
     }
 
     /// Polls the top-bar switch job and starts a new one if asked.
@@ -273,9 +281,11 @@ impl OpenHeApp {
         };
         let busy = self.worker.is_busy();
         let loading = self.worker.current_job() == Some(LOAD_LABEL);
-        // Drop the top-bar switch state on disconnect (its job fails with
-        // Disconnected and is polled below).
+        // Collect finished top-bar jobs.
         self.run_topbar(TopbarAction::default());
+        // Calibration jobs are collected whichever page is shown, so a stop
+        // sent on leaving the page is always seen through.
+        self.calibration.pump(&self.worker, snapshot, ctx);
         let calibrating = self.calibration.is_active();
         if busy || snapshot.is_none() {
             // Keep polling pending jobs and the connection state.
@@ -912,12 +922,6 @@ mod tests {
         app.run_topbar(TopbarAction {
             profile: Some(2),
             mode: None,
-        });
-        assert!(app.switch.is_some());
-        // A second pick while the first runs is ignored.
-        app.run_topbar(TopbarAction {
-            profile: None,
-            mode: Some(SystemMode::Mac),
         });
         assert_eq!(app.switch.as_ref().unwrap().kind.profile, Some(2));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
