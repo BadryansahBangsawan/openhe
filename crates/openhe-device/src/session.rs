@@ -55,9 +55,19 @@ impl<T: Transport> Session<T> {
     /// that must not be repeated (factory reset) or that make the keyboard
     /// re-enumerate (polling rate). Draining and reply matching are the same.
     pub fn call_once(&mut self, req: &Request) -> Result<Response, Error> {
-        let mut out = self.exchange_with(req, 1, 1)?;
-        let first = out.remove(0);
-        Ok(Response::decode(&first)?)
+        self.call_once_tracked(req).0
+    }
+
+    /// `call_once`, also telling whether the frame reached the transport:
+    /// `false` means the call failed before anything was written (encoding,
+    /// the pre-write drain, or the write itself), so the keyboard never saw
+    /// the request.
+    pub fn call_once_tracked(&mut self, req: &Request) -> (Result<Response, Error>, bool) {
+        let mut wrote = false;
+        let res = self
+            .exchange_tracked(req, 1, 1, &mut wrote)
+            .and_then(|mut out| Ok(Response::decode(&out.remove(0))?));
+        (res, wrote)
     }
 
     /// Non-blocking read of whatever input is waiting: protocol replies, in
@@ -105,19 +115,22 @@ impl<T: Transport> Session<T> {
     }
 
     fn exchange(&mut self, req: &Request, n: usize) -> Result<Vec<[u8; 64]>, Error> {
-        self.exchange_with(req, n, MAX_ATTEMPTS)
+        self.exchange_tracked(req, n, MAX_ATTEMPTS, &mut false)
     }
 
-    fn exchange_with(
+    /// `*wrote` is set once a write has succeeded.
+    fn exchange_tracked(
         &mut self,
         req: &Request,
         n: usize,
         attempts: usize,
+        wrote: &mut bool,
     ) -> Result<Vec<[u8; 64]>, Error> {
         let frame = req.encode()?;
         for _ in 0..attempts {
             self.drain()?;
             self.t.write(&frame)?;
+            *wrote = true;
             let deadline = Instant::now() + Duration::from_millis(ATTEMPT_MS);
             let mut got: Vec<[u8; 64]> = Vec::new();
             while got.len() < n {
@@ -345,7 +358,7 @@ mod tests {
     #[test]
     fn call_many_collects_continuations() {
         let mut m = MockTransport::new();
-        let mut a = reply(0x80 | 0x12, 0);
+        let mut a = reply(0x80 | 0x12, 2);
         a[10] = 1;
         let mut b = [0u8; 64];
         b[0] = 7;
@@ -357,7 +370,7 @@ mod tests {
         let mut s = Session::new(m);
         let req = Request {
             cmd: openhe_proto::frame::Cmd::Rm6x21,
-            payload: vec![],
+            payload: vec![2, 1, 0xFF, 0xFF],
         };
         let v = s.call_many(&req, 3).unwrap();
         assert_eq!(v.len(), 3);
@@ -401,6 +414,29 @@ mod tests {
         let e = s.call_once(&key::get(4, KeyParam::Actuation)).unwrap_err();
         assert_eq!(e, Error::Frame(FrameError::DeviceFail));
         assert_eq!(s.transport().written().len(), 1);
+    }
+
+    #[test]
+    fn call_once_tracked_says_whether_the_frame_was_written() {
+        let mut m = MockTransport::new();
+        m.fail_with(Error::Disconnected); // fails the drain, before any write
+        let mut s = Session::new(m);
+        let (r, wrote) = s.call_once_tracked(&key::get(4, KeyParam::Actuation));
+        assert_eq!(r.unwrap_err(), Error::Disconnected);
+        assert!(!wrote);
+        assert!(s.transport().written().is_empty());
+
+        let mut s = Session::new(MockTransport::new());
+        let (r, wrote) = s.call_once_tracked(&key::get(4, KeyParam::Actuation));
+        assert_eq!(r.unwrap_err(), Error::Timeout);
+        assert!(wrote);
+
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(4, 4, 7));
+        let mut s = Session::new(m);
+        let (r, wrote) = s.call_once_tracked(&key::get(4, KeyParam::Actuation));
+        assert_eq!(key::parse_value(&r.unwrap()), Some((4, 4, 7)));
+        assert!(wrote);
     }
 
     #[test]

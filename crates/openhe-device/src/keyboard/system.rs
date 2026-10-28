@@ -62,19 +62,19 @@ pub enum WriteOutcome {
 impl<T: Transport> Keyboard<T> {
     /// Non-blocking: events queued by earlier calls (`take_events`), then
     /// whatever input is waiting right now. Nothing is written.
+    ///
+    /// The input is read first and the queue taken only afterwards, so a
+    /// transport error (e.g. `Disconnected`) leaves every queued event in
+    /// place for `take_events`.
     pub fn poll_events(&mut self) -> Result<Vec<DeviceEvent>, Error> {
+        let polled = self.session.try_poll()?;
         let mut out: Vec<DeviceEvent> = self
             .session
             .take_events()
             .iter()
             .map(DeviceEvent::from_response)
             .collect();
-        out.extend(
-            self.session
-                .try_poll()?
-                .iter()
-                .map(DeviceEvent::from_response),
-        );
+        out.extend(polled.iter().map(DeviceEvent::from_response));
         Ok(out)
     }
 
@@ -131,20 +131,25 @@ impl<T: Transport> Keyboard<T> {
 
     /// Sets the polling rate with exactly one attempt. The keyboard probably
     /// restarts, so a timeout or disconnect after the write is
-    /// `Reenumerating`, not an error; any other error propagates.
+    /// `Reenumerating`, not an error. An error before the frame was written
+    /// (e.g. the keyboard was already unplugged) propagates, as does any other
+    /// error.
     pub fn set_polling_rate(&mut self, r: PollingRate) -> Result<WriteOutcome, Error> {
-        match self
+        let (res, wrote) = self
             .session
-            .call_once(&order::set(OrderType::Polling, r.index()))
-        {
+            .call_once_tracked(&order::set(OrderType::Polling, r.index()));
+        match res {
             Ok(_) => Ok(WriteOutcome::Done),
-            Err(Error::Disconnected | Error::Timeout) => Ok(WriteOutcome::Reenumerating),
+            Err(Error::Disconnected | Error::Timeout) if wrote => Ok(WriteOutcome::Reenumerating),
             Err(e) => Err(e),
         }
     }
 
     /// Restores factory settings. Exactly one attempt, never retried: any
     /// matching reply is success, no reply is `Error::Timeout`.
+    ///
+    /// The board most likely restarts, so `Timeout` or `Disconnected` after a
+    /// reset means "re-read the device state", not necessarily failure.
     pub fn factory_reset(&mut self) -> Result<(), Error> {
         self.session
             .call_once(&order::query(OrderType::FactoryReset))?;
@@ -177,7 +182,7 @@ impl<T: Transport> Keyboard<T> {
     fn rm6x21_frame(&mut self, sub: u8) -> Result<TravelFrame, Error> {
         let top = self.rm6x21_half(sub, 1)?;
         let bottom = self.rm6x21_half(sub, 2)?;
-        Ok(TravelFrame::from_halves(&top, &bottom)?)
+        TravelFrame::from_halves(&top, &bottom).map_err(|e| Error::Io(e.to_string()))
     }
 
     fn rm6x21_half(&mut self, sub: u8, part: u8) -> Result<travel::TravelHalf, Error> {
@@ -503,7 +508,10 @@ mod tests {
     fn travel_with_the_wrong_sub_or_a_short_reply_is_an_error() {
         let mut m = MockTransport::new();
         push_all(&mut m, rm_reply(SUB_CALIBRATION, 0)); // asked for travel
-        assert!(matches!(kb(m).travel(), Err(Error::Io(_))));
+        let mut k = kb(m);
+        // The session does not take a reply with another SUB as the answer.
+        assert_eq!(k.travel(), Err(Error::Timeout));
+        assert_eq!(k.take_events()[0].raw[2], 0x92);
 
         // Header + only one continuation: the call times out, never guesses.
         let mut m = MockTransport::new();
@@ -575,6 +583,39 @@ mod tests {
         let mut m = MockTransport::new();
         m.fail_with(Error::Disconnected);
         assert_eq!(kb(m).poll_events(), Err(Error::Disconnected));
+    }
+
+    #[test]
+    fn poll_events_failure_keeps_queued_events() {
+        let mut m = MockTransport::new();
+        m.push_pending(order_reply(0x70, 3)); // drained into the queue by the call
+        m.push_reply(order_reply(0x21, 1));
+        let mut k = kb(m);
+        assert_eq!(k.system_mode(), Ok(Some(SystemMode::Windows)));
+        // The keyboard is unplugged before the next poll.
+        k.session_mut()
+            .transport_mut()
+            .fail_with(Error::Disconnected);
+        assert_eq!(k.poll_events(), Err(Error::Disconnected));
+        // The queued profile event is not lost.
+        let ev = k.take_events();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            DeviceEvent::from_response(&ev[0]),
+            DeviceEvent::ProfileChanged(3)
+        );
+    }
+
+    #[test]
+    fn set_polling_rate_disconnect_before_the_write_propagates() {
+        let mut m = MockTransport::new();
+        m.fail_with(Error::Disconnected);
+        let mut k = kb(m);
+        assert_eq!(
+            k.set_polling_rate(PollingRate::Hz1000),
+            Err(Error::Disconnected)
+        );
+        assert!(k.session_mut().transport().written().is_empty());
     }
 
     #[test]
