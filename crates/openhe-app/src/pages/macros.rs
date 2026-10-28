@@ -83,6 +83,9 @@ mod strings {
 
     pub const SKIPPED: &str = "Tombol ini dilewati karena belum didukung perekam:";
     pub const UNBALANCED: &str = "Ada tombol yang ditekan tetapi tidak dilepas:";
+    pub const UNBALANCED_BLOCK: &str =
+        "Tambahkan pelepasan untuk tombol yang masih ditekan sebelum memasang, supaya tidak ada tombol yang macet.";
+    pub const ADD_RELEASES: &str = "Tambahkan pelepasan otomatis";
     pub const TOO_MANY: &str = "Terlalu banyak langkah (maksimum 255).";
     pub const EMPTY_MACRO: &str = "Macro belum punya langkah.";
     pub const DELAY_TOO_LONG: &str = "Jeda terlalu panjang untuk keyboard.";
@@ -258,18 +261,43 @@ pub struct Recording {
 /// Turns key events into macro actions. The delay of an action is the time
 /// until the next recorded action ("jeda setelahnya"), measured between the
 /// timestamps passed in (seconds); the last action has delay 0.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Recorder {
     actions: Vec<MacroAction>,
     last_t: Option<f64>,
     held: Vec<u16>,
     mods: Mods,
     skipped: Vec<String>,
+    /// Most actions this recording may hold, releases of held keys
+    /// included.
+    room: usize,
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Recorder {
+            actions: Vec::new(),
+            last_t: None,
+            held: Vec::new(),
+            mods: Mods::default(),
+            skipped: Vec::new(),
+            room: MAX_ACTIONS,
+        }
+    }
 }
 
 impl Recorder {
     pub fn new() -> Recorder {
         Recorder::default()
+    }
+
+    /// A recorder that adds at most `room` actions (releases included), for
+    /// appending to a macro that already has steps.
+    pub fn with_room(room: usize) -> Recorder {
+        Recorder {
+            room: room.min(MAX_ACTIONS),
+            ..Recorder::default()
+        }
     }
 
     pub fn actions(&self) -> &[MacroAction] {
@@ -284,19 +312,36 @@ impl Recorder {
         self.actions.is_empty()
     }
 
-    /// No room for another action (the keyboard stores at most 255).
+    /// No room for another press and its release (the keyboard stores at
+    /// most 255 actions). The release of every key still held is always
+    /// kept free, so a recording that hits the limit still ends with every
+    /// key released.
     pub fn is_full(&self) -> bool {
-        self.actions.len() >= MAX_ACTIONS
+        self.actions.len() + self.held.len() + 2 > self.room
     }
 
     pub fn skipped(&self) -> &[String] {
         &self.skipped
     }
 
-    fn push(&mut self, code: u16, down: bool, t: f64) {
+    /// Records a press of `code` (and holds it) if there is room for it and
+    /// its release; false when full.
+    fn press(&mut self, code: u16, t: f64) -> bool {
         if self.is_full() {
-            return;
+            return false;
         }
+        self.held.push(code);
+        self.push(code, true, t);
+        true
+    }
+
+    /// Records the release of a held key (its room was kept free).
+    fn release(&mut self, at: usize, t: f64) {
+        let code = self.held.remove(at);
+        self.push(code, false, t);
+    }
+
+    fn push(&mut self, code: u16, down: bool, t: f64) {
         if let (Some(last_t), Some(prev)) = (self.last_t, self.actions.last_mut()) {
             let ms = ((t - last_t) * 1000.0).round();
             prev.delay_ms = ms.clamp(0.0, f64::from(MAX_U24)) as u32;
@@ -319,12 +364,10 @@ impl Recorder {
             let code = MODIFIER_CODES[i];
             if now[i] {
                 if !self.held.contains(&code) {
-                    self.held.push(code);
-                    self.push(code, true, t);
+                    self.press(code, t);
                 }
             } else if let Some(p) = self.held.iter().position(|c| *c == code) {
-                self.held.remove(p);
-                self.push(code, false, t);
+                self.release(p, t);
             }
         }
     }
@@ -357,11 +400,9 @@ impl Recorder {
             if self.held.contains(&code) {
                 return;
             }
-            self.held.push(code);
-            self.push(code, true, t);
+            self.press(code, t);
         } else if let Some(p) = self.held.iter().position(|c| *c == code) {
-            self.held.remove(p);
-            self.push(code, false, t);
+            self.release(p, t);
         }
     }
 
@@ -472,7 +513,33 @@ pub fn unbalanced_keys(steps: &[SavedMacroAction]) -> Vec<u16> {
     held
 }
 
+/// "Tambahkan pelepasan otomatis": appends a release for every key that is
+/// pressed and never released, the last pressed first. Adds nothing when
+/// they do not all fit in the 255-action limit. Returns how many were added.
+pub fn append_releases(steps: &mut Vec<SavedMacroAction>) -> usize {
+    let held = unbalanced_keys(steps);
+    if held.is_empty() || steps.len() + held.len() > MAX_ACTIONS {
+        return 0;
+    }
+    if let Some(last) = steps.last_mut() {
+        if last.delay_ms == 0 {
+            last.delay_ms = DEFAULT_STEP_DELAY_MS;
+        }
+    }
+    let n = held.len();
+    for (i, code) in held.into_iter().rev().enumerate() {
+        steps.push(SavedMacroAction {
+            code,
+            down: false,
+            delay_ms: if i + 1 < n { DEFAULT_STEP_DELAY_MS } else { 0 },
+        });
+    }
+    n
+}
+
 /// Why the macro cannot be sent yet (Indonesian), or `None` when it is fine.
+/// A key that is pressed and never released would stay pressed on the
+/// computer, so such a macro is not sent either.
 pub fn macro_problem(m: &SavedMacro) -> Option<&'static str> {
     if m.actions.is_empty() {
         return Some(strings::EMPTY_MACRO);
@@ -482,6 +549,9 @@ pub fn macro_problem(m: &SavedMacro) -> Option<&'static str> {
     }
     if m.actions.iter().any(|a| a.delay_ms > MAX_U24) || m.interval_ms > MAX_U24 {
         return Some(strings::DELAY_TOO_LONG);
+    }
+    if !unbalanced_keys(&m.actions).is_empty() {
+        return Some(strings::UNBALANCED_BLOCK);
     }
     None
 }
@@ -850,8 +920,10 @@ impl Page {
 
     // ------------------------------------------------------------ recording
 
-    fn start_recording(&mut self, time: f64) {
-        self.recorder = Some(Recorder::new());
+    /// Starts recording onto a macro that already has `existing` steps: the
+    /// recording stops before the 255-action limit, releases included.
+    fn start_recording(&mut self, time: f64, existing: usize) {
+        self.recorder = Some(Recorder::with_room(MAX_ACTIONS.saturating_sub(existing)));
         self.last_ui_time = time;
         self.notice = None;
         self.step_sel = None;
@@ -1176,7 +1248,7 @@ impl Page {
                             *m = fresh;
                         }
                     } else {
-                        self.start_recording(time);
+                        self.start_recording(time, m.actions.len());
                     }
                 }
                 let add = egui::Button::new(strings::ADD_STEP)
@@ -1271,6 +1343,13 @@ impl Page {
             ui.add_space(6.0);
             let names: Vec<String> = unbalanced.iter().map(|c| code_label(*c)).collect();
             card::hint(ui, format!("{} {}.", strings::UNBALANCED, names.join(", ")));
+            let fits = m.actions.len() + unbalanced.len() <= MAX_ACTIONS;
+            if ui
+                .add_enabled(fits, egui::Button::new(strings::ADD_RELEASES))
+                .clicked()
+            {
+                append_releases(&mut m.actions);
+            }
         }
         if let Some(p) = macro_problem(m) {
             if !m.actions.is_empty() {
@@ -2195,11 +2274,75 @@ mod tests {
             r.key(Key::A, Some(Key::A), i % 2 == 0, false, &NONE, f64::from(i));
         }
         assert!(r.is_full());
-        assert_eq!(r.len(), 255);
+        assert_eq!(r.len(), 254, "no room for one more press and its release");
         let mut r = Recorder::new();
         r.key(Key::A, Some(Key::A), true, false, &NONE, 0.0);
         r.key(Key::A, Some(Key::A), false, false, &NONE, 100_000.0);
         assert_eq!(r.actions()[0].delay_ms, MAX_U24, "24-bit delay limit");
+    }
+
+    #[test]
+    fn keys_held_at_the_limit_are_still_released() {
+        // A held all along, B tapped until the recorder is full: the
+        // recording ends balanced and within 255 steps.
+        let mut r = Recorder::new();
+        r.key(Key::A, Some(Key::A), true, false, &NONE, 0.0);
+        for i in 0..400 {
+            r.key(Key::B, Some(Key::B), i % 2 == 0, false, &NONE, f64::from(i));
+        }
+        assert!(r.is_full());
+        let rec = r.finish(500.0);
+        let steps: Vec<SavedMacroAction> = rec.actions.iter().copied().map(Into::into).collect();
+        assert!(steps.len() <= MAX_ACTIONS, "{}", steps.len());
+        assert!(unbalanced_keys(&steps).is_empty());
+        assert_eq!(steps.last().map(|a| (a.code, a.down)), Some((0x04, false)));
+    }
+
+    #[test]
+    fn a_recording_appended_to_a_macro_fits_with_its_releases() {
+        // 250 steps already: room for 5 more, releases included.
+        let mut r = Recorder::with_room(MAX_ACTIONS - 250);
+        r.key(Key::A, Some(Key::A), true, false, &NONE, 0.0);
+        r.key(Key::B, Some(Key::B), true, false, &NONE, 0.1);
+        r.key(Key::C, Some(Key::C), true, false, &NONE, 0.2); // no room
+        assert!(r.is_full());
+        let rec = r.finish(1.0);
+        assert_eq!(rec.actions.len(), 4);
+        let mut m: Vec<SavedMacroAction> = (0..250).map(|i| act(0x04, i % 2 == 0, 0)).collect();
+        let new: Vec<SavedMacroAction> = rec.actions.into_iter().map(Into::into).collect();
+        step_insert(&mut m, None, &new);
+        assert_eq!(m.len(), 254);
+        assert!(unbalanced_keys(&m).is_empty(), "nothing cut off");
+        assert!(Recorder::with_room(1).is_full());
+    }
+
+    #[test]
+    fn unbalanced_macros_cannot_be_bound_until_released() {
+        let mut m = SavedMacro::new("x");
+        m.actions = vec![act(0xE0, true, 0), act(0x06, true, 10), act(0xE0, false, 0)];
+        assert_eq!(macro_problem(&m), Some(strings::UNBALANCED_BLOCK));
+        // "Tambahkan pelepasan otomatis": the missing releases, last pressed
+        // first.
+        let mut two = vec![act(0xE0, true, 0), act(0x06, true, 10)];
+        assert_eq!(append_releases(&mut two), 2);
+        assert_eq!(
+            two[2..],
+            [act(0x06, false, DEFAULT_STEP_DELAY_MS), act(0xE0, false, 0)]
+        );
+        assert_eq!(append_releases(&mut m.actions), 1);
+        assert_eq!(macro_problem(&m), None);
+        assert_eq!(append_releases(&mut m.actions), 0, "nothing left");
+        // No room for all of them: nothing is added, the problem stays.
+        // 4 and 5 pressed, then 6 tapped up to the limit (pressed last).
+        let mut full: Vec<SavedMacroAction> = (0..MAX_ACTIONS as u16)
+            .map(|i| match i {
+                0 | 1 => act(0x04 + i, true, 0),
+                _ => act(0x06, i % 2 == 0, 0),
+            })
+            .collect();
+        assert_eq!(unbalanced_keys(&full), vec![0x04, 0x05, 0x06]);
+        assert_eq!(append_releases(&mut full), 0);
+        assert_eq!(full.len(), MAX_ACTIONS);
     }
 
     // ---- step editor
@@ -2270,7 +2413,9 @@ mod tests {
         assert!(unbalanced_keys(&[act(1, true, 0), act(1, false, 0)]).is_empty());
         let mut m = SavedMacro::new("x");
         assert_eq!(macro_problem(&m), Some(strings::EMPTY_MACRO));
-        m.actions = steps();
+        m.actions = steps(); // keys 1 and 2 are never released
+        assert_eq!(macro_problem(&m), Some(strings::UNBALANCED_BLOCK));
+        m.actions = vec![act(1, true, 10), act(1, false, 0)];
         assert_eq!(macro_problem(&m), None);
         m.actions[0].delay_ms = MAX_U24 + 1;
         assert_eq!(macro_problem(&m), Some(strings::DELAY_TOO_LONG));
@@ -2685,7 +2830,7 @@ mod tests {
         crate::theme::apply(&egui_ctx);
         let status = ConnectionStatus::Searching;
         let mut page = Page::default();
-        page.start_recording(0.0);
+        page.start_recording(0.0, 0);
 
         let key = |key, pressed, mods: Modifiers| Event::Key {
             key,
