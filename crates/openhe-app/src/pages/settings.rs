@@ -1513,7 +1513,15 @@ impl Page {
                 }
             });
             setting_row(ui, t::LANGUAGE, None, true, |ui| {
-                ui.add_enabled(false, egui::Button::new(t::LANGUAGE_ID));
+                // One language: a read-only field, not a greyed-out button.
+                egui::Frame::new()
+                    .fill(color::BG)
+                    .stroke(line(1.0, color::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
+                    .inner_margin(egui::Margin::symmetric(14, 6))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(t::LANGUAGE_ID).color(color::TEXT));
+                    });
             });
             setting_row(ui, t::THEME, None, false, |ui| {
                 let themes = [
@@ -1681,10 +1689,8 @@ impl Page {
             self.auto
                 .set_rules(ctx.data.borrow().app_profile_rules.clone());
         }
-        if changed {
-            if ctx.save_data().is_err() {
-                self.app_error = Some(t::SAVE_FAILED.to_string());
-            }
+        if changed && ctx.save_data().is_err() {
+            self.app_error = Some(t::SAVE_FAILED.to_string());
         }
     }
 
@@ -1805,15 +1811,26 @@ fn setting_row(
     rule: bool,
     right: impl FnOnce(&mut Ui),
 ) {
+    // The control first (from the right), then the title and hint in the
+    // room left of it: a long hint wraps instead of running under the
+    // control.
     let r = ui
         .horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(title).color(color::TEXT));
-                if let Some(h) = hint {
-                    ui.label(RichText::new(h).font(font::small()).color(color::MUTED));
-                }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                right(ui);
+                ui.add_space(16.0);
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    ui.label(RichText::new(title).color(color::TEXT));
+                    if let Some(h) = hint {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(h).font(font::small()).color(color::MUTED),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
             });
-            ui.with_layout(Layout::right_to_left(Align::Center), right);
         })
         .response;
     if rule {
@@ -1827,14 +1844,19 @@ fn setting_row(
 }
 
 fn danger_button(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(RichText::new(text).color(color::DANGER).strong())
-            .fill(color::BG)
-            .stroke(line(1.0, color::DANGER.gamma_multiply(0.7)))
-            .corner_radius(CornerRadius::same(size::CONTROL_RADIUS + 2))
-            .min_size(egui::vec2(ui.available_width(), 40.0)),
-    )
+    // Full width with the text centred (egui left-aligns a button's text
+    // when it is only stretched by `min_size`).
+    ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(RichText::new(text).color(color::DANGER).strong())
+                .fill(color::BG)
+                .stroke(line(1.0, color::DANGER.gamma_multiply(0.7)))
+                .corner_radius(CornerRadius::same(size::CONTROL_RADIUS + 2))
+                .min_size(egui::vec2(ui.available_width(), 40.0)),
+        )
+    })
+    .inner
 }
 
 #[cfg(test)]
