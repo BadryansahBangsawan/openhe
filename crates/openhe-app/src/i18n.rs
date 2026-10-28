@@ -230,6 +230,8 @@ pub mod perf {
 /// background profile switcher (Track F).
 pub mod events {
     pub const PROFILE_SWITCH_FAILED: &str = "Gagal mengganti profil.";
+    pub const PROFILE_RECONNECTING: &str =
+        "Profil diganti; keyboard tersambung ulang sebentar. Menyambung ulang…";
     pub const MODE_SWITCH_FAILED: &str = "Gagal mengganti mode Win/Mac.";
     pub const LOCKED_CALIBRATING: &str = "Hentikan kalibrasi dulu";
     pub const CALIBRATION_OWED: &str =

@@ -4,9 +4,12 @@
 //! login, device info and factory reset.
 //!
 //! Also home of the profile and Win/Mac switch jobs, which the top bar
-//! shares, and of the restart flow ([`Restart`]) for writes after which the
-//! keyboard re-enumerates (polling rate, factory reset): the page shows
-//! "Menyambung ulang…", never an error, while the worker reconnects.
+//! shares, and of the restart flow ([`Restart`], [`RestartRun`]) for writes
+//! after which the keyboard re-enumerates (polling rate, factory reset, and
+//! a profile switch: PROTOCOL 7.x finding 23): "Menyambung ulang…", never an
+//! error, while the worker reconnects, then a check of what the reconnected
+//! keyboard reports. Win/Mac is stored per profile, so after a profile
+//! switch the mode comes from the reconnected keyboard's snapshot.
 
 pub mod os;
 pub mod profile_file;
@@ -34,36 +37,21 @@ use std::time::{Duration, Instant};
 
 // ------------------------------------------------------- switch jobs
 
-/// What a profile or Win/Mac switch job did: the write result, and the
-/// value read back afterwards (also after a failed write).
+/// What a Win/Mac switch job did: the write result, and the mode read
+/// back afterwards (also after a failed write).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchOutcome {
     pub write: Result<(), Error>,
-    /// The profile read back (profile switches only); `None` when the
-    /// re-read failed.
-    pub profile: Option<u8>,
-    /// The mode read back (mode switches only); `None` when the re-read
-    /// failed.
+    /// The mode read back; `None` when the re-read failed.
     pub system_mode: Option<Option<SystemMode>>,
 }
 
-/// Switches the onboard profile (0..=3), then reads it back. A disconnect
-/// at any point is `Err(Disconnected)`, so the worker reconnects.
-pub fn profile_job<T: Transport>(kb: &mut Keyboard<T>, idx: u8) -> Result<SwitchOutcome, Error> {
-    let write = kb.set_profile(idx);
-    if write == Err(Error::Disconnected) {
-        return Err(Error::Disconnected);
-    }
-    let profile = match kb.profile() {
-        Ok(p) => Some(p),
-        Err(Error::Disconnected) => return Err(Error::Disconnected),
-        Err(_) => None,
-    };
-    Ok(SwitchOutcome {
-        write,
-        profile,
-        system_mode: None,
-    })
+/// Switches the onboard profile (0..=3) with one attempt. The keyboard
+/// re-enumerates afterwards, so this is a restart write: run it through
+/// [`RestartRun`] with [`RestartKind::Profile`], which reconnects and checks
+/// the profile of the reconnected keyboard.
+pub fn profile_job<T: Transport>(kb: &mut Keyboard<T>, idx: u8) -> Result<WriteOutcome, Error> {
+    kb.set_profile(idx)
 }
 
 /// Switches Win/Mac mode, then reads it back.
@@ -80,30 +68,24 @@ pub fn system_mode_job<T: Transport>(
         Err(Error::Disconnected) => return Err(Error::Disconnected),
         Err(_) => None,
     };
-    Ok(SwitchOutcome {
-        write,
-        profile: None,
-        system_mode,
-    })
+    Ok(SwitchOutcome { write, system_mode })
 }
 
-/// What the UI does with a finished switch job.
+/// What the UI does with a finished Win/Mac switch job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchEffects {
-    /// Patch the snapshot's profile with this (read back).
-    pub profile: Option<u8>,
     /// Patch the snapshot's Win/Mac mode with this (read back).
     pub system_mode: Option<Option<SystemMode>>,
-    /// A profile or mode switch changes what the keys do: re-read all.
+    /// A mode switch may change the layout: re-read all.
     pub request_reload: bool,
     /// Indonesian error text.
     pub error: Option<String>,
     pub technical: Option<String>,
 }
 
-/// Turns a switch job result into UI effects. Every finished job reloads
-/// the snapshot (a new profile has new key settings; a new mode may change
-/// the layout), except a disconnect, after which the worker reloads anyway.
+/// Turns a mode switch job result into UI effects. Every finished job
+/// reloads the snapshot (a new mode may change the layout), except a
+/// disconnect, after which the worker reloads anyway.
 pub fn switch_effects(result: Result<SwitchOutcome, Error>, failed: &str) -> SwitchEffects {
     match result {
         Ok(out) => {
@@ -115,7 +97,6 @@ pub fn switch_effects(result: Result<SwitchOutcome, Error>, failed: &str) -> Swi
                 ),
             };
             SwitchEffects {
-                profile: out.profile,
                 system_mode: out.system_mode,
                 request_reload: true,
                 error,
@@ -123,7 +104,6 @@ pub fn switch_effects(result: Result<SwitchOutcome, Error>, failed: &str) -> Swi
             }
         }
         Err(e) => SwitchEffects {
-            profile: None,
             system_mode: None,
             request_reload: e != Error::Disconnected,
             error: Some(format!("{failed} {}", i18n::device_error(&e))),
@@ -137,16 +117,8 @@ pub fn apply_switch_effects(
     worker: &crate::worker::Worker,
     fx: SwitchEffects,
 ) -> Option<(String, Option<String>)> {
-    if fx.profile.is_some() || fx.system_mode.is_some() {
-        let (p, m) = (fx.profile, fx.system_mode);
-        worker.patch_snapshot(move |s| {
-            if let Some(p) = p {
-                s.profile = p;
-            }
-            if let Some(m) = m {
-                s.system_mode = m;
-            }
-        });
+    if let Some(m) = fx.system_mode {
+        worker.patch_snapshot(move |s| s.system_mode = m);
     }
     if fx.request_reload {
         worker.request_reload();
@@ -166,13 +138,16 @@ pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub enum RestartKind {
     Polling(PollingRate),
     FactoryReset,
+    /// A switch to this profile (0..=3).
+    Profile(u8),
 }
 
-/// The polling-rate / factory-reset flow (Review Focus 4): the write, then
+/// The polling-rate / factory-reset / profile-switch flow (Review Focus 4): the write, then
 /// "Menyambung ulang…" (never an error) while the worker reconnects, then a
 /// check of what the keyboard reports.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Restart {
+    #[default]
     Idle,
     /// The write is queued or running; `connects` is
     /// [`Worker::connects`] when it was sent.
@@ -265,6 +240,14 @@ impl Restart {
                         None,
                     ),
                     RestartKind::FactoryReset => Restart::Done(t::RESET_DONE.to_string()),
+                    // The new connection read the profile (and the Win/Mac
+                    // mode, which is stored per profile) from the keyboard.
+                    RestartKind::Profile(p) if s.profile == p => {
+                        Restart::Done(format!("{} {}.", t::PROFILE_DONE, p + 1))
+                    }
+                    RestartKind::Profile(_) => {
+                        Restart::Failed(format!("{} {}.", t::PROFILE_MISMATCH, s.profile + 1), None)
+                    }
                 };
             }
             _ if now.duration_since(since) >= RECONNECT_TIMEOUT => {
@@ -272,6 +255,81 @@ impl Restart {
             }
             _ => {}
         }
+    }
+}
+
+/// What a restart flow needs from the worker: [`crate::worker::Worker`]
+/// and [`WorkerHandle`] in the app.
+pub trait RestartPort {
+    /// [`crate::worker::Worker::connects`].
+    fn connects(&self) -> u64;
+    /// Drop the keyboard and reconnect after `pause`.
+    fn reconnect(&self, pause: Duration);
+    fn request_reload(&self);
+}
+
+impl<T: Transport + 'static> RestartPort for crate::worker::Worker<T> {
+    fn connects(&self) -> u64 {
+        crate::worker::Worker::connects(self)
+    }
+    fn reconnect(&self, pause: Duration) {
+        crate::worker::Worker::reconnect(self, pause);
+    }
+    fn request_reload(&self) {
+        crate::worker::Worker::request_reload(self);
+    }
+}
+
+impl<T: Transport + 'static> RestartPort for WorkerHandle<T> {
+    fn connects(&self) -> u64 {
+        WorkerHandle::<T>::connects(self)
+    }
+    fn reconnect(&self, pause: Duration) {
+        WorkerHandle::<T>::reconnect(self, pause);
+    }
+    fn request_reload(&self) {
+        WorkerHandle::request_reload(self);
+    }
+}
+
+/// One restart flow with its write job: the state machine ([`Restart`])
+/// plus the plumbing every caller needs (the settings page, the top bar,
+/// the per-app switcher).
+#[derive(Default)]
+pub struct RestartRun {
+    pub state: Restart,
+    job: Option<Pending<WriteOutcome>>,
+}
+
+impl RestartRun {
+    /// The write `job` was submitted for `kind`; `connects` is the
+    /// worker's count at that moment.
+    pub fn start(&mut self, kind: RestartKind, connects: u64, job: Pending<WriteOutcome>) {
+        self.state = Restart::begin(kind, connects);
+        self.job = Some(job);
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.state.is_busy()
+    }
+
+    /// Collects the write job (asking the worker to reconnect, or to
+    /// reload after a failed write) and follows the reconnect.
+    pub fn pump(
+        &mut self,
+        port: &impl RestartPort,
+        snapshot: Option<&DeviceSnapshot>,
+        now: Instant,
+    ) {
+        if let Some(r) = self.job.as_mut().and_then(Pending::poll) {
+            self.job = None;
+            match self.state.job_done(r, now) {
+                RestartAction::Reconnect => port.reconnect(RECONNECT_PAUSE),
+                RestartAction::Reload => port.request_reload(),
+                RestartAction::None => {}
+            }
+        }
+        self.state.observe(port.connects(), snapshot, now);
     }
 }
 
@@ -350,16 +408,16 @@ impl AutoSwitch {
 
 /// What the per-app switcher needs from the worker. [`WorkerHandle`] in
 /// the app; a fake in tests.
-pub trait SwitchPort {
+pub trait SwitchPort: RestartPort {
     /// The active profile while connected.
     fn profile(&self) -> Option<u8>;
-    /// The worker is busy (a job queued or running, or loading) or may be
-    /// calibrating (its calibration guard is set).
+    /// The snapshot while connected (read while a switch reconnects).
+    fn snapshot(&self) -> Option<DeviceSnapshot>;
+    /// The worker is busy (a job queued or running, or loading), restarting
+    /// (a reconnect after a re-enumerating write) or may be calibrating.
     fn locked(&self) -> bool;
-    /// Starts a profile switch ([`profile_job`]).
-    fn switch(&self, profile: u8) -> Pending<SwitchOutcome>;
-    /// Applies a finished switch: patches the snapshot, asks for a reload.
-    fn apply(&self, fx: SwitchEffects);
+    /// Submits a profile switch ([`profile_job`]).
+    fn switch(&self, profile: u8) -> Pending<WriteOutcome>;
 }
 
 impl<T: Transport + 'static> SwitchPort for WorkerHandle<T> {
@@ -367,29 +425,16 @@ impl<T: Transport + 'static> SwitchPort for WorkerHandle<T> {
         WorkerHandle::profile(self)
     }
 
+    fn snapshot(&self) -> Option<DeviceSnapshot> {
+        WorkerHandle::<T>::snapshot(self)
+    }
+
     fn locked(&self) -> bool {
-        self.is_busy() || self.calibration_guard()
+        self.is_busy() || self.is_restarting() || self.calibration_guard()
     }
 
-    fn switch(&self, profile: u8) -> Pending<SwitchOutcome> {
+    fn switch(&self, profile: u8) -> Pending<WriteOutcome> {
         self.submit("auto-profile", move |kb| profile_job(kb, profile))
-    }
-
-    fn apply(&self, fx: SwitchEffects) {
-        if fx.profile.is_some() || fx.system_mode.is_some() {
-            let (p, m) = (fx.profile, fx.system_mode);
-            self.patch_snapshot(move |s| {
-                if let Some(p) = p {
-                    s.profile = p;
-                }
-                if let Some(m) = m {
-                    s.system_mode = m;
-                }
-            });
-        }
-        if fx.request_reload {
-            self.request_reload();
-        }
     }
 }
 
@@ -435,36 +480,54 @@ impl AutoShared {
 #[derive(Default)]
 pub struct AutoSwitcher {
     decide: AutoSwitch,
-    pending: Option<Pending<SwitchOutcome>>,
+    /// The running switch: write, reconnect, check of the new profile.
+    run: RestartRun,
 }
 
 impl AutoSwitcher {
     /// One watcher tick with the app in front (`None`: OpenHE itself or
-    /// unknown). Collects a finished switch, then starts one when a rule
-    /// asks for it and nothing holds switches back. True when a switch
+    /// unknown). Follows a running switch through the keyboard's
+    /// reconnect, then starts one when a rule asks for it and nothing holds
+    /// switches back (never while a switch reconnects). True when a switch
     /// finished (the UI may want to repaint).
     pub fn tick(&mut self, app: Option<&str>, port: &impl SwitchPort, shared: &AutoShared) -> bool {
+        self.tick_at(app, port, shared, Instant::now())
+    }
+
+    fn tick_at(
+        &mut self,
+        app: Option<&str>,
+        port: &impl SwitchPort,
+        shared: &AutoShared,
+        now: Instant,
+    ) -> bool {
         if shared.rules_changed.swap(false, Ordering::SeqCst) {
             self.decide = AutoSwitch::default();
         }
         let mut finished = false;
-        if let Some(r) = self.pending.as_mut().and_then(Pending::poll) {
-            self.pending = None;
-            finished = true;
-            let fx = switch_effects(r, i18n::events::AUTO_SWITCH_FAILED);
-            if let Some(e) = fx.error.clone() {
-                *shared.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+        if self.run.is_busy() {
+            let snap = port.snapshot();
+            self.run.pump(port, snap.as_ref(), now);
+            match std::mem::take(&mut self.run.state) {
+                Restart::Done(_) => finished = true,
+                Restart::Failed(msg, _) => {
+                    finished = true;
+                    let e = format!("{} {msg}", i18n::events::AUTO_SWITCH_FAILED);
+                    *shared.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                }
+                other => self.run.state = other,
             }
-            port.apply(fx);
         }
-        if self.pending.is_some() || shared.ui_lock.load(Ordering::SeqCst) || port.locked() {
+        if self.run.is_busy() || shared.ui_lock.load(Ordering::SeqCst) || port.locked() {
             return finished;
         }
         let Some(current) = port.profile() else {
             return finished;
         };
         if let Some(p) = self.decide.decide(app, &shared.rules(), current) {
-            self.pending = Some(port.switch(p));
+            let connects = port.connects();
+            self.run
+                .start(RestartKind::Profile(p), connects, port.switch(p));
         }
         finished
     }
@@ -564,9 +627,10 @@ mod strings {
     pub const POLLING_DONE: &str = "Polling rate sekarang";
     pub const POLLING_MISMATCH: &str = "Keyboard tersambung lagi, tapi melaporkan";
     pub const RESET_DONE: &str = "Keyboard sudah direset ke bawaan pabrik dan dibaca ulang.";
+    pub const PROFILE_DONE: &str = "Keyboard tersambung lagi dengan Profil";
+    pub const PROFILE_MISMATCH: &str = "Keyboard tersambung lagi, tapi melaporkan Profil";
     pub const NOT_BACK: &str = "Keyboard belum tersambung lagi. Cabut lalu colokkan kembali.";
     pub const WRITE_FAILED: &str = "Perintah tidak terkirim.";
-    pub const SWITCH_FAILED: &str = "Gagal mengganti profil.";
     pub const MODE_FAILED: &str = "Gagal mengganti mode sistem.";
 }
 use strings as t;
@@ -684,8 +748,9 @@ pub struct Page {
     /// A profile name changed and is not saved yet.
     name_save: Debounce,
     switch_error: Option<(String, Option<String>)>,
-    restart: Restart,
-    restart_job: Option<Pending<WriteOutcome>>,
+    /// Polling change, factory reset or profile switch (the keyboard
+    /// re-enumerates after each).
+    restart: RestartRun,
     /// What the last restart flow was for (its status shows there).
     last_restart: Option<RestartKind>,
     /// Polling segment shown while a change is under way.
@@ -709,8 +774,7 @@ impl Default for Page {
             switch: None,
             name_save: Debounce::new(NAME_SAVE_DELAY),
             switch_error: None,
-            restart: Restart::Idle,
-            restart_job: None,
+            restart: RestartRun::default(),
             last_restart: None,
             polling_target: None,
             transfer: Transfer::Idle,
@@ -746,16 +810,7 @@ impl Page {
                 self.switch_error = apply_switch_effects(ctx.worker, switch_effects(r, failed));
             }
         }
-        if let Some(r) = self.restart_job.as_mut().and_then(Pending::poll) {
-            self.restart_job = None;
-            match self.restart.job_done(r, now) {
-                RestartAction::Reconnect => ctx.worker.reconnect(RECONNECT_PAUSE),
-                RestartAction::Reload => ctx.worker.request_reload(),
-                RestartAction::None => {}
-            }
-        }
-        self.restart
-            .observe(ctx.worker.connects(), ctx.snapshot, now);
+        self.restart.pump(ctx.worker, ctx.snapshot, now);
         if !self.restart.is_busy() {
             self.polling_target = None;
         } else {
@@ -845,7 +900,7 @@ impl Page {
                 let kind = RestartKind::Polling(PollingRate::Hz1000);
                 self.polling_target = Some(PollingRate::Hz1000);
                 self.last_restart = Some(kind);
-                self.restart = Restart::Reconnecting {
+                self.restart.state = Restart::Reconnecting {
                     kind,
                     connects: u64::MAX,
                     since: Instant::now() + Duration::from_secs(3600),
@@ -1009,6 +1064,7 @@ impl Page {
                 }
             });
             self.profile_cards(ctx, ui, can);
+            self.restart_status(ui, |k| matches!(k, RestartKind::Profile(_)));
             ui.add_space(4.0);
             card::hint(ui, t::NAME_HINT);
             if let Some((e, tech)) = &self.switch_error {
@@ -1022,10 +1078,25 @@ impl Page {
     fn change_polling(&mut self, ctx: &AppCtx, rate: PollingRate) {
         self.polling_target = Some(rate);
         self.last_restart = Some(RestartKind::Polling(rate));
-        self.restart = Restart::begin(RestartKind::Polling(rate), ctx.worker.connects());
-        self.restart_job = Some(
+        self.restart.start(
+            RestartKind::Polling(rate),
+            ctx.worker.connects(),
             ctx.worker
                 .submit("set-polling", move |kb| polling_job(kb, rate)),
+        );
+    }
+
+    /// A profile switch re-enumerates the keyboard: the restart flow
+    /// reconnects, and the reconnected keyboard's profile is checked.
+    fn switch_profile(&mut self, ctx: &AppCtx, idx: u8) {
+        self.switch_error = None;
+        let kind = RestartKind::Profile(idx);
+        self.last_restart = Some(kind);
+        self.restart.start(
+            kind,
+            ctx.worker.connects(),
+            ctx.worker
+                .submit("set-profile", move |kb| profile_job(kb, idx)),
         );
     }
 
@@ -1033,8 +1104,11 @@ impl Page {
         self.reset_open = false;
         self.reset_text.clear();
         self.last_restart = Some(RestartKind::FactoryReset);
-        self.restart = Restart::begin(RestartKind::FactoryReset, ctx.worker.connects());
-        self.restart_job = Some(ctx.worker.submit("factory-reset", reset_job));
+        self.restart.start(
+            RestartKind::FactoryReset,
+            ctx.worker.connects(),
+            ctx.worker.submit("factory-reset", reset_job),
+        );
     }
 
     /// The status line of the last restart flow, under the control that
@@ -1043,11 +1117,11 @@ impl Page {
         let Some(kind) = self.last_restart.filter(|k| mine(*k)) else {
             return;
         };
-        match &self.restart {
+        match &self.restart.state {
             Restart::Sending { .. } | Restart::Reconnecting { .. } => {
                 let text = match kind {
                     RestartKind::FactoryReset => t::RESTARTING,
-                    RestartKind::Polling(_) => t::RECONNECTING,
+                    RestartKind::Polling(_) | RestartKind::Profile(_) => t::RECONNECTING,
                 };
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -1142,12 +1216,7 @@ impl Page {
             self.app_error = Some(t::SAVE_FAILED.to_string());
         }
         if let Some(i) = switch_to {
-            self.switch_error = None;
-            self.switch = Some((
-                ctx.worker
-                    .submit("set-profile", move |kb| profile_job(kb, i)),
-                t::SWITCH_FAILED,
-            ));
+            self.switch_profile(ctx, i);
         }
     }
 
@@ -1689,51 +1758,58 @@ mod tests {
         Keyboard::new(m, Model::Win68HeMax)
     }
 
+    /// A profile switch re-enumerates the keyboard (PROTOCOL 7.x finding
+    /// 23): one write, no read-back on the dying connection.
     #[test]
-    fn profile_switch_writes_verifies_and_rereads() {
+    fn a_profile_switch_job_is_one_write_that_expects_a_restart() {
         let mut m = MockTransport::new();
-        m.push_reply(order_reply(0x70, 2)); // SET
-        m.push_reply(order_reply(0x70, 2)); // verify
-        m.push_reply(order_reply(0x70, 2)); // re-read
-        let out = profile_job(&mut kb(m), 2).unwrap();
-        assert_eq!(out.write, Ok(()));
-        assert_eq!(out.profile, Some(2));
-        let fx = switch_effects(Ok(out), "x");
-        assert_eq!(fx.profile, Some(2));
-        assert!(fx.request_reload);
-        assert_eq!(fx.error, None);
+        m.push_reply(order_reply(0x70, 2));
+        let mut k = kb(m);
+        assert_eq!(profile_job(&mut k, 2), Ok(WriteOutcome::Done));
+        assert_eq!(k.session_mut().transport().written().len(), 1);
+        let mut k = kb(MockTransport::new());
+        assert_eq!(profile_job(&mut k, 3), Ok(WriteOutcome::Reenumerating));
+        assert_eq!(k.session_mut().transport().written().len(), 1);
+    }
+
+    fn snap_on(profile: u8, mode: SystemMode) -> DeviceSnapshot {
+        let mut s = crate::app::test_support::snapshot68();
+        s.profile = profile;
+        s.system_mode = Some(mode);
+        s
     }
 
     #[test]
-    fn a_failed_profile_switch_still_rereads_and_reloads() {
-        let mut m = MockTransport::new();
-        m.push_reply(order_reply(0x70, 2)); // SET
-        m.push_reply(order_reply(0x70, 1)); // verify: stayed on 1
-        m.push_reply(order_reply(0x70, 1)); // re-read
-        let out = profile_job(&mut kb(m), 2).unwrap();
-        assert!(out.write.is_err());
-        assert_eq!(out.profile, Some(1));
-        let fx = switch_effects(Ok(out), "Gagal.");
+    fn a_profile_switch_reconnects_then_checks_the_reconnected_profile() {
+        let t0 = Instant::now();
+        let mut f = Restart::begin(RestartKind::Profile(2), 1);
         assert_eq!(
-            fx.profile,
-            Some(1),
-            "the screen shows what the keyboard has"
+            f.job_done(Ok(WriteOutcome::Reenumerating), t0),
+            RestartAction::Reconnect
         );
-        assert!(fx.request_reload);
-        let e = fx.error.unwrap();
-        assert!(e.starts_with("Gagal. "), "{e}");
-        assert!(!e.contains("verify"), "no English: {e}");
-    }
+        // Still the old connection: nothing to check yet.
+        f.observe(1, Some(&snap_on(0, SystemMode::Windows)), t0);
+        assert!(f.is_busy());
+        f.observe(1, None, t0);
+        assert!(f.is_busy());
+        // The reconnected keyboard reports profile 2 (with its own mode).
+        f.observe(2, Some(&snap_on(2, SystemMode::Mac)), t0);
+        assert_eq!(f, Restart::Done(format!("{} 3.", t::PROFILE_DONE)));
 
-    #[test]
-    fn a_failing_reread_leaves_the_value_unpatched() {
-        // No replies: SET times out, the re-read too.
-        let out = profile_job(&mut kb(MockTransport::new()), 3).unwrap();
-        assert_eq!(out.write, Err(Error::Timeout));
-        assert_eq!(out.profile, None);
-        let fx = switch_effects(Ok(out), "x");
-        assert_eq!(fx.profile, None);
-        assert!(fx.request_reload);
+        let mut f = Restart::begin(RestartKind::Profile(2), 1);
+        f.job_done(Ok(WriteOutcome::Done), t0);
+        f.observe(2, Some(&snap_on(0, SystemMode::Mac)), t0);
+        assert_eq!(
+            f,
+            Restart::Failed(format!("{} 1.", t::PROFILE_MISMATCH), None)
+        );
+        // A disconnect while sending: the worker reconnects on its own.
+        let mut f = Restart::begin(RestartKind::Profile(1), 1);
+        assert_eq!(
+            f.job_done(Err(Error::Disconnected), t0),
+            RestartAction::None
+        );
+        assert!(f.is_busy());
     }
 
     #[test]
@@ -1927,33 +2003,65 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::Ordering;
 
-    type Reply = std::sync::mpsc::Sender<Result<SwitchOutcome, Error>>;
+    type Reply = std::sync::mpsc::Sender<Result<WriteOutcome, Error>>;
 
-    /// A worker stand-in: its profile, whether it is locked, the switches
-    /// asked for (their results are sent by the test) and the effects
-    /// applied.
+    /// A worker stand-in: its connection count and snapshot, whether it
+    /// is locked, the switches asked for (their results are sent by the
+    /// test), and the reconnects and reloads requested.
     #[derive(Default)]
     struct FakePort {
-        profile: Cell<Option<u8>>,
+        snapshot: RefCell<Option<DeviceSnapshot>>,
+        connects: Cell<u64>,
         locked: Cell<bool>,
         sent: RefCell<Vec<(u8, Reply)>>,
-        applied: RefCell<Vec<SwitchEffects>>,
+        reconnects: Cell<usize>,
+        reloads: Cell<usize>,
+    }
+
+    impl FakePort {
+        fn on(profile: u8) -> FakePort {
+            let p = FakePort::default();
+            p.connect(profile);
+            p
+        }
+
+        /// A (re)connect that loaded a snapshot on `profile`.
+        fn connect(&self, profile: u8) {
+            self.connects.set(self.connects.get() + 1);
+            *self.snapshot.borrow_mut() = Some(snap_on(profile, SystemMode::Windows));
+        }
+
+        fn disconnect(&self) {
+            *self.snapshot.borrow_mut() = None;
+        }
+    }
+
+    impl RestartPort for FakePort {
+        fn connects(&self) -> u64 {
+            self.connects.get()
+        }
+        fn reconnect(&self, _pause: Duration) {
+            self.reconnects.set(self.reconnects.get() + 1);
+        }
+        fn request_reload(&self) {
+            self.reloads.set(self.reloads.get() + 1);
+        }
     }
 
     impl SwitchPort for FakePort {
         fn profile(&self) -> Option<u8> {
-            self.profile.get()
+            self.snapshot.borrow().as_ref().map(|s| s.profile)
+        }
+        fn snapshot(&self) -> Option<DeviceSnapshot> {
+            self.snapshot.borrow().clone()
         }
         fn locked(&self) -> bool {
             self.locked.get()
         }
-        fn switch(&self, profile: u8) -> Pending<SwitchOutcome> {
+        fn switch(&self, profile: u8) -> Pending<WriteOutcome> {
             let (tx, p) = pending_channel("auto-profile");
             self.sent.borrow_mut().push((profile, tx));
             p
-        }
-        fn apply(&self, fx: SwitchEffects) {
-            self.applied.borrow_mut().push(fx);
         }
     }
 
@@ -1965,8 +2073,7 @@ mod tests {
 
     #[test]
     fn the_switcher_decides_and_submits_without_the_ui() {
-        let port = FakePort::default();
-        port.profile.set(Some(0));
+        let port = FakePort::on(0);
         let shared = shared_with(rules());
         let mut sw = AutoSwitcher::default();
         // Valorant in front, keyboard on profile 0: switch to 1.
@@ -1976,18 +2083,53 @@ mod tests {
         // One switch at a time.
         sw.tick(Some("Code"), &port, &shared);
         assert_eq!(port.sent.borrow().len(), 1);
-        // It finishes: its effects are applied on the watcher thread.
-        let ok = SwitchOutcome {
-            write: Ok(()),
-            profile: Some(1),
-            system_mode: None,
-        };
-        port.sent.borrow()[0].1.send(Ok(ok)).unwrap();
-        port.profile.set(Some(1));
+        // The write went out and the keyboard restarts: reconnect.
+        port.sent.borrow()[0]
+            .1
+            .send(Ok(WriteOutcome::Reenumerating))
+            .unwrap();
+        assert!(!sw.tick(Some("Valorant"), &port, &shared));
+        assert_eq!(port.reconnects.get(), 1);
+        // Back on profile 1: done, no error, nothing more to do.
+        port.connect(1);
         assert!(sw.tick(Some("Valorant"), &port, &shared), "finished");
-        assert_eq!(port.applied.borrow()[0].profile, Some(1));
         assert_eq!(shared.take_error(), None);
+        sw.tick(Some("Valorant"), &port, &shared);
         assert_eq!(port.sent.borrow().len(), 1, "already on 1");
+    }
+
+    /// While a switch reconnects nothing fires again, even though the
+    /// snapshot still shows the old profile (or none at all).
+    #[test]
+    fn no_automatic_switch_fires_while_a_switch_reconnects() {
+        let port = FakePort::on(0);
+        let shared = shared_with(rules());
+        let mut sw = AutoSwitcher::default();
+        sw.tick(Some("Valorant"), &port, &shared);
+        port.sent.borrow()[0]
+            .1
+            .send(Ok(WriteOutcome::Reenumerating))
+            .unwrap();
+        // Old snapshot (profile 0), then searching, for many ticks; other
+        // apps with other rules come to the front meanwhile.
+        for app in ["Valorant", "Code", "Valorant"] {
+            sw.tick(Some(app), &port, &shared);
+        }
+        port.disconnect();
+        for app in ["Code", "Valorant"] {
+            sw.tick(Some(app), &port, &shared);
+        }
+        assert_eq!(port.sent.borrow().len(), 1, "no second switch");
+        assert_eq!(port.reconnects.get(), 1, "one reconnect");
+        // The keyboard comes back on another profile: reported once, and
+        // not retried in a loop.
+        port.connect(0);
+        assert!(sw.tick(Some("Valorant"), &port, &shared));
+        let e = shared.take_error().expect("mismatch reported");
+        assert!(e.starts_with(i18n::events::AUTO_SWITCH_FAILED), "{e}");
+        assert!(e.contains(t::PROFILE_MISMATCH), "{e}");
+        sw.tick(Some("Valorant"), &port, &shared);
+        assert_eq!(port.sent.borrow().len(), 1);
     }
 
     #[test]
@@ -1997,8 +2139,8 @@ mod tests {
         let port = FakePort::default();
         // Disconnected.
         sw.tick(Some("Valorant"), &port, &shared);
-        port.profile.set(Some(0));
-        // The worker is busy or calibrating.
+        port.connect(0);
+        // The worker is busy, restarting or calibrating.
         port.locked.set(true);
         sw.tick(Some("Valorant"), &port, &shared);
         port.locked.set(false);
@@ -2014,17 +2156,20 @@ mod tests {
 
     #[test]
     fn a_failed_switch_is_reported_once_and_not_retried_in_a_loop() {
-        let port = FakePort::default();
-        port.profile.set(Some(0));
+        let port = FakePort::on(0);
         let shared = shared_with(rules());
         let mut sw = AutoSwitcher::default();
         sw.tick(Some("Valorant"), &port, &shared);
-        port.sent.borrow()[0].1.send(Err(Error::Timeout)).unwrap();
-        sw.tick(Some("Valorant"), &port, &shared);
+        port.sent.borrow()[0]
+            .1
+            .send(Err(Error::Io("x".into())))
+            .unwrap();
+        assert!(sw.tick(Some("Valorant"), &port, &shared));
         let e = shared.take_error().expect("shown by the shell");
         assert!(e.starts_with(i18n::events::AUTO_SWITCH_FAILED), "{e}");
         assert_eq!(shared.take_error(), None, "taken once");
-        assert!(port.applied.borrow()[0].request_reload);
+        assert_eq!(port.reloads.get(), 1, "the state is re-read");
+        assert_eq!(port.reconnects.get(), 0);
         sw.tick(Some("Valorant"), &port, &shared);
         assert_eq!(port.sent.borrow().len(), 1, "no retry loop");
         // Edited rules start over.
@@ -2033,18 +2178,24 @@ mod tests {
         assert_eq!(port.sent.borrow().len(), 2);
     }
 
+    /// End to end with a real worker on the watcher thread: the switch
+    /// re-enumerates, the worker reconnects, and the new connection's
+    /// profile and Win/Mac mode (stored per profile) are what the app shows.
     #[test]
     fn a_real_worker_switches_from_another_thread() {
-        use crate::worker::tests::{order_reply, push_snapshot};
+        use crate::worker::tests::{order_reply, push_snapshot, push_snapshot_os};
         use crate::worker::{Worker, WorkerConfig};
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let o = opened.clone();
         let w = Worker::spawn_with(
-            Box::new(|| {
+            Box::new(move || {
                 let mut m = MockTransport::new();
-                push_snapshot(&mut m, 0);
-                for _ in 0..3 {
-                    m.push_reply(order_reply(0x70, 2)); // SET, verify, re-read
+                if o.fetch_add(1, Ordering::SeqCst) == 0 {
+                    push_snapshot(&mut m, 0); // Windows
+                    m.push_reply(order_reply(0x70, 2)); // the SET reply
+                } else {
+                    push_snapshot_os(&mut m, 2, 0); // profile 2 is Mac
                 }
-                push_snapshot(&mut m, 2); // the reload afterwards
                 Ok(Keyboard::new(m, Model::Win68HeMax))
             }),
             WorkerConfig {
@@ -2064,7 +2215,7 @@ mod tests {
         // The watcher thread: no UI frame runs meanwhile.
         std::thread::spawn(move || {
             let mut sw = AutoSwitcher::default();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(10);
             while !sw.tick(Some("Game"), &handle, &sh) {
                 assert!(Instant::now() < deadline, "never switched");
                 std::thread::sleep(Duration::from_millis(2));
@@ -2072,7 +2223,11 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert_eq!(w.snapshot().unwrap().profile, 2);
+        assert_eq!(opened.load(Ordering::SeqCst), 2, "reconnected once");
+        let snap = w.snapshot().unwrap();
+        assert_eq!(snap.profile, 2);
+        assert_eq!(snap.system_mode, Some(SystemMode::Mac));
+        assert!(!w.is_restarting());
         assert_eq!(shared.take_error(), None);
         assert!(!shared.ui_lock.load(Ordering::SeqCst));
     }
@@ -2249,10 +2404,13 @@ mod tests {
             reset_open: true,
             reset_text: "RESET".into(),
             last_restart: Some(RestartKind::Polling(PollingRate::Hz1000)),
-            restart: Restart::Reconnecting {
-                kind: RestartKind::Polling(PollingRate::Hz1000),
-                connects: 0,
-                since: Instant::now(),
+            restart: RestartRun {
+                state: Restart::Reconnecting {
+                    kind: RestartKind::Polling(PollingRate::Hz1000),
+                    connects: 0,
+                    since: Instant::now(),
+                },
+                job: None,
             },
             transfer: Transfer::Planned {
                 file: "x.json".into(),

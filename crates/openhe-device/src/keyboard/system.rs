@@ -89,21 +89,28 @@ impl<T: Transport> Keyboard<T> {
         Ok(info)
     }
 
-    /// Switches the onboard profile (0..=3) and reads it back.
-    pub fn set_profile(&mut self, idx: u8) -> Result<(), Error> {
+    /// Switches the onboard profile (0..=3) with exactly one attempt.
+    ///
+    /// The keyboard re-enumerates on USB after a profile switch, like after
+    /// a polling-rate change (PROTOCOL 7.x finding 23), so there is no
+    /// read-back here: a timeout or disconnect after the write is
+    /// `Reenumerating`, and the caller reconnects and reads `profile()`
+    /// from the new connection. An index above 3 is `InvalidInput` before
+    /// any I/O; an error before the frame was written propagates.
+    pub fn set_profile(&mut self, idx: u8) -> Result<WriteOutcome, Error> {
         if idx > 3 {
             return Err(Error::InvalidInput(format!(
                 "profile {idx} out of range 0..=3"
             )));
         }
-        self.session.call(&order::set(OrderType::Profile, idx))?;
-        let got = self.profile()?;
-        if got != idx {
-            return Err(Error::Io(format!(
-                "verify failed: profile: wrote {idx}, read {got}"
-            )));
+        let (res, wrote) = self
+            .session
+            .call_once_tracked(&order::set(OrderType::Profile, idx));
+        match res {
+            Ok(_) => Ok(WriteOutcome::Done),
+            Err(Error::Disconnected | Error::Timeout) if wrote => Ok(WriteOutcome::Reenumerating),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
     /// Switches Win/Mac mode: the reply must report success (R[2] == 1), and
@@ -286,28 +293,50 @@ mod tests {
     }
 
     #[test]
-    fn set_profile_writes_then_verifies() {
+    fn set_profile_done_on_reply_with_one_write() {
         let mut m = MockTransport::new();
         m.push_reply(order_reply(0x70, 2)); // SET reply
-        m.push_reply(order_reply(0x70, 2)); // read-back
         let mut k = kb(m);
-        k.set_profile(2).unwrap();
+        assert_eq!(k.set_profile(2), Ok(WriteOutcome::Done));
         let w = k.session_mut().transport().written().to_vec();
-        assert_eq!(w.len(), 2);
+        assert_eq!(w.len(), 1, "no read-back: the keyboard re-enumerates");
         assert_frame(&w[0], &[0x5C, 0x04, 0x00, 0x94, 0x70, 2, 0xFF, 0xFF]);
-        assert_frame(&w[1], &[0x5C, 0x03, 0x00, 0x93, 0x70, 0xFF, 0xFF]);
+    }
+
+    /// A profile switch re-enumerates USB like a polling change (PROTOCOL
+    /// 7.x finding 23): silence or a disconnect after the write is
+    /// `Reenumerating`, and the SET is never written twice.
+    #[test]
+    fn set_profile_timeout_or_disconnect_after_the_write_is_reenumerating() {
+        let mut k = kb(MockTransport::new());
+        assert_eq!(k.set_profile(1), Ok(WriteOutcome::Reenumerating));
+        assert_eq!(k.session_mut().transport().written().len(), 1);
+        let mut k = Keyboard {
+            model: Model::Win68HeMax,
+            session: Session::new(GoneAfterWrite {
+                writes: 0,
+                wrote: false,
+                err: Error::Disconnected,
+            }),
+        };
+        assert_eq!(k.set_profile(3), Ok(WriteOutcome::Reenumerating));
+        assert_eq!(k.session_mut().transport().writes, 1);
     }
 
     #[test]
-    fn set_profile_verify_mismatch_is_an_error() {
+    fn set_profile_errors_before_the_write_or_other_errors_propagate() {
         let mut m = MockTransport::new();
-        m.push_reply(order_reply(0x70, 2));
-        m.push_reply(order_reply(0x70, 1)); // the keyboard stayed on 1
-        let e = kb(m).set_profile(2).unwrap_err();
-        assert!(
-            matches!(&e, Error::Io(s) if s.starts_with("verify failed")),
-            "{e:?}"
-        );
+        m.fail_with(Error::Disconnected); // gone before anything was written
+        assert_eq!(kb(m).set_profile(1), Err(Error::Disconnected));
+        let mut k = Keyboard {
+            model: Model::Win68HeMax,
+            session: Session::new(GoneAfterWrite {
+                writes: 0,
+                wrote: false,
+                err: Error::Io("boom".into()),
+            }),
+        };
+        assert_eq!(k.set_profile(1), Err(Error::Io("boom".into())));
     }
 
     #[test]

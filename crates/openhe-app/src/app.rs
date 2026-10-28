@@ -2,7 +2,9 @@
 
 use crate::i18n;
 use crate::pages;
-use crate::pages::settings::{apply_switch_effects, switch_effects, SwitchOutcome};
+use crate::pages::settings::{
+    apply_switch_effects, switch_effects, Restart, RestartKind, RestartRun, SwitchOutcome,
+};
 use crate::storage::{AppData, LoadNotice};
 use crate::theme::{self, color, font, line, size, Theme};
 use crate::widgets::card::Card;
@@ -64,7 +66,10 @@ impl AppCtx<'_> {
     /// be in calibration mode (also after a stop that failed), so nothing
     /// is written until a stop worked.
     pub fn can_write(&self) -> bool {
-        self.snapshot.is_some() && !self.busy && !self.worker.calibration_guard()
+        self.snapshot.is_some()
+            && !self.busy
+            && !self.worker.calibration_guard()
+            && !self.worker.is_restarting()
     }
 
     pub fn save_data(&self) -> std::io::Result<()> {
@@ -197,8 +202,12 @@ pub struct OpenHeApp {
     lighting: pages::lighting::Page,
     calibration: pages::calibration::Page,
     settings: pages::settings::Page,
-    /// A profile or Win/Mac switch started from the top bar.
+    /// A Win/Mac switch started from the top bar.
     switch: Option<TopbarSwitch>,
+    /// A profile switch started from the top bar: the keyboard
+    /// re-enumerates, so it runs the restart flow (reconnect, then a check
+    /// of the reconnected keyboard's profile).
+    profile_switch: RestartRun,
     /// An error from the top bar, shown as a dismissable notice.
     shell_error: Option<(String, Option<String>)>,
     close: CloseGuard,
@@ -248,6 +257,7 @@ impl OpenHeApp {
             calibration: Default::default(),
             settings: Default::default(),
             switch: None,
+            profile_switch: RestartRun::default(),
             shell_error: None,
             close: CloseGuard::default(),
         }
@@ -334,31 +344,57 @@ impl OpenHeApp {
         self.settings.preview(state);
     }
 
-    /// Polls the top-bar switch job and starts a new one if asked.
-    fn run_topbar(&mut self, action: TopbarAction) {
+    /// The profile a top-bar switch is reconnecting to, if one runs.
+    fn profile_target(&self) -> Option<u8> {
+        match self.profile_switch.state {
+            Restart::Sending {
+                kind: RestartKind::Profile(p),
+                ..
+            }
+            | Restart::Reconnecting {
+                kind: RestartKind::Profile(p),
+                ..
+            } => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Polls the top-bar switch jobs and starts a new one if asked.
+    fn run_topbar(&mut self, action: TopbarAction, snapshot: Option<&DeviceSnapshot>) {
+        let now = std::time::Instant::now();
+        self.profile_switch.pump(&self.worker, snapshot, now);
+        match std::mem::take(&mut self.profile_switch.state) {
+            Restart::Failed(msg, tech) => {
+                self.shell_error = Some((
+                    format!("{} {msg}", i18n::events::PROFILE_SWITCH_FAILED),
+                    tech,
+                ));
+            }
+            Restart::Done(_) | Restart::Idle => {}
+            running => self.profile_switch.state = running,
+        }
         if let Some(sw) = self.switch.as_mut() {
             if let Some(result) = sw.pending.poll() {
-                let failed = if sw.kind.profile.is_some() {
-                    i18n::events::PROFILE_SWITCH_FAILED
-                } else {
-                    i18n::events::MODE_SWITCH_FAILED
-                };
-                self.shell_error =
-                    apply_switch_effects(&self.worker, switch_effects(result, failed));
+                self.shell_error = apply_switch_effects(
+                    &self.worker,
+                    switch_effects(result, i18n::events::MODE_SWITCH_FAILED),
+                );
                 self.switch = None;
             }
         }
-        if self.switch.is_some() {
+        if self.switch.is_some() || self.profile_switch.is_busy() {
             return;
         }
         if let Some(idx) = action.profile {
             self.shell_error = None;
-            self.switch = Some(TopbarSwitch {
-                pending: self.worker.submit("set-profile", move |kb| {
+            let connects = self.worker.connects();
+            self.profile_switch.start(
+                RestartKind::Profile(idx),
+                connects,
+                self.worker.submit("set-profile", move |kb| {
                     pages::settings::profile_job(kb, idx)
                 }),
-                kind: action,
-            });
+            );
         } else if let Some(mode) = action.mode {
             self.shell_error = None;
             self.switch = Some(TopbarSwitch {
@@ -384,10 +420,12 @@ impl OpenHeApp {
             ConnectionStatus::Connected(s) => Some(s),
             _ => None,
         };
-        let busy = self.worker.is_busy();
+        // A reconnect after a re-enumerating write (polling, reset, profile
+        // switch) locks writes like a running job.
+        let busy = self.worker.is_busy() || self.worker.is_restarting();
         let loading = self.worker.current_job() == Some(LOAD_LABEL);
         // Collect finished top-bar jobs.
-        self.run_topbar(TopbarAction::default());
+        self.run_topbar(TopbarAction::default(), snapshot);
         // Calibration jobs are collected whichever page is shown, so a stop
         // sent on leaving the page is always seen through.
         self.calibration.pump(&self.worker, snapshot, ctx);
@@ -433,7 +471,12 @@ impl OpenHeApp {
                     .inner_margin(Margin::symmetric(size::PAGE_MARGIN as i8, 0)),
             )
             .show(ctx, |ui| {
-                let shown = self.switch.as_ref().map(|s| s.kind);
+                let shown = self.switch.as_ref().map(|s| s.kind).or_else(|| {
+                    self.profile_target().map(|p| TopbarAction {
+                        profile: Some(p),
+                        mode: None,
+                    })
+                });
                 let lock = if calibrating {
                     Some(i18n::events::LOCKED_CALIBRATING)
                 } else {
@@ -454,7 +497,7 @@ impl OpenHeApp {
             });
         let action = top.inner;
         let top = top.response.rect;
-        self.run_topbar(action);
+        self.run_topbar(action, snapshot);
         // Rules between sidebar and content, and under the top bar.
         let rules = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Middle,
@@ -470,7 +513,9 @@ impl OpenHeApp {
 
         let worker_notice = snapshot.and(self.worker.notice());
         let closing = self.close.waiting();
-        if worker_notice.is_some()
+        let reconnecting = self.profile_switch.is_busy();
+        if reconnecting
+            || worker_notice.is_some()
             || self.data_notice.is_some()
             || self.shell_error.is_some()
             || stop_owed
@@ -487,6 +532,9 @@ impl OpenHeApp {
                 .show(ctx, |ui| {
                     if closing {
                         notice_line(ui, i18n::common::CLOSING);
+                    }
+                    if reconnecting {
+                        notice_line(ui, i18n::events::PROFILE_RECONNECTING);
                     }
                     if stop_owed
                         && notice_bar(
@@ -539,7 +587,7 @@ impl OpenHeApp {
         // Pengaturan's restart flows run whichever page is shown; per-app
         // profile switching runs on its own thread and is told here what
         // the UI holds it back with (calibration, a top-bar switch).
-        let auto_locked = calibrating || self.switch.is_some();
+        let auto_locked = calibrating || self.switch.is_some() || self.profile_switch.is_busy();
         if let Some(e) = self.settings.background(&app_ctx, auto_locked, ctx) {
             self.shell_error = Some((e, None));
         }
@@ -1071,22 +1119,143 @@ mod tests {
         .expect("bold without theme::apply");
     }
 
-    #[test]
-    fn a_topbar_profile_switch_runs_a_job_and_reports_failure() {
-        let mut app = OpenHeApp::with_worker(offline_worker(), AppData::default());
-        app.run_topbar(TopbarAction {
-            profile: Some(2),
-            mode: None,
-        });
-        assert_eq!(app.switch.as_ref().unwrap().kind.profile, Some(2));
+    /// A worker whose first connection is on profile 0 (Windows) and
+    /// answers one profile SET; every later connection loads `then`
+    /// (profile, QueryWinMode value).
+    fn switching_worker(
+        then: (u8, u8),
+    ) -> (
+        Worker<openhe_device::MockTransport>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use crate::worker::tests::{order_reply, push_snapshot, push_snapshot_os};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let opened = std::sync::Arc::new(AtomicUsize::new(0));
+        let o = opened.clone();
+        let w = Worker::spawn_with(
+            Box::new(move || {
+                let mut m = openhe_device::MockTransport::new();
+                if o.fetch_add(1, Ordering::SeqCst) == 0 {
+                    push_snapshot(&mut m, 0);
+                    m.push_reply(order_reply(0x70, then.0)); // the SET reply
+                } else {
+                    push_snapshot_os(&mut m, then.0, then.1);
+                }
+                Ok(openhe_device::Keyboard::new(
+                    m,
+                    openhe_proto::Model::Win68HeMax,
+                ))
+            }),
+            crate::worker::WorkerConfig {
+                retry_interval: std::time::Duration::from_millis(5),
+                idle_poll: std::time::Duration::from_millis(2),
+                state_poll: std::time::Duration::from_secs(3600),
+            },
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.switch.is_some() {
+        while !w.is_connected() {
             assert!(std::time::Instant::now() < deadline);
-            app.run_topbar(TopbarAction::default());
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        // The offline worker fails the job with Disconnected.
-        let (text, _) = app.shell_error.clone().unwrap();
+        (w, opened)
+    }
+
+    /// Drives `run_topbar` like frames do until the profile switch ends.
+    fn run_profile_switch<T: openhe_device::Transport + 'static>(
+        w: &Worker<T>,
+        flow: &mut RestartRun,
+        idx: u8,
+    ) -> Vec<bool> {
+        let mut restarting_seen = Vec::new();
+        flow.start(
+            RestartKind::Profile(idx),
+            w.connects(),
+            w.submit("set-profile", move |kb| {
+                pages::settings::profile_job(kb, idx)
+            }),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while flow.is_busy() {
+            assert!(std::time::Instant::now() < deadline, "{:?}", flow.state);
+            let snap = w.snapshot();
+            flow.pump(w, snap.as_ref(), std::time::Instant::now());
+            restarting_seen.push(w.is_restarting());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        restarting_seen
+    }
+
+    #[test]
+    fn a_profile_switch_reconnects_and_takes_profile_and_mode_from_the_new_connection() {
+        // Profile 2 is in Mac mode: Win/Mac is stored per profile.
+        let (w, opened) = switching_worker((2, 0));
+        assert_eq!(w.snapshot().unwrap().system_mode, Some(SystemMode::Windows));
+        let mut flow = RestartRun::default();
+        let seen = run_profile_switch(&w, &mut flow, 2);
+        assert!(seen.contains(&true), "locked while reconnecting");
+        assert!(matches!(flow.state, Restart::Done(_)), "{:?}", flow.state);
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let snap = w.snapshot().unwrap();
+        assert_eq!(snap.profile, 2);
+        assert_eq!(snap.system_mode, Some(SystemMode::Mac));
+        assert!(!w.is_restarting(), "unlocked once back");
+    }
+
+    #[test]
+    fn the_topbar_profile_switch_runs_the_restart_flow() {
+        let mut app = OpenHeApp::with_worker(offline_worker(), AppData::default());
+        app.run_topbar(
+            TopbarAction {
+                profile: Some(2),
+                mode: None,
+            },
+            None,
+        );
+        assert!(app.profile_switch.is_busy());
+        assert_eq!(app.profile_target(), Some(2), "shown in the top bar");
+        // The offline worker ends the job with Disconnected: that is the
+        // keyboard restarting, not an error. It waits for the reconnect.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(app.profile_switch.state, Restart::Sending { .. }) {
+            assert!(std::time::Instant::now() < deadline);
+            app.run_topbar(TopbarAction::default(), None);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(matches!(
+            app.profile_switch.state,
+            Restart::Reconnecting {
+                kind: RestartKind::Profile(2),
+                ..
+            }
+        ));
+        assert_eq!(app.shell_error, None);
+        // Nothing else starts meanwhile (another profile, or Win/Mac).
+        app.run_topbar(
+            TopbarAction {
+                profile: Some(3),
+                mode: Some(SystemMode::Mac),
+            },
+            None,
+        );
+        assert_eq!(app.profile_target(), Some(2));
+        assert!(app.switch.is_none());
+    }
+
+    #[test]
+    fn a_topbar_profile_switch_whose_keyboard_comes_back_elsewhere_is_reported() {
+        let mut app = OpenHeApp::with_worker(offline_worker(), AppData::default());
+        app.profile_switch.state = Restart::Reconnecting {
+            kind: RestartKind::Profile(2),
+            connects: 0,
+            since: std::time::Instant::now(),
+        };
+        let mut snap = snapshot68();
+        snap.profile = 1;
+        // A new connection (connects 0 -> 1) loaded profile 1.
+        app.worker.inject_connect();
+        app.run_topbar(TopbarAction::default(), Some(&snap));
+        assert!(!app.profile_switch.is_busy());
+        let (text, _) = app.shell_error.clone().expect("mismatch shown");
         assert!(
             text.starts_with(i18n::events::PROFILE_SWITCH_FAILED),
             "{text}"

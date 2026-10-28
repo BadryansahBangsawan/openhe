@@ -33,8 +33,9 @@
 //! - Polling jobs (live depth, calibration) go through
 //!   [`Worker::submit_quiet`], so they never mark the app busy.
 //! - [`Worker::reconnect`] drops the keyboard on purpose (after a polling-rate
-//!   change or a factory reset, when the keyboard re-enumerates) and connects
-//!   again after a pause.
+//!   change, a factory reset or a profile switch, when the keyboard
+//!   re-enumerates) and connects again after a pause;
+//!   [`Worker::is_restarting`] is true until that connect worked.
 //! - [`Worker::set_calibration_guard`]: while set, a keyboard that is
 //!   (re)connected is sent `stop_calibration` right after its handshake
 //!   (never to a keyboard in bootloader mode), and one still open when the
@@ -304,6 +305,9 @@ struct Control {
     reconnect_ms: AtomicU64,
     /// Calibration may be running: stop it on (re)connect and on shutdown.
     calibrating: AtomicBool,
+    /// A reconnect was requested (a write after which the keyboard
+    /// re-enumerates); cleared by the next successful connect.
+    restarting: AtomicBool,
 }
 
 const NO_RECONNECT: u64 = u64::MAX;
@@ -351,6 +355,12 @@ impl Control {
     fn set_current(&self, label: Option<&'static str>) {
         self.lock().current = label;
         self.repaint();
+    }
+
+    fn request_reconnect(&self, pause: Duration) {
+        self.restarting.store(true, Ordering::SeqCst);
+        let ms = u64::try_from(pause.as_millis()).unwrap_or(NO_RECONNECT - 1);
+        self.reconnect_ms.store(ms, Ordering::SeqCst);
     }
 
     /// Edits the snapshot in place (no-op while disconnected).
@@ -507,6 +517,7 @@ impl<T: Transport + 'static> Worker<T> {
             lighting: AtomicU64::new(0),
             reconnect_ms: AtomicU64::new(NO_RECONNECT),
             calibrating: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
         });
         let thread_ctl = Arc::clone(&ctl);
         let thread = std::thread::Builder::new()
@@ -642,8 +653,7 @@ impl<T: Transport + 'static> Worker<T> {
     /// meanwhile fail with `Disconnected`). For writes after which the
     /// keyboard re-enumerates on USB (polling rate, factory reset).
     pub fn reconnect(&self, pause: Duration) {
-        let ms = u64::try_from(pause.as_millis()).unwrap_or(NO_RECONNECT - 1);
-        self.ctl.reconnect_ms.store(ms, Ordering::SeqCst);
+        self.ctl.request_reconnect(pause);
     }
 
     /// While `on`, the worker sends `stop_calibration` to any keyboard it
@@ -651,6 +661,14 @@ impl<T: Transport + 'static> Worker<T> {
     /// worker shuts down. The calibration page sets it before starting and
     /// clears it once a stop succeeded. Cleared by the worker after it sent
     /// the stop on a reconnect.
+    /// True from [`Worker::reconnect`] until the next successful connect:
+    /// the keyboard is re-enumerating after a write (polling rate, factory
+    /// reset, profile switch). Writes and automatic profile switches stay
+    /// locked meanwhile.
+    pub fn is_restarting(&self) -> bool {
+        self.ctl.restarting.load(Ordering::SeqCst)
+    }
+
     pub fn set_calibration_guard(&self, on: bool) {
         self.ctl.calibrating.store(on, Ordering::SeqCst);
     }
@@ -709,6 +727,29 @@ impl<T: Transport + 'static> WorkerHandle<T> {
     /// See [`Worker::calibration_guard`].
     pub fn calibration_guard(&self) -> bool {
         self.ctl.calibrating.load(Ordering::SeqCst)
+    }
+
+    /// See [`Worker::is_restarting`].
+    pub fn is_restarting(&self) -> bool {
+        self.ctl.restarting.load(Ordering::SeqCst)
+    }
+
+    /// See [`Worker::connects`].
+    pub fn connects(&self) -> u64 {
+        self.ctl.connects.load(Ordering::SeqCst)
+    }
+
+    /// See [`Worker::reconnect`].
+    pub fn reconnect(&self, pause: Duration) {
+        self.ctl.request_reconnect(pause);
+    }
+
+    /// See [`Worker::snapshot`].
+    pub fn snapshot(&self) -> Option<DeviceSnapshot> {
+        match &self.ctl.lock().status {
+            ConnectionStatus::Connected(s) => Some(s.clone()),
+            _ => None,
+        }
     }
 
     /// See [`Worker::request_reload`].
@@ -785,6 +826,11 @@ fn enqueue<T: Transport + 'static, R: Send + 'static>(
 
 #[cfg(test)]
 impl<T: Transport + 'static> Worker<T> {
+    /// Test hook for UI tests: counts a successful connect.
+    pub(crate) fn inject_connect(&self) {
+        self.ctl.connects.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Test hook for UI tests: overrides the shown status.
     pub(crate) fn inject_status(&self, s: ConnectionStatus) {
         self.ctl.set_status(s);
@@ -1006,6 +1052,7 @@ fn run<T: Transport>(
                                     n.loaded(skipped);
                                 });
                                 ctl.connects.fetch_add(1, Ordering::SeqCst);
+                                ctl.restarting.store(false, Ordering::SeqCst);
                                 ctl.set_status(ConnectionStatus::Connected(snap));
                                 kb = Some(k);
                                 last_idle = Instant::now();
@@ -1457,6 +1504,32 @@ pub(crate) mod tests {
         wait_for("retries", || tries.load(Ordering::SeqCst) >= 3);
     }
 
+    /// From a requested reconnect (a write after which the keyboard
+    /// re-enumerates) until the next successful connect, the worker reports
+    /// restarting, so writes and automatic switches stay locked.
+    #[test]
+    fn a_requested_reconnect_reports_restarting_until_the_keyboard_is_back() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = n.clone();
+        let w = Worker::spawn_with(
+            Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        assert!(!w.is_restarting());
+        let before = w.connects();
+        w.reconnect(Duration::from_millis(30));
+        assert!(w.is_restarting(), "at once, before the worker drops it");
+        assert!(w.handle().is_restarting());
+        wait_for("back", || w.connects() > before);
+        assert!(!w.is_restarting());
+    }
+
     #[test]
     fn a_busy_keyboard_is_reported_and_retried() {
         let tries = Arc::new(AtomicUsize::new(0));
@@ -1756,6 +1829,7 @@ pub(crate) mod tests {
             lighting: AtomicU64::new(0),
             reconnect_ms: AtomicU64::new(NO_RECONNECT),
             calibrating: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
         });
         let c = Arc::clone(&ctl);
         let _ = std::thread::spawn(move || {
