@@ -584,9 +584,17 @@ fn check_performance(model: Model, key: u8, change: &PerformanceChange) -> Resul
 
 /// The function checks of `set_advanced`: the proto packet builders'
 /// validation, known keycodes, and SOCD positions that are real keys of
-/// this keyboard with `key` one of them.
+/// this keyboard with `key` one of them. Like the Tombol Lanjutan page, the
+/// Fn key never gets a function (macros included) and is never part of a
+/// SOCD pair: what the firmware does then is unknown, and losing Fn loses
+/// the Fn layers.
 fn check_advanced(key: u8, cfg: &AdvancedConfig, present: &BTreeSet<u8>) -> Result<(), FileError> {
     let invalid = |e: openhe_proto::advanced::AdvancedError| bad(format!("key 0x{key:02X}: {e}"));
+    if key == FN_KEY && *cfg != AdvancedConfig::None {
+        return Err(bad(
+            "the Fn key cannot have an advanced function".to_string()
+        ));
+    }
     match cfg {
         AdvancedConfig::None | AdvancedConfig::Macro => {}
         AdvancedConfig::Dks(d) => {
@@ -616,6 +624,9 @@ fn check_advanced(key: u8, cfg: &AdvancedConfig, present: &BTreeSet<u8>) -> Resu
             if key != s.pos1 && key != s.pos2 {
                 return Err(bad(format!("key 0x{key:02X} is not in its SOCD pair")));
             }
+            if s.pos1 == FN_KEY || s.pos2 == FN_KEY {
+                return Err(bad("the Fn key cannot be in a SOCD pair".to_string()));
+            }
             for p in [s.pos1, s.pos2] {
                 if !present.contains(&p) {
                     return Err(bad(format!("SOCD position 0x{p:02X} is not a key")));
@@ -635,7 +646,8 @@ fn check_advanced(key: u8, cfg: &AdvancedConfig, present: &BTreeSet<u8>) -> Resu
 /// duplicate key entries, every performance value against its switch,
 /// every advanced function (packet validation, keycodes, SOCD positions),
 /// every layer keycode, and the per-key colours (no duplicates). The Fn
-/// key's own base-layer code is left out of the writes.
+/// key's own base-layer code is left out of the writes, and a function on
+/// the Fn key (or a SOCD pair with it) refuses the file.
 pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPlan, FileError> {
     if data.model != snap.model {
         return Err(FileError::WrongModel {
@@ -1028,6 +1040,27 @@ mod tests {
             if let AdvancedConfig::Tgl(x) = &mut d.keys[4].advanced {
                 x.code = 0xBEEF;
             }
+        });
+        push("function on the Fn key", &|d| {
+            d.keys[last].advanced = AdvancedConfig::Mt(Mt {
+                hold: 0xE0,
+                tap: 0x08,
+                delay_ms: 200,
+            });
+        });
+        push("END on the Fn key", &|d| {
+            d.keys[last].advanced = AdvancedConfig::End(End { code: 0x29 });
+        });
+        push("macro on the Fn key", &|d| {
+            d.keys[last].advanced = AdvancedConfig::Macro;
+        });
+        push("SOCD pair with the Fn key", &|d| {
+            let pair = Socd {
+                pos2: 0x01,
+                ..socd()
+            };
+            d.keys[7].advanced = AdvancedConfig::Socd(pair); // key 0x04
+            d.keys[8].advanced = AdvancedConfig::None; // key 0x07
         });
         push("duplicate key", &|d| {
             let k = d.keys[0].clone();

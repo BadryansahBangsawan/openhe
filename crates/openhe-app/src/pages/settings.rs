@@ -25,7 +25,7 @@ use openhe_proto::{PollingRate, SystemMode};
 use os::{set_launch_at_login, ForegroundWatcher};
 use profile_file::{
     export_job, import_job, plan_import, Exported, FileError, ImportPlan, ImportReport, ImportStep,
-    ProfileFile,
+    ProfileData, ProfileFile,
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -376,6 +376,8 @@ mod strings {
     pub const IMPORT_FUNCS: &str = "fungsi lanjutan";
     pub const IMPORT_LIGHT: &str = "lampu";
     pub const IMPORT_OVERWRITE: &str = "Pengaturan profil ini di keyboard akan ditimpa.";
+    pub const IMPORT_CHANGED: &str =
+        "Keyboard berubah sejak file dibaca, jadi rencana impor dibuat ulang. Periksa lagi, lalu tekan Terapkan.";
     pub const IMPORT_MACROS: &str = "Isi macro tidak ikut diimpor; tombol macro dilewati:";
     pub const IMPORT_APPLY: &str = "Terapkan";
     pub const CANCEL: &str = "Batal";
@@ -469,7 +471,14 @@ enum Transfer {
     /// A file was read and planned; waiting for "Terapkan".
     Planned {
         file: String,
+        /// The parsed file, re-planned against the keyboard on "Terapkan".
+        data: Box<ProfileData>,
+        /// The plan shown (what "Terapkan" writes if nothing changed).
         plan: Box<ImportPlan>,
+        /// `(profile, worker generation)` the plan was made for.
+        planned: (u8, u64),
+        /// The keyboard changed since the first plan; this is a new one.
+        changed: bool,
     },
     Importing(Pending<ImportReport>),
     Done(String),
@@ -479,6 +488,38 @@ enum Transfer {
 impl Transfer {
     fn is_busy(&self) -> bool {
         matches!(self, Transfer::Exporting { .. } | Transfer::Importing(_))
+    }
+}
+
+/// What "Terapkan" does with a planned import.
+#[derive(Debug)]
+pub enum Confirm {
+    /// The keyboard is as it was when the plan was shown: write this plan,
+    /// made again from the current snapshot.
+    Write(ImportPlan),
+    /// The profile or the snapshot changed since the plan was shown:
+    /// nothing is written; show this new plan (or why it cannot be made)
+    /// and ask again.
+    Changed(Result<ImportPlan, FileError>),
+}
+
+/// "Terapkan" on a plan made for `planned` = `(profile, generation)`.
+/// Always plans again against `snap`, so what gets cleared or skipped
+/// matches the keyboard now; refuses to write when the profile or the
+/// worker generation moved since the user saw the plan.
+pub fn confirm_import(
+    data: &ProfileData,
+    planned: (u8, u64),
+    snap: &DeviceSnapshot,
+    generation: u64,
+) -> Confirm {
+    let plan = plan_import(data, snap);
+    if planned != (snap.profile, generation) {
+        return Confirm::Changed(plan);
+    }
+    match plan {
+        Ok(p) => Confirm::Write(p),
+        Err(e) => Confirm::Changed(Err(e)),
     }
 }
 
@@ -604,9 +645,7 @@ impl Page {
                 let idle = ctx.can_write()
                     && !locked
                     && self.auto_pending.is_none()
-                    && self.switch.is_none()
-                    && !self.restart.is_busy()
-                    && !self.transfer.is_busy();
+                    && !self.auto_locked();
                 if idle {
                     let rules = ctx.data.borrow().app_profile_rules.clone();
                     if let Some(p) = self
@@ -703,15 +742,30 @@ impl Page {
             _ => {
                 self.transfer = Transfer::Planned {
                     file: "openhe-profil-2-Gaming.json".into(),
+                    data: Box::new(ProfileData {
+                        model: openhe_proto::Model::Win68HeMax,
+                        keys: Vec::new(),
+                        lighting: None,
+                        key_colors: Vec::new(),
+                    }),
                     plan: Box::new(ImportPlan {
                         performance: vec![((0x04..0x1E).collect(), Default::default())],
                         skipped_macros: vec![0x10],
                         ..Default::default()
                     }),
+                    planned: (1, 0),
+                    changed: false,
                 };
                 self.auto_enabled = true;
             }
         }
+    }
+
+    /// Automatic profile switches wait: a switch, restart or import of this
+    /// page is running, or an import is planned and waiting for
+    /// "Terapkan" (a switch would change the profile it was planned for).
+    fn auto_locked(&self) -> bool {
+        !self.idle() || matches!(self.transfer, Transfer::Planned { .. })
     }
 
     /// Nothing of this page is running on the keyboard.
@@ -1001,10 +1055,14 @@ impl Page {
                 let file = path
                     .file_name()
                     .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
-                match prepare_import(&text, snap) {
-                    Ok(plan) => Transfer::Planned {
+                let parsed = ProfileFile::from_json(&text).and_then(|f| f.to_data());
+                match parsed.and_then(|d| plan_import(&d, snap).map(|p| (d, p))) {
+                    Ok((data, plan)) => Transfer::Planned {
                         file,
+                        data: Box::new(data),
                         plan: Box::new(plan),
+                        planned: (snap.profile, ctx.worker.generation()),
+                        changed: false,
                     },
                     Err(e) => Transfer::Failed(file_error_text(&e), Some(format!("{e:?}"))),
                 }
@@ -1029,9 +1087,15 @@ impl Page {
                     ui.label(RichText::new(text).color(color::ACCENT));
                 });
             }
-            Transfer::Planned { file, plan } => {
+            Transfer::Planned {
+                file,
+                plan,
+                planned,
+                changed,
+                ..
+            } => {
                 ui.add_space(10.0);
-                let profile = ctx.snapshot.map_or(0, |s| s.profile) + 1;
+                let profile = planned.0 + 1;
                 Card::new()
                     .fill(color::ACCENT_SOFT)
                     .stroke(color::ACCENT.gamma_multiply(0.5))
@@ -1057,6 +1121,9 @@ impl Page {
                             RichText::new(format!("{summary}. {}", t::IMPORT_OVERWRITE))
                                 .color(color::MUTED),
                         );
+                        if *changed {
+                            card::hint(ui, t::IMPORT_CHANGED);
+                        }
                         if !plan.skipped_macros.is_empty() {
                             card::hint(
                                 ui,
@@ -1091,13 +1158,31 @@ impl Page {
         }
         match next {
             Some(true) => {
-                if let Transfer::Planned { plan, .. } =
-                    std::mem::replace(&mut self.transfer, Transfer::Idle)
+                let Some(snap) = ctx.snapshot else { return };
+                if let Transfer::Planned {
+                    file,
+                    data,
+                    planned,
+                    ..
+                } = std::mem::replace(&mut self.transfer, Transfer::Idle)
                 {
-                    self.transfer = Transfer::Importing(
-                        ctx.worker
-                            .submit("profile-import", move |kb| import_job(kb, &plan)),
-                    );
+                    let generation = ctx.worker.generation();
+                    self.transfer = match confirm_import(&data, planned, snap, generation) {
+                        Confirm::Write(plan) => Transfer::Importing(
+                            ctx.worker
+                                .submit("profile-import", move |kb| import_job(kb, &plan)),
+                        ),
+                        Confirm::Changed(Ok(plan)) => Transfer::Planned {
+                            file,
+                            data,
+                            plan: Box::new(plan),
+                            planned: (snap.profile, generation),
+                            changed: true,
+                        },
+                        Confirm::Changed(Err(e)) => {
+                            Transfer::Failed(file_error_text(&e), Some(format!("{e:?}")))
+                        }
+                    };
                 }
             }
             Some(false) => self.transfer = Transfer::Idle,
@@ -1687,6 +1772,68 @@ mod tests {
         );
     }
 
+    fn sample_data() -> profile_file::ProfileData {
+        let snap = crate::app::test_support::snapshot68();
+        let json = ProfileFile::from_data(&profile_file::ProfileData {
+            model: snap.model,
+            keys: Vec::new(),
+            lighting: None,
+            key_colors: Vec::new(),
+        })
+        .to_json();
+        ProfileFile::from_json(&json).unwrap().to_data().unwrap()
+    }
+
+    #[test]
+    fn terapkan_replans_against_the_current_keyboard_and_refuses_a_stale_plan() {
+        use openhe_proto::key::Advanced;
+        let mut data = sample_data();
+        let mut snap = crate::app::test_support::snapshot68();
+        data.keys.push(profile_file::KeyData {
+            code: 0x29,
+            settings: snap.keys[&0x29],
+            layers: [0x29, 0, 0, 0],
+            advanced: openhe_device::AdvancedConfig::None,
+        });
+        // Planned on profile 1, generation 7.
+        assert!(matches!(
+            confirm_import(&data, (1, 7), &snap, 7),
+            Confirm::Write(_)
+        ));
+        // Esc got a function since (e.g. on another page): the plan written
+        // is made from the keyboard as it is now, so it clears it.
+        snap.keys.get_mut(&0x29).unwrap().mode.advanced = Advanced::Dks;
+        match confirm_import(&data, (1, 7), &snap, 7) {
+            Confirm::Write(plan) => assert_eq!(plan.clear_advanced, vec![0x29]),
+            _ => panic!("same generation: write"),
+        }
+        // The keyboard changed since the plan was shown (a reload, or
+        // another profile): nothing is written, the new plan is shown.
+        assert!(matches!(
+            confirm_import(&data, (1, 7), &snap, 8),
+            Confirm::Changed(Ok(_))
+        ));
+        snap.profile = 2;
+        assert!(matches!(
+            confirm_import(&data, (1, 7), &snap, 7),
+            Confirm::Changed(Ok(_))
+        ));
+    }
+
+    #[test]
+    fn a_planned_import_holds_automatic_switches_back() {
+        let mut page = Page::default();
+        assert!(!page.auto_locked());
+        page.transfer = Transfer::Planned {
+            file: "x.json".into(),
+            data: Box::new(sample_data()),
+            plan: Box::default(),
+            planned: (0, 0),
+            changed: false,
+        };
+        assert!(page.auto_locked());
+    }
+
     #[test]
     fn import_results_read_in_indonesian() {
         assert_eq!(
@@ -1736,7 +1883,10 @@ mod tests {
             },
             transfer: Transfer::Planned {
                 file: "x.json".into(),
+                data: Box::new(sample_data()),
                 plan: Box::default(),
+                planned: (1, 0),
+                changed: true,
             },
             auto_enabled: true, // rules editor without a watcher
             ..Page::default()
