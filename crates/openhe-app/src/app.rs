@@ -255,7 +255,19 @@ impl OpenHeApp {
                 }))
                 .show(ctx, |ui| {
                     if let Some(n) = &worker_notice {
-                        if notice_bar(ui, &worker_notice_text(n), i18n::common::RELOAD, !busy) {
+                        // Skipped keys stay skipped on a reload: offer to
+                        // hide the notice instead (it comes back if other
+                        // keys are skipped later).
+                        if let WorkerNotice::KeysSkipped(_) = n {
+                            if notice_bar(ui, &worker_notice_text(n), i18n::common::DISMISS, true) {
+                                self.worker.dismiss_notice();
+                            }
+                        } else if notice_bar(
+                            ui,
+                            &worker_notice_text(n),
+                            i18n::common::RELOAD,
+                            !busy,
+                        ) {
                             self.worker.request_reload();
                         }
                     }
