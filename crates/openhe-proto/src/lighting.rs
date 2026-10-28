@@ -190,7 +190,9 @@ pub fn get() -> Request {
 /// above 4, a mode above 21, a sleep timeout that is not one of
 /// `SLEEP_MINUTES` or a colour index above 7 is an error (the same
 /// `LightingError` as validation), never clamped, so a value the keyboard
-/// should not report is never written back as something else.
+/// should not report is never written back as something else. Flag bits
+/// other than bit0 (on) and bit1 (reverse) are ignored: a real reply had
+/// flags 0xC1 (bits 6 and 7 set, bit4 clear).
 pub fn parse(r: &Response) -> Result<Lighting, LightingError> {
     if r.cmd != Cmd::Prgb as u8 {
         return Err(LightingError::WrongReply("PRGB"));

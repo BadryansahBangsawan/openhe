@@ -1,6 +1,7 @@
 //! Keyboard lighting (CMD 0x18 PRGB and 0x2A KRGB) operations.
 
 use crate::{Error, Keyboard, Transport};
+use openhe_proto::frame::FrameError;
 use openhe_proto::lighting::{self, Lighting, LightingError, Rgb};
 use openhe_proto::order::{self, OrderType};
 use std::collections::HashSet;
@@ -24,8 +25,16 @@ impl<T: Transport> Keyboard<T> {
     ///
     /// Sends RGBNACK (order 0x47, arg 1) first, as the official app does
     /// before reading lighting, then a PRGB GET.
+    ///
+    /// FW App V1.1.3 rejects RGBNACK with a 0xFF reply (DeviceFail) while
+    /// the GET after it works (PROTOCOL 7.x finding 22), so that one failure
+    /// is ignored. Any other RGBNACK error (timeout, disconnect) fails the
+    /// read before the GET is sent.
     pub fn lighting(&mut self) -> Result<Lighting, Error> {
-        self.session.call(&order::set(OrderType::RgbNack, 1))?;
+        match self.session.call(&order::set(OrderType::RgbNack, 1)) {
+            Ok(_) | Err(Error::Frame(FrameError::DeviceFail)) => {}
+            Err(e) => return Err(e),
+        }
         let r = self.session.call(&lighting::get())?;
         Ok(lighting::parse(&r)?)
     }
@@ -183,6 +192,37 @@ mod tests {
         let mut get = [0u8; 64];
         get[..4].copy_from_slice(&[0x5C, 0x0F, 0x18, 0xB8]);
         assert_eq!(w[1], get, "GET uses flag 00 and LEN 15");
+    }
+
+    /// FW App V1.1.3 rejects RGBNACK with a 0xFF reply (PROTOCOL 7.x
+    /// finding 22); the PRGB GET after it works, so the read goes on.
+    #[test]
+    fn a_rejected_rgbnack_does_not_stop_the_read() {
+        let mut m = MockTransport::new();
+        m.push_reply(reply(0x7F, &[])); // 0xFF: DeviceFail for RGBNACK
+        m.push_reply(prgb_reply(&sample()));
+        let mut k = kb(m);
+        assert_eq!(k.lighting(), Ok(sample()));
+        let w = k.session_mut().transport().written();
+        assert_eq!(w.len(), 2, "RGBNACK once, then the GET");
+        assert_eq!(payload(&w[0]), [0x47, 0x01, 0xFF, 0xFF]);
+        assert_eq!(&w[1][..5], &[0x5C, 0x0F, 0x18, 0xB8, 0x00]);
+    }
+
+    #[test]
+    fn other_rgbnack_errors_still_fail_the_read() {
+        // No reply at all: Timeout, and the GET is never sent.
+        let mut k = kb(MockTransport::new());
+        assert_eq!(k.lighting(), Err(Error::Timeout));
+        assert!(k
+            .session_mut()
+            .transport()
+            .written()
+            .iter()
+            .all(|w| w[2] == 0x00));
+        let mut m = MockTransport::new();
+        m.fail_with(Error::Disconnected);
+        assert_eq!(kb(m).lighting(), Err(Error::Disconnected));
     }
 
     #[test]

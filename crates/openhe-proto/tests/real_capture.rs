@@ -100,3 +100,42 @@ fn every_captured_reply_decodes_and_answers_its_request() {
     // info 4 + dump (4 + 3 + 68 * 7) + two set-actuation runs (3 + 7 + 2 each).
     assert_eq!(pairs, 4 + 483 + 2 * 12);
 }
+
+/// PRGB GET reply to the LEN-15 GET `5C 0F 18 B8 00 ...` (FW App V1.1.3),
+/// raw[0..48] as captured, padded with zeros. Without raw[48] the checksum
+/// cannot be checked (it covers body[LEN-1] = raw[48]).
+const PRGB_REPLY: &str = "5C 2D 98 55 00 00 00 00 00 00 00 FF FF 00 FF 00 FF 00 7F 7F FF FF 00 00 FF 7F 00 7F FF 7F 7F 00 FF 7F 7F 7F FF 00 00 00 00 C1 03 03 03 02 06 07";
+
+#[test]
+fn real_prgb_reply_parses_with_unknown_flag_bits() {
+    use openhe_proto::lighting::{parse, Lighting, Rgb};
+    let r = Response::decode(&raw(PRGB_REPLY)).unwrap();
+    assert_eq!(r.cmd, Cmd::Prgb as u8);
+    assert_eq!(r.len, 0x2D);
+    // Flags 0xC1: on (bit0), not reversed (bit1); bits 6 and 7 are unknown
+    // and ignored, bit4 ("superResponse") is clear.
+    assert_eq!(r.body()[37], 0xC1);
+    let rgb = |r, g, b| Rgb { r, g, b };
+    assert_eq!(
+        parse(&r),
+        Ok(Lighting {
+            on: true,
+            reverse: false,
+            brightness: 3,
+            mode: 3,
+            speed: 3,
+            sleep_minutes: 2,
+            static_color: 6,
+            dynamic_color: 7,
+            colors: [
+                rgb(0xFF, 0, 0),
+                rgb(0, 0xFF, 0),
+                rgb(0x7F, 0x7F, 0),
+                rgb(0, 0, 0xFF),
+                rgb(0x7F, 0, 0x7F),
+                rgb(0, 0x7F, 0x7F),
+                rgb(0x7F, 0x7F, 0x7F),
+            ],
+        })
+    );
+}
