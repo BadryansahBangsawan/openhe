@@ -5,6 +5,9 @@ use crate::{Error, Transport};
 
 pub const VENDOR_ID: u16 = 0x1CA2;
 pub const USAGE_PAGE: u16 = 0xFFA0;
+/// The Linux udev rule, relative to the repository root. It must sort before
+/// systemd's 73-seat-late.rules, which applies the `uaccess` tag.
+pub const UDEV_RULES: &str = "packaging/linux/70-openhe.rules";
 
 pub fn classify(vid: u16, pid: u16, usage_page: u16, product: &str) -> Option<Model> {
     if usage_page != USAGE_PAGE {
@@ -84,7 +87,7 @@ impl HidTransport {
 fn open_failure_message(detail: &str) -> String {
     #[cfg(target_os = "linux")]
     {
-        format!("{detail}; install packaging/linux/99-openhe.rules to grant access to the keyboard")
+        format!("{detail}; install {UDEV_RULES} to grant access to the keyboard")
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -120,6 +123,30 @@ impl Transport for HidTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn udev_rule_exists_and_runs_before_uaccess_is_applied() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(UDEV_RULES);
+        let rule = std::fs::read_to_string(&path).expect("udev rule file");
+        assert!(rule.contains(r#"TAG+="uaccess""#));
+        assert!(rule.contains("1901|1902"));
+        let name = Path::new(UDEV_RULES).file_name().unwrap().to_str().unwrap();
+        let number: u32 = name.split('-').next().unwrap().parse().unwrap();
+        assert!(number < 73, "{name} sorts after 73-seat-late.rules");
+        assert!(
+            rule.contains(&format!("sudo cp {name} ")),
+            "install hint names the file"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_failure_names_the_udev_rule() {
+        assert!(open_failure_message("denied").contains("packaging/linux/70-openhe.rules"));
+    }
 
     #[test]
     fn model_filter() {

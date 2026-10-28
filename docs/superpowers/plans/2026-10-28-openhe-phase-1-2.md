@@ -116,7 +116,7 @@ crates/openhe-device/src/
   session.rs    Session: kirim, cocokkan balasan, retry, antrean event
   keyboard.rs   Keyboard: API tingkat tinggi
 crates/openhe-cli/src/main.rs   openhe list | info | dump | set-actuation
-packaging/linux/99-openhe.rules
+packaging/linux/70-openhe.rules
 docs/superpowers/specs/2026-10-28-openhe-design.md
 docs/superpowers/plans/2026-10-28-openhe-phase-1-2.md
 ```
@@ -311,14 +311,14 @@ Byte 0 balasan tidak divalidasi karena isinya belum diketahui. `checksum_ok()` h
 
 ### Task 9: Transport hidapi
 
-**Files:** `src/hid.rs`, `packaging/linux/99-openhe.rules`.
+**Files:** `src/hid.rs`, `packaging/linux/70-openhe.rules`.
 
 **Interfaces (Produces):**
 - `pub struct DeviceEntry { pub model: Option<Model>, pub product: String, pub path: String }`
 - `pub fn list_devices() -> Result<Vec<DeviceEntry>, Error>`: semua interface VID `0x1CA2` dengan usage page `0xFFA0`. `model` bernilai None untuk perangkat yang tidak didukung.
 - `pub struct HidTransport` dengan `impl Transport` dan `pub fn open_first() -> Result<(HidTransport, Model), Error>`.
   - Saat menulis, tambahkan prefix `0x00`.
-  - Error hidapi saat membuka dipetakan ke `Permission(..)`. Di Linux, pesannya menyebut `packaging/linux/99-openhe.rules`.
+  - Error hidapi saat membuka dipetakan ke `Permission(..)`. Di Linux, pesannya menyebut `packaging/linux/70-openhe.rules`.
 - Isi aturan udev: `SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1ca2", ATTRS{idProduct}=="1901|1902", TAG+="uaccess"`.
 
 - [ ] **Step 1:** `cargo build -p openhe-device` di macOS → sukses. Untuk target lain cukup `cargo check` bila toolchain tersedia; build sungguhan di 3 OS dikerjakan di CI Tahap 7.
