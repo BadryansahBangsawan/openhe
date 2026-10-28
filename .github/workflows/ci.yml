@@ -50,7 +50,7 @@ jobs:
         run: cargo test --locked --workspace
 
   msrv:
-    name: cargo check on Rust 1.85 (rust-version)
+    name: cargo check on Rust 1.88 (rust-version)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,12 +63,12 @@ jobs:
             libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libdbus-1-dev libxcb1-dev
 
-      - name: Install Rust 1.85.0
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Check
-        # rust-toolchain.toml pins "stable"; +1.85.0 overrides it.
-        run: cargo +1.85.0 check --workspace --locked
+        # rust-toolchain.toml pins "stable"; +1.88.0 overrides it.
+        run: cargo +1.88.0 check --workspace --locked

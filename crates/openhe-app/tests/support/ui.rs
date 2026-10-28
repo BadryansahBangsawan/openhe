@@ -307,10 +307,16 @@ impl World {
         self.click(label);
         // The job may reach the worker a frame or two later on a slow
         // machine; waiting for "idle" alone could return before it started.
-        self.until("the apply wrote to the keyboard", 10, |w| {
-            w.frames(1);
-            w.sim().log.len() > before
-        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.sim().log.len() == before {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "{label:?} wrote nothing to the keyboard; on screen: {:?}",
+                    self.labels()
+                );
+            }
+            self.frames(1);
+        }
         self.idle();
     }
 }

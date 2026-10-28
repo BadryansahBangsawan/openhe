@@ -16,7 +16,7 @@ winresource = { version = "0.1.34", default-features = false }
 
 `winresource` is compiled on every host but only called when the target is Windows, so Linux and macOS
 builds are unaffected (`build.rs` does nothing on other targets). The default `toml` feature is off: no
-Cargo.toml metadata is read, and the crate builds on Rust 1.85.
+Cargo.toml metadata is read, and the crate builds on Rust 1.88.
 
 ## 2. `crates/openhe-app/build.rs`
 

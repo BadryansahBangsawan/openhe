@@ -78,7 +78,7 @@ Aturan udev ini juga diperlukan untuk menjalankan CLI hasil build dari source di
 
 ## Build dari source
 
-Butuh Rust stable (1.85 atau lebih baru).
+Butuh Rust stable (1.88 atau lebih baru).
 
 ```sh
 git clone <repository-url> openhe
@@ -205,7 +205,7 @@ The rule is also needed to run a CLI built from source on Linux. Then unplug and
 
 ## Build from source
 
-You need stable Rust (1.85 or newer).
+You need stable Rust (1.88 or newer).
 
 ```sh
 git clone <repository-url> openhe

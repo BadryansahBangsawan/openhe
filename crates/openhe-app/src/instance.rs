@@ -48,7 +48,7 @@ pub fn acquire(dir: &Path) -> Acquire {
         Err(e) => return Acquire::Unavailable(e),
     };
     // Fully qualified: newer std has an inherent `File::try_lock` with
-    // another error type, while the workspace builds on Rust 1.85 too.
+    // another error type, while the workspace builds on Rust 1.88 too.
     match fs4::FileExt::try_lock(&file) {
         Ok(()) => Acquire::Acquired(InstanceLock { _file: file }),
         Err(fs4::TryLockError::WouldBlock) => Acquire::AlreadyRunning,
