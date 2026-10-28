@@ -105,6 +105,9 @@ mod strings {
     pub const LOADING: &str = "Membaca pengaturan lampu…";
     pub const LOAD_FAILED: &str = "Gagal membaca pengaturan lampu";
     pub const OFFLINE: &str = "Sambungkan keyboard untuk mengatur lampu.";
+    pub const EXTERNAL_CHANGE: &str =
+        "Lampu diubah dari keyboard. Muat ulang untuk melihatnya (perubahan di layar dibuang), atau abaikan untuk tetap memakai perubahan di layar.";
+    pub const IGNORE: &str = "Abaikan";
     pub const UNVERIFIED: &str =
         "Pengaturan lampu belum diuji di keyboard sungguhan. Jika hasilnya berbeda, nilai dibaca ulang.";
 
@@ -634,6 +637,11 @@ pub struct Page {
     /// The latest lighting read worked. "Terapkan" stays off otherwise, so
     /// nothing is written on top of a state that could not be read.
     read_ok: bool,
+    /// `Worker::lighting_generation` last looked at.
+    seen_lighting: Option<u64>,
+    /// The keyboard changed its lighting while the form had unsent edits:
+    /// "Terapkan" waits until the user reloads or keeps the edits.
+    external_change: bool,
     loading: Option<Pending<Lighting>>,
     loaded_generation: Option<u64>,
     pending: Option<Pending<LightingOutcome>>,
@@ -671,6 +679,8 @@ impl Default for Page {
             form: Form::default(),
             device: None,
             read_ok: false,
+            seen_lighting: None,
+            external_change: false,
             loading: None,
             loaded_generation: None,
             pending: None,
@@ -734,6 +744,7 @@ impl Page {
 
     pub fn ui(&mut self, ctx: &AppCtx, ui: &mut Ui) {
         self.poll(ctx);
+        self.follow_lighting(ctx.worker.lighting_generation());
         self.start_reads(ctx);
         page_with_right_panel(
             ui,
@@ -764,7 +775,71 @@ impl Page {
     /// "Terapkan ke keyboard" may send the form: the lighting was read
     /// (the latest read worked) and the form differs from it.
     fn effects_ready(&self) -> bool {
-        self.read_ok && self.device.is_some() && self.dirty()
+        self.read_ok && !self.external_change && self.device.is_some() && self.dirty()
+    }
+
+    /// The keyboard reported a lighting change of its own (Fn + light keys)
+    /// when `lighting_generation` moved. Without unsent edits the lighting
+    /// (and the key colours) are simply read again; with edits they are
+    /// kept and the page says the keyboard changed (see
+    /// [`Page::reload_from_keyboard`] and [`Page::keep_edits`]).
+    fn follow_lighting(&mut self, lighting_generation: u64) {
+        let moved = self.seen_lighting.is_some_and(|g| g != lighting_generation);
+        self.seen_lighting = Some(lighting_generation);
+        if !moved {
+            return;
+        }
+        if self.dirty() {
+            self.external_change = true;
+        } else {
+            self.loaded_generation = None;
+        }
+        // Key colours keep unsent paint on a re-read (see `finish_key_load`).
+        self.key_loaded_generation = None;
+    }
+
+    /// "Muat ulang" after a change on the keyboard: drop the edits and read
+    /// the lighting again.
+    fn reload_from_keyboard(&mut self) {
+        if let Some(d) = &self.device {
+            self.form = Form::from_lighting(d);
+        }
+        self.external_change = false;
+        self.loaded_generation = None;
+    }
+
+    /// "Abaikan": keep the edits; "Terapkan" sends them as they are.
+    fn keep_edits(&mut self) {
+        self.external_change = false;
+    }
+
+    /// The key colours were read. A key whose colour on screen was not
+    /// painted (it equals what the keyboard had) follows the keyboard;
+    /// unsent paint is kept.
+    fn finish_key_load(&mut self, r: Result<Vec<(u8, Rgb)>, Error>) {
+        match r {
+            Ok(colors) => {
+                for (k, c) in colors {
+                    let painted = self
+                        .key_edit
+                        .get(&k)
+                        .is_some_and(|e| self.key_device.get(&k) != Some(e));
+                    if !painted {
+                        self.key_edit.insert(k, c);
+                    }
+                    self.key_device.insert(k, c);
+                }
+                self.key_failure = None;
+            }
+            Err(Error::Disconnected) => self.key_loaded_generation = None,
+            Err(e) => {
+                self.key_failure = Some(Failure {
+                    title: strings::KEYS_LOAD_FAILED,
+                    text: i18n::device_error(&e),
+                    technical: Some(i18n::technical(&e)),
+                });
+            }
+        }
     }
 
     /// A lighting read finished. Unsent edits are kept.
@@ -838,24 +913,7 @@ impl Page {
         if let Some(p) = self.key_loading.as_mut() {
             if let Some(r) = p.poll() {
                 self.key_loading = None;
-                match r {
-                    Ok(colors) => {
-                        self.key_device = colors.iter().copied().collect();
-                        // Keep unsent paint; fill the rest from the keyboard.
-                        for (k, c) in colors {
-                            self.key_edit.entry(k).or_insert(c);
-                        }
-                        self.key_failure = None;
-                    }
-                    Err(Error::Disconnected) => self.key_loaded_generation = None,
-                    Err(e) => {
-                        self.key_failure = Some(Failure {
-                            title: strings::KEYS_LOAD_FAILED,
-                            text: i18n::device_error(&e),
-                            technical: Some(i18n::technical(&e)),
-                        });
-                    }
-                }
+                self.finish_key_load(r);
             }
         }
         if let Some(p) = self.key_pending.as_mut() {
@@ -1382,6 +1440,33 @@ impl Page {
             ui.add_space(8.0);
         }
 
+        if self.external_change && self.tab == Tab::Effects {
+            Card::new()
+                .fill(color::ACCENT_SOFT)
+                .stroke(color::ACCENT.gamma_multiply(0.5))
+                .padding(12)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(strings::EXTERNAL_CHANGE).color(color::TEXT),
+                        )
+                        .wrap(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(idle, egui::Button::new(i18n::common::RELOAD))
+                            .clicked()
+                        {
+                            self.reload_from_keyboard();
+                        }
+                        if ui.button(strings::IGNORE).clicked() {
+                            self.keep_edits();
+                        }
+                    });
+                });
+            ui.add_space(8.0);
+        }
         match self.tab {
             Tab::Effects => {
                 let can = idle && self.effects_ready();
@@ -2233,6 +2318,55 @@ mod tests {
         page.finish_load(Ok(sample()));
         assert!(page.effects_ready());
         assert_eq!(page.form.brightness, 1, "still kept: unsent edits");
+    }
+
+    #[test]
+    fn a_lighting_change_on_the_keyboard_is_read_again_unless_edited() {
+        let mut page = Page::preloaded(3, sample(), [(0x04, rgb(1, 2, 3))]);
+        page.follow_lighting(0); // first look: nothing to compare
+        assert_eq!(page.loaded_generation, Some(3));
+        // Fn+light on the keyboard, no edits here: read it again.
+        page.follow_lighting(1);
+        assert_eq!(page.loaded_generation, None);
+        assert_eq!(page.key_loaded_generation, None);
+        assert!(!page.external_change);
+
+        // With unsent edits: keep them, say so, and hold "Terapkan" back
+        // until the user picks.
+        page.loaded_generation = Some(3);
+        page.key_loaded_generation = Some(3);
+        page.form.brightness = 1;
+        page.follow_lighting(2);
+        assert_eq!(page.loaded_generation, Some(3), "edits are not replaced");
+        assert!(page.external_change);
+        assert!(!page.effects_ready());
+        page.follow_lighting(2);
+        assert!(page.external_change);
+        // "Muat ulang": drop the edits and read the keyboard.
+        page.reload_from_keyboard();
+        assert!(!page.external_change);
+        assert_eq!(page.loaded_generation, None);
+        assert_eq!(page.form, Form::from_lighting(&sample()));
+        // Or keep them on purpose: "Terapkan" is possible again.
+        page.loaded_generation = Some(3);
+        page.form.brightness = 1;
+        page.follow_lighting(3);
+        page.keep_edits();
+        assert!(!page.external_change);
+        assert!(page.effects_ready());
+    }
+
+    #[test]
+    fn a_key_colour_reread_keeps_only_real_edits() {
+        let mut page = Page::preloaded(3, sample(), [(0x04, rgb(1, 1, 1)), (0x05, rgb(2, 2, 2))]);
+        page.key_edit.insert(0x05, rgb(9, 9, 9)); // painted, unsent
+        page.finish_key_load(Ok(vec![(0x04, rgb(7, 7, 7)), (0x05, rgb(8, 8, 8))]));
+        assert_eq!(page.key_edit[&0x04], rgb(7, 7, 7), "follows the keyboard");
+        assert_eq!(page.key_edit[&0x05], rgb(9, 9, 9), "unsent paint kept");
+        assert_eq!(
+            changed_keys(&page.key_device, &page.key_edit),
+            vec![(0x05, rgb(9, 9, 9))]
+        );
     }
 
     #[test]
