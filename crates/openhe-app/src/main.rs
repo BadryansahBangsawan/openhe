@@ -1,1 +1,7 @@
-fn main() {}
+#![forbid(unsafe_code)]
+// No console window on Windows release builds.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+fn main() -> eframe::Result {
+    openhe_app::run()
+}

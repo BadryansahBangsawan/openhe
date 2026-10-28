@@ -328,6 +328,14 @@ impl<T: Transport + 'static> Worker<T> {
     }
 }
 
+#[cfg(test)]
+impl<T: Transport + 'static> Worker<T> {
+    /// Test hook for UI tests: overrides the shown status.
+    pub(crate) fn inject_status(&self, s: ConnectionStatus) {
+        self.ctl.set_status(s);
+    }
+}
+
 impl<T: Transport + 'static> Drop for Worker<T> {
     fn drop(&mut self) {
         self.ctl.stop.store(true, Ordering::SeqCst);
