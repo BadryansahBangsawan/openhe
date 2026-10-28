@@ -18,7 +18,6 @@ use openhe_device::keyboard::performance::{MAX_DEADZONE_UM, MIN_RT_UM};
 use openhe_device::{AdvancedConfig, Error, KeySettings, Keyboard, PerformanceChange, Transport};
 use openhe_proto::advanced::{self, Dks, End, Mpt, Mt, Socd, SocdMode, Tgl};
 use openhe_proto::key::{Advanced, KeyMode};
-use openhe_proto::keycodes;
 use openhe_proto::lighting::{Lighting, Rgb, COLOR_SLOTS};
 use openhe_proto::model::MIN_ACTUATION_UM;
 use openhe_proto::{Layer, Micrometers, Model, TouchMode};
@@ -534,15 +533,6 @@ fn bad(msg: String) -> FileError {
     FileError::BadValue(msg)
 }
 
-fn known_code(key: u8, what: &str, code: u16) -> Result<(), FileError> {
-    if keycodes::lookup(code).is_none() {
-        return Err(bad(format!(
-            "key 0x{key:02X}: unknown {what} keycode 0x{code:04X}"
-        )));
-    }
-    Ok(())
-}
-
 /// The checks the device API would make while writing `change` to `key`
 /// (switch id, actuation 0.1 mm..=max, RT 0.005 mm..=max, deadzones
 /// 0..=1.0 mm), done up front so a bad file writes nothing.
@@ -583,8 +573,9 @@ fn check_performance(model: Model, key: u8, change: &PerformanceChange) -> Resul
 }
 
 /// The function checks of `set_advanced`: the proto packet builders'
-/// validation, known keycodes, and SOCD positions that are real keys of
-/// this keyboard with `key` one of them. Like the Tombol Lanjutan page, the
+/// validation and SOCD positions that are real keys of this keyboard with
+/// `key` one of them. Keycodes are not checked against the keycode table:
+/// the factory map itself holds codes it does not know (0x6152, 0xF344). Like the Tombol Lanjutan page, the
 /// Fn key never gets a function (macros included) and is never part of a
 /// SOCD pair: what the firmware does then is unknown, and losing Fn loses
 /// the Fn layers.
@@ -599,26 +590,17 @@ fn check_advanced(key: u8, cfg: &AdvancedConfig, present: &BTreeSet<u8>) -> Resu
         AdvancedConfig::None | AdvancedConfig::Macro => {}
         AdvancedConfig::Dks(d) => {
             advanced::dks_set(key, d).map_err(invalid)?;
-            for c in d.bindings {
-                known_code(key, "DKS", c)?;
-            }
         }
         AdvancedConfig::Mt(m) => {
             advanced::mt_set(key, m).map_err(invalid)?;
-            known_code(key, "MT hold", m.hold)?;
-            known_code(key, "MT tap", m.tap)?;
         }
         AdvancedConfig::Tgl(t) => {
             advanced::tgl_set(key, t).map_err(invalid)?;
-            known_code(key, "TGL", t.code)?;
         }
         AdvancedConfig::Mpt(m) => {
             advanced::mpt_set(key, m).map_err(invalid)?;
-            for c in m.codes {
-                known_code(key, "MPT", c)?;
-            }
         }
-        AdvancedConfig::End(e) => known_code(key, "END", e.code)?,
+        AdvancedConfig::End(_) => {}
         AdvancedConfig::Socd(s) => {
             advanced::socd_set(s).map_err(invalid)?;
             if key != s.pos1 && key != s.pos2 {
@@ -632,8 +614,6 @@ fn check_advanced(key: u8, cfg: &AdvancedConfig, present: &BTreeSet<u8>) -> Resu
                     return Err(bad(format!("SOCD position 0x{p:02X} is not a key")));
                 }
             }
-            known_code(key, "SOCD", s.key1)?;
-            known_code(key, "SOCD", s.key2)?;
         }
     }
     Ok(())
@@ -644,8 +624,10 @@ fn check_advanced(key: u8, cfg: &AdvancedConfig, present: &BTreeSet<u8>) -> Resu
 /// Everything the device API would refuse is checked here first, so a bad
 /// file is rejected (`FileError`) before anything is written: the model,
 /// duplicate key entries, every performance value against its switch,
-/// every advanced function (packet validation, keycodes, SOCD positions),
-/// every layer keycode, and the per-key colours (no duplicates). The Fn
+/// every advanced function (packet validation, SOCD positions), and the
+/// per-key colours (no duplicates). Keycodes the keycode table does not
+/// know are accepted and written as they are (the factory Fn layers hold
+/// some). The Fn
 /// key's own base-layer code is left out of the writes, and a function on
 /// the Fn key (or a SOCD pair with it) refuses the file.
 pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPlan, FileError> {
@@ -678,11 +660,6 @@ pub fn plan_import(data: &ProfileData, snap: &DeviceSnapshot) -> Result<ImportPl
         let change = perf_change(&k.settings);
         check_performance(snap.model, k.code, &change)?;
         check_advanced(k.code, &k.advanced, &present)?;
-        for (layer, code) in LAYERS.into_iter().zip(k.layers) {
-            if !(k.code == FN_KEY && layer == Layer::Base) {
-                known_code(k.code, "layer", code)?;
-            }
-        }
         match plan.performance.iter_mut().find(|(_, c)| *c == change) {
             Some((keys, _)) => keys.push(k.code),
             None => plan.performance.push((vec![k.code], change)),
@@ -1033,14 +1010,6 @@ mod tests {
         push("SOCD on a key outside its pair", &|d| {
             d.keys[last].advanced = AdvancedConfig::Socd(socd());
         });
-        push("unknown layer keycode", &|d| {
-            d.keys[last].layers[3] = 0xBEEF
-        });
-        push("unknown TGL keycode", &|d| {
-            if let AdvancedConfig::Tgl(x) = &mut d.keys[4].advanced {
-                x.code = 0xBEEF;
-            }
-        });
         push("function on the Fn key", &|d| {
             d.keys[last].advanced = AdvancedConfig::Mt(Mt {
                 hold: 0xE0,
@@ -1086,6 +1055,47 @@ mod tests {
         }
         // The untouched sample still plans.
         assert!(plan_import(&sample(), &snap).is_ok());
+    }
+
+    /// The factory map itself holds codes the keycode table does not know
+    /// (Fn2: 0x6152, 0x681B; Fn1 Caps: 0xF344), so an exported factory
+    /// profile must import again. Unknown codes are written as they are.
+    #[test]
+    fn unknown_keycodes_are_imported_as_they_are() {
+        let snap = snapshot68();
+        let mut d = sample();
+        let fn_key = d.keys.len() - 1;
+        let a = d.keys.iter().position(|k| k.code == 0x04).unwrap();
+        d.keys[a].layers = [0x0004, 0xF344, 0x6152, 0x681B];
+        d.keys[fn_key].layers[2] = 0xBEEF;
+        if let Some(AdvancedConfig::Tgl(x)) =
+            d.keys.iter_mut().find_map(|k| match &mut k.advanced {
+                AdvancedConfig::Tgl(_) => Some(&mut k.advanced),
+                _ => None,
+            })
+        {
+            x.code = 0xBEEF;
+        } else {
+            panic!("the sample has a TGL key");
+        }
+        let plan = plan_import(&d, &snap).expect("unknown codes are accepted");
+        for want in [
+            (0x04, Layer::Fn1, 0xF344),
+            (0x04, Layer::Fn2, 0x6152),
+            (0x04, Layer::Fn3, 0x681B),
+            (0x01, Layer::Fn2, 0xBEEF),
+        ] {
+            assert!(plan.layers.contains(&want), "{want:?}");
+        }
+        assert!(plan
+            .advanced
+            .iter()
+            .any(|(_, c)| matches!(c, AdvancedConfig::Tgl(t) if t.code == 0xBEEF)));
+        // The Fn guard stays: Fn's own Base code is never written.
+        assert!(!plan
+            .layers
+            .iter()
+            .any(|&(k, l, _)| k == 0x01 && l == Layer::Base));
     }
 
     #[test]
