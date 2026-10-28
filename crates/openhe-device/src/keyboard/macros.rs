@@ -461,12 +461,17 @@ mod tests {
         assert!(matches!(Error::from(MacroError::WrongReply), Error::Io(_)));
     }
 
+    /// A MACRO_MODE GET reply for another key is not the answer: it is
+    /// queued as an event, never read as this key's binding.
     #[test]
-    fn macro_binding_rejects_a_reply_for_another_key() {
+    fn macro_binding_skips_a_reply_for_another_key() {
         let mut m = MockTransport::new();
         m.push_reply(key_reply(KEY, 8, 0x0006));
-        m.push_reply(mode_reply(0x0B, 5, PlayMode::Once, 1, 100));
-        let e = kb(m).macro_binding(KEY).unwrap_err();
-        assert!(matches!(e, Error::Io(_)), "{e:?}");
+        m.push_reply(mode_reply(0x0B, 5, PlayMode::Toggle, 9, 900));
+        m.push_reply(mode_reply(KEY, 5, PlayMode::Once, 1, 100));
+        let mut k = kb(m);
+        let b = k.macro_binding(KEY).unwrap().unwrap();
+        assert_eq!((b.mode, b.repeat, b.interval_ms), (PlayMode::Once, 1, 100));
+        assert_eq!(k.session_mut().take_events().len(), 1);
     }
 }

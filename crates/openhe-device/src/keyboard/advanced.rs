@@ -3,7 +3,7 @@
 use super::Keyboard;
 use crate::{Error, Transport};
 use openhe_proto::advanced::{self, AdvancedError, Dks, End, Mpt, Mt, Socd, Tgl};
-use openhe_proto::frame::Request;
+use openhe_proto::frame::{Request, Response};
 use openhe_proto::key::{Advanced, KeyMode, KeyParam, Layer, Slot};
 
 /// The advanced function bound to a key, as read from or written to the
@@ -35,6 +35,21 @@ fn invalid(e: AdvancedError) -> Error {
 
 fn bad_reply(e: AdvancedError) -> Error {
     Error::Io(format!("unexpected advanced-key reply: {e}"))
+}
+
+/// MPT, TGL and END replies carry the key at R[1] (PROTOCOL 3.6, inferred
+/// from the vendor parsers). `Session` does not match on it, since the
+/// layout is not hardware-verified; a reply for another key (stray or
+/// late) is an `Io` error here instead of being read as this key's data.
+fn reply_key_is(key: u8, what: &str, r: &Response) -> Result<(), Error> {
+    let got = r.body()[1];
+    if got == key {
+        Ok(())
+    } else {
+        Err(Error::Io(format!(
+            "unexpected {what} reply for key 0x{key:02X}: key 0x{got:02X}"
+        )))
+    }
 }
 
 impl AdvancedConfig {
@@ -113,19 +128,30 @@ impl<T: Transport> Keyboard<T> {
             }
             Advanced::Mpt => {
                 let r = self.session.call(&advanced::mpt_get(key))?;
+                reply_key_is(key, "MPT", &r)?;
                 AdvancedConfig::Mpt(advanced::parse_mpt(&r).map_err(bad_reply)?)
             }
             Advanced::Tgl => {
                 let r = self.session.call(&advanced::tgl_get(key))?;
+                reply_key_is(key, "TGL", &r)?;
                 AdvancedConfig::Tgl(advanced::parse_tgl(&r).map_err(bad_reply)?)
             }
             Advanced::End => {
                 let r = self.session.call(&advanced::end_get(key))?;
+                reply_key_is(key, "END", &r)?;
                 AdvancedConfig::End(advanced::parse_end(&r).map_err(bad_reply)?)
             }
             Advanced::Socd => {
                 let r = self.session.call(&advanced::socd_get(key))?;
-                AdvancedConfig::Socd(advanced::parse_socd(&r).map_err(bad_reply)?)
+                let s = advanced::parse_socd(&r).map_err(bad_reply)?;
+                // The record names the pair, which must hold this key.
+                if s.pos1 != key && s.pos2 != key {
+                    return Err(Error::Io(format!(
+                        "unexpected SOCD reply for key 0x{key:02X}: pair 0x{:02X}/0x{:02X}",
+                        s.pos1, s.pos2
+                    )));
+                }
+                AdvancedConfig::Socd(s)
             }
         })
     }
@@ -633,6 +659,50 @@ mod tests {
         assert_eq!(payload(&w[9]), [0x01, KEY, 8, 0x14, 0x00]);
         // END keeps touch RT (0x20) and writes END (5).
         assert_eq!(payload(&w[15]), [0x01, KEY, 8, 0x25, 0x00]);
+    }
+
+    /// Scan finding 3: the MPT, TGL and END replies carry the key at R[1].
+    /// A reply for another key (a stray or late one) must not pass the
+    /// set_advanced verify, which rebuilds the packet with the requested
+    /// key, nor be read as this key's function.
+    #[test]
+    fn a_function_reply_for_another_key_never_verifies() {
+        const OTHER: u8 = 0x0B;
+        let mut m = MockTransport::new();
+        script_set(&mut m, 0x27, 0, 2);
+        m.push_reply(reply(
+            0x27,
+            &[0, OTHER, 4, 0, 5, 0, 6, 0, 0xE8, 3, 0xD0, 7, 0xB8, 0xB],
+        ));
+        script_set(&mut m, 0x25, 0x0010, 0x0014);
+        m.push_reply(reply(0x25, &[0, OTHER, 4, 0, 30]));
+        script_set(&mut m, 0x28, 0x0020, 0x0025);
+        m.push_reply(reply(0x28, &[0, OTHER, 5, 0, 0, 0]));
+        let mut k = kb(m);
+        let tgl = Tgl {
+            code: 4,
+            delay_ms: 300,
+        };
+        for cfg in [
+            AdvancedConfig::Mpt(mpt()),
+            AdvancedConfig::Tgl(tgl),
+            AdvancedConfig::End(End { code: 5 }),
+        ] {
+            let e = k.set_advanced(KEY, &cfg).unwrap_err();
+            assert!(
+                matches!(&e, Error::Io(s) if s.contains("key 0x0B")),
+                "{cfg:?}: {e:?}"
+            );
+        }
+        // Plain reads check the key too; a SOCD record must name the key.
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(KEY, 8, 0x0014));
+        m.push_reply(reply(0x25, &[0, OTHER, 4, 0, 30]));
+        m.push_reply(key_reply(KEY, 8, 0x0018));
+        m.push_reply(reply(0x2C, &[0, 4, 7, 4, 0, 7, 0, 1, 2, 50, 0]));
+        let mut k = kb(m);
+        assert!(matches!(k.advanced(KEY), Err(Error::Io(_))));
+        assert!(matches!(k.advanced(KEY), Err(Error::Io(_))));
     }
 
     #[test]

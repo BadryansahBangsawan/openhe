@@ -4,6 +4,11 @@ use crate::{Error, Keyboard, Transport};
 use openhe_proto::lighting::{self, Lighting, LightingError, Rgb};
 use openhe_proto::order::{self, OrderType};
 use std::collections::HashSet;
+use std::time::Duration;
+
+/// How long `set_lighting` lets late 0x98 reports arrive (and drains them)
+/// between the SET and the read-back.
+const PRGB_SETTLE: Duration = Duration::from_millis(50);
 
 /// A lighting reply that does not parse or holds out-of-range values: a
 /// problem with what the keyboard sent (`Error::Io`). Values the caller
@@ -44,7 +49,8 @@ impl<T: Transport> Keyboard<T> {
         Ok(lighting::parse(&r)?)
     }
 
-    /// Writes the main light state, then reads it back with `lighting` and
+    /// Writes the main light state, waits 50 ms and drains late 0x98 reports
+    /// (see `PRGB_SETTLE`), then reads it back with `lighting` and
     /// compares every field except `extra_flags`.
     ///
     /// `extra_flags` (flag bits other than on and reverse, meaning unknown)
@@ -62,6 +68,10 @@ impl<T: Transport> Keyboard<T> {
     pub fn set_lighting(&mut self, l: &Lighting) -> Result<(), Error> {
         let req = lighting::set(l).map_err(invalid)?;
         self.session.call(&req)?;
+        // A keyboard lighting report (0x98, e.g. Fn+light) can be taken as
+        // the SET reply; the real one then arrives late and, being 0x98 too,
+        // could answer the read-back GET. Let it arrive and drain it first.
+        self.session.settle(PRGB_SETTLE)?;
         let got = self.lighting()?;
         let want = Lighting {
             speed: l.wire_speed(),
@@ -365,6 +375,40 @@ mod tests {
         );
     }
 
+    /// Scan finding 3 (PRGB): the SET reply, the GET reply and the
+    /// keyboard's own lighting report all use 0x98. A keyboard report
+    /// (Fn+light) taken as the SET reply pushes the real SET reply late; it
+    /// must not answer the read-back GET, or a SET echo verifies whatever
+    /// the keyboard actually stored. The wire sequence is unchanged:
+    /// RGBNACK once, then the LEN-15 GET (7.x finding 22).
+    #[test]
+    fn a_late_set_reply_never_answers_the_read_back() {
+        use crate::TimedTransport;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut stored = sample();
+        stored.brightness = 1;
+        let mut keyboard_report = sample();
+        keyboard_report.mode = 5;
+        let mut t = TimedTransport::new();
+        t.on_write(vec![
+            (ms(0), prgb_reply(&keyboard_report)), // Fn+light, taken as the SET reply
+            (ms(20), prgb_reply(&sample())),       // the real SET reply (an echo)
+        ]);
+        t.on_write(vec![(ms(0), nack_reply())]);
+        t.on_write(vec![(ms(30), prgb_reply(&stored))]); // the read-back
+        let mut k = Keyboard::new(t, Model::Win68HeMax);
+        let e = k.set_lighting(&sample()).unwrap_err();
+        assert!(
+            matches!(&e, Error::Io(s) if s.starts_with("verify failed")),
+            "{e:?}"
+        );
+        let w = k.session_mut().transport().written();
+        assert_eq!(w.len(), 3);
+        assert_eq!(payload(&w[1]), [0x47, 0x01, 0xFF, 0xFF]);
+        assert_eq!(&w[2][..5], &[0x5C, 0x0F, 0x18, 0xB8, 0x00]);
+    }
+
     #[test]
     fn set_lighting_expects_speed_zero_for_static() {
         let mut l = sample();
@@ -439,12 +483,33 @@ mod tests {
         assert_eq!(payload(&w[1]), [0x00, 0x0B]);
     }
 
+    /// A KRGB reply for another key (a stray echo) is not the answer: it
+    /// is queued as an event and the call waits for this key's reply.
     #[test]
-    fn key_colors_rejects_a_reply_for_another_key() {
+    fn key_colors_skip_a_reply_for_another_key() {
         let mut m = MockTransport::new();
         m.push_reply(krgb_reply(0x0B, rgb(1, 2, 3)));
-        let e = kb(m).key_colors(&[0x0A]).unwrap_err();
-        assert!(matches!(e, Error::Io(_)), "{e:?}");
+        m.push_reply(krgb_reply(0x0A, rgb(4, 5, 6)));
+        let mut k = kb(m);
+        assert_eq!(k.key_colors(&[0x0A]), Ok(vec![(0x0A, rgb(4, 5, 6))]));
+        assert_eq!(k.session_mut().take_events().len(), 1);
+        // Alone, it is never taken as the answer.
+        let mut m = MockTransport::new();
+        m.push_reply(krgb_reply(0x0B, rgb(1, 2, 3)));
+        assert_eq!(kb(m).key_colors(&[0x0A]), Err(Error::Timeout));
+    }
+
+    /// A stray KRGB echo for another key arriving during a SET no longer
+    /// fails the batch with a spurious "verify failed" (scan finding 3).
+    #[test]
+    fn set_key_colors_skips_a_stray_echo_for_another_key() {
+        let mut m = MockTransport::new();
+        m.push_reply(krgb_reply(0x0B, rgb(9, 9, 9))); // stray
+        m.push_reply(krgb_reply(0x0A, rgb(1, 2, 3)));
+        m.push_reply(reply(0x2A, &[0, 0xFE, 0xFE, 0xFE, 0xFE]));
+        let mut k = kb(m);
+        assert_eq!(k.set_key_colors(&[(0x0A, rgb(1, 2, 3))]), Ok(()));
+        assert_eq!(k.session_mut().transport().written().len(), 2);
     }
 
     #[test]

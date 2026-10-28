@@ -1,5 +1,6 @@
 use crate::Error;
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 /// A 64-byte HID report pipe. `read` blocks up to `timeout_ms` and returns
 /// `Ok(None)` when nothing arrived.
@@ -66,6 +67,60 @@ impl Transport for MockTransport {
             return Ok(None);
         }
         Ok(self.replies.pop_front())
+    }
+}
+
+/// Test transport with timing: each write makes its scripted replies
+/// readable after their delays, as a keyboard would answer. A read returns
+/// the oldest report that is due, waits (really sleeping) up to its timeout
+/// for the next one, or returns `Ok(None)`. Unlike [`MockTransport`] it can
+/// show input that arrives late, e.g. after the next request was written.
+#[derive(Debug, Default)]
+pub struct TimedTransport {
+    script: VecDeque<Vec<(Duration, [u8; 64])>>,
+    inbox: Vec<(Instant, [u8; 64])>,
+    written: Vec<[u8; 64]>,
+}
+
+impl TimedTransport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The replies (delay after the write, report) of the next unscripted
+    /// write. A write without a script gets no reply.
+    pub fn on_write(&mut self, replies: Vec<(Duration, [u8; 64])>) {
+        self.script.push_back(replies);
+    }
+
+    pub fn written(&self) -> &[[u8; 64]] {
+        &self.written
+    }
+}
+
+impl Transport for TimedTransport {
+    fn write(&mut self, report: &[u8; 64]) -> Result<(), Error> {
+        self.written.push(*report);
+        let now = Instant::now();
+        for (d, r) in self.script.pop_front().unwrap_or_default() {
+            self.inbox.push((now + d, r));
+        }
+        self.inbox.sort_by_key(|(t, _)| *t);
+        Ok(())
+    }
+
+    fn read(&mut self, timeout_ms: u32) -> Result<Option<[u8; 64]>, Error> {
+        let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        match self.inbox.first() {
+            Some(&(t, _)) if t <= deadline => {
+                std::thread::sleep(t.saturating_duration_since(Instant::now()));
+                Ok(Some(self.inbox.remove(0).1))
+            }
+            _ => {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                Ok(None)
+            }
+        }
     }
 }
 
