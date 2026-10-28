@@ -28,7 +28,20 @@ sudo cp squashfs-root/usr/share/openhe/70-openhe.rules /etc/udev/rules.d/
 
 ## 2. AppImage
 
-Build (needs the system libraries listed in the main README and `curl`; `linuxdeploy` is downloaded
+Build prerequisites on Debian/Ubuntu (the same list CI installs):
+
+```sh
+sudo apt-get install -y --no-install-recommends \
+  libudev-dev pkg-config libxkbcommon-dev libgl1-mesa-dev \
+  libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+  libdbus-1-dev libxcb1-dev curl file
+```
+
+`libdbus-1-dev` and `libxcb1-dev` are for the foreground-app watcher behind per-app profile switching
+(`active-win-pos-rs`: `libdbus-sys` is found through pkg-config `dbus-1`, and `xcb` links `libxcb`).
+At run time they need only `libdbus-1-3` and `libxcb1`, which every desktop install has.
+
+Build (needs the libraries above; `linuxdeploy` is downloaded
 automatically unless it is on `PATH` or set with `LINUXDEPLOY=/path/to/linuxdeploy`):
 
 ```sh
