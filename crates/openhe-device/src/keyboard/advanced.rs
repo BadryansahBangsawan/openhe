@@ -24,8 +24,8 @@ pub enum AdvancedConfig {
 
 const SLOTS: [Slot; 4] = [Slot::S1, Slot::S2, Slot::S3, Slot::S4];
 
-/// The key's own default code; the Fn key and the code that makes a key Fn.
-const FN_CODE: u16 = 0x01;
+/// The Fn key's own default code.
+const FN_KEY: u8 = 0x01;
 
 fn invalid(e: AdvancedError) -> Error {
     Error::InvalidInput(e.to_string())
@@ -131,20 +131,50 @@ impl<T: Transport> Keyboard<T> {
         self.read_function(key, mode.advanced)
     }
 
+    /// The other key of the SOCD pair `key` belongs to, read from the keyboard.
+    fn socd_partner(&mut self, key: u8) -> Result<Option<u8>, Error> {
+        let r = self.session.call(&advanced::socd_get(key))?;
+        let s = advanced::parse_socd(&r).map_err(bad_reply)?;
+        Ok(if s.pos1 == key {
+            Some(s.pos2)
+        } else if s.pos2 == key {
+            Some(s.pos1)
+        } else {
+            None
+        })
+    }
+
     /// Binds (or, with `AdvancedConfig::None`, clears) the advanced function of
     /// `key`.
     ///
-    /// The config is validated before any I/O. Then the key's current Mode is
-    /// read, the function packet is sent, and the Mode is written as
-    /// `(touch << 4) | advanced` with the touch mode and the high byte kept as
-    /// read. The Mode write is verified by `set_key_params`; the function's
-    /// parameters are then read back and compared with what was sent (delays
-    /// compare in their 10 ms wire units). A difference is an `Error::Io` that
-    /// starts with "verify failed". Nothing is read back after a failed write.
+    /// The config is validated before any I/O. Steps, in order:
     ///
-    /// A SOCD pair is bound to two keys: `key` must be one of the pair, and
-    /// both keys get their Mode written (each keeps its own touch mode and high
-    /// byte). `AdvancedConfig::Macro` is rejected; use `bind_macro`.
+    /// 1. For every key whose Mode will be written, read its Mode; where it is
+    ///    SOCD, read the SOCD pair and remember the partner key.
+    /// 2. Send the function packet (none for `AdvancedConfig::None`).
+    /// 3. Re-read the Mode of each key and change only its advanced nibble
+    ///    (touch mode and high byte stay as the keyboard now has them), so a
+    ///    firmware side effect of the function packet is never reverted. One
+    ///    batched write, verified by `set_key_params`.
+    /// 4. Read the function's parameters back and compare them with what was
+    ///    sent (delays compare in their 10 ms wire units).
+    ///
+    /// A SOCD pair is bound to two keys: `key` must be one of the pair and both
+    /// keys get their Mode written. Replacing or clearing a key that is in a
+    /// SOCD pair (including moving it into a different pair) also clears the
+    /// advanced nibble of its old partner, as AULA's delete does, unless the
+    /// partner is written anyway; the partner keeps its touch mode and high
+    /// byte and is only touched if it is still in SOCD mode. Re-setting the same
+    /// pair changes nothing else. `AdvancedConfig::Macro` is rejected; use
+    /// `bind_macro`.
+    ///
+    /// Not atomic: the function packet can succeed and the Mode write then fail,
+    /// leaving the new function data stored while the Mode still shows the old
+    /// function. The phases fail differently: a Mode mismatch is `Error::Io`
+    /// starting "verify failed (mode)", a function mismatch "verify failed
+    /// (function)"; transport and device errors are passed through unchanged.
+    /// After any error re-read the key with `advanced` rather than trusting the
+    /// last state.
     pub fn set_advanced(&mut self, key: u8, cfg: &AdvancedConfig) -> Result<(), Error> {
         let packet = function_packet(key, cfg)?;
         let target = nibble(cfg);
@@ -152,8 +182,21 @@ impl<T: Transport> Keyboard<T> {
             AdvancedConfig::Socd(s) if s.pos1 != s.pos2 => vec![s.pos1, s.pos2],
             _ => vec![key],
         };
-        let mut entries = Vec::with_capacity(mode_keys.len());
-        for k in mode_keys {
+        let mut orphans: Vec<u8> = Vec::new();
+        for &k in &mode_keys {
+            if self.read_mode(k)?.advanced == Advanced::Socd {
+                if let Some(p) = self.socd_partner(k)? {
+                    if !mode_keys.contains(&p) && !orphans.contains(&p) {
+                        orphans.push(p);
+                    }
+                }
+            }
+        }
+        if let Some(p) = &packet {
+            self.session.call(p)?;
+        }
+        let mut entries = Vec::with_capacity(mode_keys.len() + orphans.len());
+        for &k in &mode_keys {
             let mode = self.read_mode(k)?;
             let new = KeyMode {
                 advanced: target,
@@ -161,10 +204,23 @@ impl<T: Transport> Keyboard<T> {
             };
             entries.push((k, KeyParam::Mode, new.to_u16()));
         }
-        if let Some(p) = &packet {
-            self.session.call(p)?;
+        for &p in &orphans {
+            let mode = self.read_mode(p)?;
+            if mode.advanced == Advanced::Socd {
+                let new = KeyMode {
+                    advanced: Advanced::None,
+                    ..mode
+                };
+                entries.push((p, KeyParam::Mode, new.to_u16()));
+            }
         }
-        self.set_key_params(&entries)?;
+        self.set_key_params(&entries).map_err(|e| match e {
+            Error::Io(s) => Error::Io(match s.strip_prefix("verify failed: ") {
+                Some(rest) => format!("verify failed (mode): {rest}"),
+                None => s,
+            }),
+            other => other,
+        })?;
         let Some(sent) = packet else {
             return Ok(());
         };
@@ -177,7 +233,7 @@ impl<T: Transport> Keyboard<T> {
             Ok(())
         } else {
             Err(Error::Io(format!(
-                "verify failed: key 0x{key:02X} advanced function: wrote {cfg:?}, read {back:?}"
+                "verify failed (function): key 0x{key:02X}: wrote {cfg:?}, read {back:?}"
             )))
         }
     }
@@ -189,15 +245,16 @@ impl<T: Transport> Keyboard<T> {
 
     /// Writes layer codes, then reads each back (see `set_key_params`).
     ///
-    /// The Fn key must stay on the base layer, so any Base-layer entry for key
-    /// 0x01, or assigning code 0x01 on the Base layer, is `Error::InvalidInput`
-    /// and nothing at all is written. The Fn layers may use either freely. At
-    /// most 14 entries go in each packet.
+    /// The Fn key's own Base-layer code must never be overwritten, so any
+    /// Base-layer entry for key 0x01 is `Error::InvalidInput` and nothing at all
+    /// is written. Assigning the Fn code (0x01) to other keys, on any layer, is
+    /// allowed (e.g. Caps to Fn), and the Fn key may be remapped on the Fn
+    /// layers. At most 14 entries go in each packet.
     pub fn set_layer_codes(&mut self, entries: &[(u8, Layer, u16)]) -> Result<(), Error> {
-        for &(key, layer, code) in entries {
-            if layer == Layer::Base && (u16::from(key) == FN_CODE || code == FN_CODE) {
+        for &(key, layer, _) in entries {
+            if layer == Layer::Base && key == FN_KEY {
                 return Err(Error::InvalidInput(format!(
-                    "refusing to write the Fn key on the base layer (key 0x{key:02X}, code 0x{code:04X})"
+                    "refusing to overwrite the Fn key's base-layer code (key 0x{key:02X})"
                 )));
             }
         }
@@ -391,13 +448,15 @@ mod tests {
 
     // ---- writes ----
 
-    /// Queues the replies of a successful single-key write: the current Mode,
-    /// the function packet's echo, the Mode SET echo and its read-back.
+    /// Queues the replies of a successful single-key write: the current Mode
+    /// (checked for SOCD), the function packet's echo, the Mode read again, the
+    /// Mode SET echo and its read-back.
     fn script_set(m: &mut MockTransport, func_cmd: u8, before: u16, after: u16) {
         m.push_reply(key_reply(KEY, 8, before));
         if func_cmd != 0 {
             m.push_reply(reply(func_cmd, &[0, KEY]));
         }
+        m.push_reply(key_reply(KEY, 8, before));
         m.push_reply(key_reply(KEY, 8, after));
         m.push_reply(key_reply(KEY, 8, after));
     }
@@ -413,16 +472,68 @@ mod tests {
         let mut k = kb(m);
         assert_eq!(k.set_advanced(KEY, &AdvancedConfig::Mt(mt())), Ok(()));
         let w = written(&mut k);
-        assert_eq!(w.len(), 7);
+        assert_eq!(w.len(), 8);
         assert_eq!(payload(&w[0]), [0x00, KEY, 8, 0, 0]); // current Mode
         assert_eq!(w[1][2], 0x24);
         assert_eq!(payload(&w[1]), [0x01, KEY, 0xE0, 0, 0x29, 0, 0x14]);
-        // Mode keeps touch = Single and the 0xAB high byte, advanced = MT.
-        assert_eq!(payload(&w[2]), [0x01, KEY, 8, 0x13, 0xAB]);
-        assert_eq!(payload(&w[3]), [0x00, KEY, 8, 0, 0]); // Mode read-back
-        assert_eq!(payload(&w[4]), [0x00, KEY, 9, 0, 0]);
-        assert_eq!(payload(&w[5]), [0x00, KEY, 10, 0, 0]);
-        assert_eq!(payload(&w[6]), [0x00, KEY, 19, 0, 0]);
+        assert_eq!(payload(&w[2]), [0x00, KEY, 8, 0, 0]); // Mode re-read after the packet
+                                                          // Mode keeps touch = Single and the 0xAB high byte, advanced = MT.
+        assert_eq!(payload(&w[3]), [0x01, KEY, 8, 0x13, 0xAB]);
+        assert_eq!(payload(&w[4]), [0x00, KEY, 8, 0, 0]); // Mode read-back
+        assert_eq!(payload(&w[5]), [0x00, KEY, 9, 0, 0]);
+        assert_eq!(payload(&w[6]), [0x00, KEY, 10, 0, 0]);
+        assert_eq!(payload(&w[7]), [0x00, KEY, 19, 0, 0]);
+    }
+
+    #[test]
+    fn mode_is_re_read_after_the_function_packet() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(KEY, 8, 0xAB10)); // before the packet
+        m.push_reply(reply(0x24, &[0, KEY]));
+        // The firmware changed the touch mode and high byte in the meantime.
+        m.push_reply(key_reply(KEY, 8, 0xCD20));
+        m.push_reply(key_reply(KEY, 8, 0xCD23));
+        m.push_reply(key_reply(KEY, 8, 0xCD23));
+        m.push_reply(key_reply(KEY, 9, 0x00E0));
+        m.push_reply(key_reply(KEY, 10, 0x0029));
+        m.push_reply(key_reply(KEY, 19, 20));
+        let mut k = kb(m);
+        assert_eq!(k.set_advanced(KEY, &AdvancedConfig::Mt(mt())), Ok(()));
+        let w = written(&mut k);
+        // Only the advanced nibble changes, from the Mode as read after the packet.
+        assert_eq!(payload(&w[3]), [0x01, KEY, 8, 0x23, 0xCD]);
+    }
+
+    #[test]
+    fn mode_write_failing_after_the_function_packet_is_reported_as_mode_phase() {
+        let mut m = MockTransport::new();
+        script_set(&mut m, 0x24, 0x0010, 0x0010); // the Mode did not change
+        let mut k = kb(m);
+        let e = k.set_advanced(KEY, &AdvancedConfig::Mt(mt())).unwrap_err();
+        assert!(
+            matches!(&e, Error::Io(s) if s.starts_with("verify failed (mode): key 0x0A layout 8")),
+            "{e:?}"
+        );
+        // The function packet went out; no function read-back was attempted.
+        let w = written(&mut k);
+        assert_eq!(w.len(), 5);
+        assert_eq!(w[1][2], 0x24);
+    }
+
+    #[test]
+    fn mode_set_rejected_after_the_function_packet_passes_the_error_through() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(KEY, 8, 0));
+        m.push_reply(reply(0x24, &[0, KEY]));
+        m.push_reply(key_reply(KEY, 8, 0));
+        let mut fail = [0u8; 64];
+        fail[0] = 0x5C;
+        fail[2] = 0xFF;
+        m.push_reply(fail);
+        let mut k = kb(m);
+        let e = k.set_advanced(KEY, &AdvancedConfig::Mt(mt())).unwrap_err();
+        assert_eq!(e, Error::Frame(FrameError::DeviceFail));
+        assert_eq!(written(&mut k).len(), 4);
     }
 
     #[test]
@@ -436,7 +547,7 @@ mod tests {
             .set_advanced(KEY, &AdvancedConfig::Mt(mt()))
             .unwrap_err();
         assert!(
-            matches!(&e, Error::Io(s) if s.starts_with("verify failed")),
+            matches!(&e, Error::Io(s) if s.starts_with("verify failed (function): key 0x0A")),
             "{e:?}"
         );
     }
@@ -471,10 +582,10 @@ mod tests {
         let mut k = kb(m);
         assert_eq!(k.set_advanced(KEY, &AdvancedConfig::Dks(dks())), Ok(()));
         let w = written(&mut k);
-        assert_eq!(w.len(), 4 + 9);
+        assert_eq!(w.len(), 5 + 9);
         assert_eq!(w[1][2], 0x26);
         assert_eq!(w[1][1], 18);
-        assert_eq!(payload(&w[2]), [0x01, KEY, 8, 0x21, 0x12]);
+        assert_eq!(payload(&w[3]), [0x01, KEY, 8, 0x21, 0x12]);
     }
 
     #[test]
@@ -501,12 +612,12 @@ mod tests {
             Ok(())
         );
         let w = written(&mut k);
-        // MPT: GET Mode, SET, Mode SET, Mode GET, MPT GET.
-        assert_eq!(payload(&w[2]), [0x01, KEY, 8, 0x02, 0x00]);
+        // MPT: GET Mode, SET, GET Mode, Mode SET, Mode GET, MPT GET.
+        assert_eq!(payload(&w[3]), [0x01, KEY, 8, 0x02, 0x00]);
         // TGL keeps touch Single (0x10) and writes TGL (4).
-        assert_eq!(payload(&w[7]), [0x01, KEY, 8, 0x14, 0x00]);
+        assert_eq!(payload(&w[9]), [0x01, KEY, 8, 0x14, 0x00]);
         // END keeps touch RT (0x20) and writes END (5).
-        assert_eq!(payload(&w[12]), [0x01, KEY, 8, 0x25, 0x00]);
+        assert_eq!(payload(&w[15]), [0x01, KEY, 8, 0x25, 0x00]);
     }
 
     #[test]
@@ -515,6 +626,8 @@ mod tests {
         m.push_reply(key_reply(0x04, 8, 0x0000)); // current Mode of pos1
         m.push_reply(key_reply(0x07, 8, 0x1200)); // pos2: Global, high byte 0x12
         m.push_reply(reply(0x2C, &[0, 4, 7]));
+        m.push_reply(key_reply(0x04, 8, 0x0000)); // both re-read after the packet
+        m.push_reply(key_reply(0x07, 8, 0x1200));
         m.push_reply(key_reply(0x04, 8, 0x0008)); // Mode SET echo (first entry)
         m.push_reply(key_reply(0x04, 8, 0x0008)); // read-backs
         m.push_reply(key_reply(0x07, 8, 0x1208));
@@ -522,13 +635,136 @@ mod tests {
         let mut k = kb(m);
         assert_eq!(k.set_advanced(0x07, &AdvancedConfig::Socd(socd())), Ok(()));
         let w = written(&mut k);
+        assert_eq!(w.len(), 9);
         assert_eq!(w[2][2], 0x2C);
         assert_eq!(payload(&w[2]), [0x01, 4, 7, 4, 0, 7, 0, 1, 2, 50, 0]);
         assert_eq!(
-            payload(&w[3]),
+            payload(&w[5]),
             [0x01, 0x04, 8, 0x08, 0x00, 0x07, 8, 0x08, 0x12]
         );
-        assert_eq!(payload(&w[6]), [0x00, 0x07]); // SOCD GET by the key given
+        assert_eq!(payload(&w[8]), [0x00, 0x07]); // SOCD GET by the key given
+    }
+
+    /// A SOCD pair (4, 7); `socd_get` reports it from either key.
+    fn socd_pair_reply() -> [u8; 64] {
+        reply(0x2C, &[0, 4, 7, 4, 0, 7, 0, 1, 2, 50, 0])
+    }
+
+    #[test]
+    fn clearing_one_socd_key_also_clears_its_partner() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x04, 8, 0x0008)); // key 4 is SOCD
+        m.push_reply(socd_pair_reply()); // its partner is 7
+        m.push_reply(key_reply(0x04, 8, 0x0008)); // re-read key 4
+        m.push_reply(key_reply(0x07, 8, 0x1218)); // re-read partner: Single, SOCD, high 0x12
+        m.push_reply(key_reply(0x04, 8, 0x0000)); // Mode SET echo
+        m.push_reply(key_reply(0x04, 8, 0x0000)); // read-backs
+        m.push_reply(key_reply(0x07, 8, 0x1210));
+        let mut k = kb(m);
+        assert_eq!(k.set_advanced(0x04, &AdvancedConfig::None), Ok(()));
+        let w = written(&mut k);
+        assert_eq!(w.len(), 7);
+        assert_eq!(payload(&w[1]), [0x00, 0x04]); // SOCD GET
+                                                  // The partner keeps its touch mode (0x10 nibble of 0x18) and high byte.
+        assert_eq!(
+            payload(&w[4]),
+            [0x01, 0x04, 8, 0x00, 0x00, 0x07, 8, 0x10, 0x12]
+        );
+    }
+
+    #[test]
+    fn replacing_socd_with_mt_clears_the_partner() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x04, 8, 0x0008));
+        m.push_reply(socd_pair_reply());
+        m.push_reply(reply(0x24, &[0, 0x04])); // MT SET
+        m.push_reply(key_reply(0x04, 8, 0x0008));
+        m.push_reply(key_reply(0x07, 8, 0x0008));
+        m.push_reply(key_reply(0x04, 8, 0x0003)); // Mode SET echo
+        m.push_reply(key_reply(0x04, 8, 0x0003)); // read-backs
+        m.push_reply(key_reply(0x07, 8, 0x0000));
+        m.push_reply(key_reply(0x04, 9, 0x00E0)); // function read-back
+        m.push_reply(key_reply(0x04, 10, 0x0029));
+        m.push_reply(key_reply(0x04, 19, 20));
+        let mut k = kb(m);
+        assert_eq!(k.set_advanced(0x04, &AdvancedConfig::Mt(mt())), Ok(()));
+        let w = written(&mut k);
+        assert_eq!(
+            payload(&w[5]),
+            [0x01, 0x04, 8, 0x03, 0x00, 0x07, 8, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn moving_a_key_into_a_new_socd_pair_clears_its_old_partner() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x04, 8, 0x0008)); // key 4 is in pair (4, 7)
+        m.push_reply(socd_pair_reply());
+        m.push_reply(key_reply(0x09, 8, 0x0000)); // key 9 is free
+        m.push_reply(reply(0x2C, &[0, 4, 9])); // SOCD SET
+        m.push_reply(key_reply(0x04, 8, 0x0008));
+        m.push_reply(key_reply(0x09, 8, 0x0000));
+        m.push_reply(key_reply(0x07, 8, 0x0008)); // old partner re-read
+        m.push_reply(key_reply(0x04, 8, 0x0008)); // Mode SET echo
+        m.push_reply(key_reply(0x04, 8, 0x0008)); // read-backs
+        m.push_reply(key_reply(0x09, 8, 0x0008));
+        m.push_reply(key_reply(0x07, 8, 0x0000));
+        m.push_reply(reply(0x2C, &[0, 4, 9, 4, 0, 9, 0, 1, 2, 50, 0]));
+        let new_pair = Socd {
+            pos2: 0x09,
+            key2: 0x09,
+            ..socd()
+        };
+        let mut k = kb(m);
+        assert_eq!(
+            k.set_advanced(0x04, &AdvancedConfig::Socd(new_pair)),
+            Ok(())
+        );
+        let w = written(&mut k);
+        assert_eq!(
+            payload(&w[7]),
+            [0x01, 0x04, 8, 0x08, 0x00, 0x09, 8, 0x08, 0x00, 0x07, 8, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn re_setting_the_same_socd_pair_writes_only_the_pair() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x04, 8, 0x0008));
+        m.push_reply(socd_pair_reply());
+        m.push_reply(key_reply(0x07, 8, 0x0008));
+        m.push_reply(socd_pair_reply());
+        m.push_reply(reply(0x2C, &[0, 4, 7])); // SOCD SET
+        m.push_reply(key_reply(0x04, 8, 0x0008));
+        m.push_reply(key_reply(0x07, 8, 0x0008));
+        m.push_reply(key_reply(0x04, 8, 0x0008)); // Mode SET echo
+        m.push_reply(key_reply(0x04, 8, 0x0008)); // read-backs
+        m.push_reply(key_reply(0x07, 8, 0x0008));
+        m.push_reply(socd_pair_reply()); // function read-back
+        let mut k = kb(m);
+        assert_eq!(k.set_advanced(0x04, &AdvancedConfig::Socd(socd())), Ok(()));
+        let w = written(&mut k);
+        assert_eq!(w.len(), 11);
+        assert_eq!(
+            payload(&w[7]),
+            [0x01, 0x04, 8, 0x08, 0x00, 0x07, 8, 0x08, 0x00]
+        );
+    }
+
+    #[test]
+    fn a_partner_no_longer_in_socd_mode_is_left_alone() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x04, 8, 0x0008));
+        m.push_reply(socd_pair_reply());
+        m.push_reply(key_reply(0x04, 8, 0x0008));
+        m.push_reply(key_reply(0x07, 8, 0x1200)); // already cleared elsewhere
+        m.push_reply(key_reply(0x04, 8, 0x0000));
+        m.push_reply(key_reply(0x04, 8, 0x0000));
+        let mut k = kb(m);
+        assert_eq!(k.set_advanced(0x04, &AdvancedConfig::None), Ok(()));
+        let w = written(&mut k);
+        assert_eq!(w.len(), 6);
+        assert_eq!(payload(&w[4]), [0x01, 0x04, 8, 0x00, 0x00]);
     }
 
     #[test]
@@ -538,13 +774,18 @@ mod tests {
         let mut k = kb(m);
         assert_eq!(k.set_advanced(KEY, &AdvancedConfig::None), Ok(()));
         let w = written(&mut k);
-        assert_eq!(w.len(), 3, "mode read, mode write, mode read-back only");
-        assert_eq!(payload(&w[1]), [0x01, KEY, 8, 0x20, 0xAB]);
+        assert_eq!(
+            w.len(),
+            4,
+            "two mode reads, mode write, mode read-back only"
+        );
+        assert_eq!(payload(&w[2]), [0x01, KEY, 8, 0x20, 0xAB]);
     }
 
     #[test]
     fn mode_verify_mismatch_is_io_error() {
         let mut m = MockTransport::new();
+        m.push_reply(key_reply(KEY, 8, 0x0023));
         m.push_reply(key_reply(KEY, 8, 0x0023));
         m.push_reply(key_reply(KEY, 8, 0x0020));
         m.push_reply(key_reply(KEY, 8, 0x0023)); // the clear did not stick
@@ -662,12 +903,8 @@ mod tests {
     #[test]
     fn fn_key_is_never_written_on_the_base_layer() {
         let mut k = kb(MockTransport::new());
-        // Overwriting the Fn key itself, a reset of it, or assigning Fn.
-        for entry in [
-            (0x01, Layer::Base, 0x04),
-            (0x01, Layer::Base, 0x01),
-            (0x0A, Layer::Base, 0x01),
-        ] {
+        // Overwriting the Fn key's own code, or resetting it to itself.
+        for entry in [(0x01, Layer::Base, 0x04), (0x01, Layer::Base, 0x01)] {
             let e = k
                 .set_layer_codes(&[(0x0B, Layer::Base, 0x0B), entry])
                 .unwrap_err();
@@ -677,6 +914,17 @@ mod tests {
             written(&mut k).is_empty(),
             "nothing is written, not even the valid entry"
         );
+    }
+
+    #[test]
+    fn fn_may_be_assigned_to_other_keys_on_the_base_layer() {
+        // Caps (0x39) -> Fn (0x01).
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x39, 0, 0x01));
+        m.push_reply(key_reply(0x39, 0, 0x01));
+        let mut k = kb(m);
+        assert_eq!(k.set_layer_codes(&[(0x39, Layer::Base, 0x01)]), Ok(()));
+        assert_eq!(payload(&written(&mut k)[0]), [0x01, 0x39, 0, 0x01, 0]);
     }
 
     #[test]
