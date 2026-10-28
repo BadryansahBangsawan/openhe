@@ -27,7 +27,7 @@ impl InfoOut {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct KeyOut {
     pub row: u8,
     pub col: u8,

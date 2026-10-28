@@ -4,6 +4,7 @@ mod trace;
 
 use clap::{Parser, Subcommand};
 use openhe_device::{list_devices, Error, HidTransport, Keyboard, Transport};
+use openhe_proto::defkey::Matrix;
 use openhe_proto::model::{Model, SystemMode};
 use output::{matrix_rows, DumpOut, InfoOut, KeyOut};
 use std::process::ExitCode;
@@ -45,6 +46,37 @@ fn exit_code(e: &Error) -> u8 {
     }
 }
 
+/// Errors that mean the device is gone or silent: abort instead of continuing per key.
+fn is_fatal(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Disconnected | Error::Timeout | Error::Permission(_) | Error::Unsupported(_)
+    )
+}
+
+fn collect_keys<T: Transport>(kb: &mut Keyboard<T>, matrix: &Matrix) -> Result<Vec<KeyOut>, Error> {
+    let mut keys = Vec::new();
+    for (r, c, code) in matrix.keys() {
+        match kb.key_settings(code) {
+            Ok(s) => keys.push(KeyOut::ok(r, c, code, &s)),
+            Err(e) if is_fatal(&e) => return Err(e),
+            Err(e) => keys.push(KeyOut::err(r, c, code, e.to_string())),
+        }
+    }
+    Ok(keys)
+}
+
+fn collect_dump<T: Transport>(kb: &mut Keyboard<T>, model: Model) -> Result<DumpOut, Error> {
+    let info = collect_info(kb, model)?;
+    let matrix = kb.matrix()?;
+    let keys = collect_keys(kb, &matrix)?;
+    Ok(DumpOut {
+        info,
+        matrix: matrix_rows(&matrix),
+        keys,
+    })
+}
+
 fn collect_info<T: Transport>(kb: &mut Keyboard<T>, model: Model) -> Result<InfoOut, Error> {
     let info = kb.info()?;
     let mode = match kb.system_mode()? {
@@ -73,7 +105,8 @@ fn open(trace: bool) -> Result<(Keyboard<TraceTransport<HidTransport>>, Model), 
     Ok((Keyboard::new(t, model), model))
 }
 
-fn run(cli: &Cli) -> Result<(), Error> {
+/// Ok(true) = complete success, Ok(false) = partial read (exit 1).
+fn run(cli: &Cli) -> Result<bool, Error> {
     match cli.command {
         Cmd::List => {
             let devices = list_devices()?;
@@ -94,35 +127,31 @@ fn run(cli: &Cli) -> Result<(), Error> {
         }
         Cmd::Dump { json } => {
             let (mut kb, model) = open(cli.trace)?;
-            let info = collect_info(&mut kb, model)?;
-            let matrix = kb.matrix()?;
-            let keys = matrix
-                .keys()
-                .map(|(r, c, code)| match kb.key_settings(code) {
-                    Ok(s) => KeyOut::ok(r, c, code, &s),
-                    Err(e) => KeyOut::err(r, c, code, e.to_string()),
-                })
-                .collect();
-            let out = DumpOut {
-                info,
-                matrix: matrix_rows(&matrix),
-                keys,
-            };
+            let out = collect_dump(&mut kb, model)?;
             if json {
                 let s = serde_json::to_string_pretty(&out).map_err(|e| Error::Io(e.to_string()))?;
                 println!("{s}");
             } else {
                 out.print();
             }
+            let failed = out.keys.iter().filter(|k| k.error.is_some()).count();
+            if failed > 0 {
+                eprintln!(
+                    "openhe: {failed} of {} keys could not be read",
+                    out.keys.len()
+                );
+                return Ok(false);
+            }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
         Err(e) => {
             eprintln!("openhe: {e}");
             ExitCode::from(exit_code(&e))
@@ -134,6 +163,7 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use openhe_device::MockTransport;
     #[test]
     fn cli_valid() {
         Cli::command().debug_assert();
@@ -147,5 +177,73 @@ mod tests {
     fn trace_flag() {
         let c = Cli::try_parse_from(["openhe", "--trace", "info"]).unwrap();
         assert!(c.trace);
+    }
+
+    fn key_reply(key: u8, layout: u8, v: u16) -> [u8; 64] {
+        let mut raw = [0u8; 64];
+        raw[2] = 0xA3;
+        raw[5] = key;
+        raw[6] = layout;
+        raw[7..9].copy_from_slice(&v.to_le_bytes());
+        raw
+    }
+
+    fn two_key_matrix() -> Matrix {
+        let mut m = Matrix::default();
+        m.codes[0][0] = 0x0A;
+        m.codes[0][1] = 0x0B;
+        m
+    }
+
+    fn kb(m: MockTransport) -> Keyboard<MockTransport> {
+        Keyboard::new(m, Model::Win68HeMax)
+    }
+
+    #[test]
+    fn fatal_classification() {
+        use openhe_device::Error as E;
+        assert!(is_fatal(&E::Disconnected));
+        assert!(is_fatal(&E::Timeout));
+        assert!(is_fatal(&E::Permission("x".into())));
+        assert!(is_fatal(&E::Unsupported("x".into())));
+        assert!(!is_fatal(&E::Io("x".into())));
+        assert!(!is_fatal(&E::Frame(
+            openhe_proto::frame::FrameError::ShortReport
+        )));
+    }
+
+    #[test]
+    fn disconnect_aborts_dump() {
+        let mut k = kb(MockTransport::new());
+        k.session_mut()
+            .transport_mut()
+            .fail_with(Error::Disconnected);
+        let e = collect_keys(&mut k, &two_key_matrix()).unwrap_err();
+        assert_eq!(e, Error::Disconnected);
+        assert_eq!(k.session_mut().transport().written().len(), 0);
+    }
+
+    #[test]
+    fn per_key_io_error_is_recorded_and_dump_continues() {
+        let mut m = MockTransport::new();
+        // Key 0x0A: wrong layout for the first param -> Io error.
+        m.push_reply(key_reply(0x0A, 20, 1));
+        // Key 0x0B: seven good replies.
+        for (layout, v) in [
+            (8u8, 0x20u16),
+            (4, 1500),
+            (20, 1),
+            (21, 2),
+            (22, 3),
+            (23, 4),
+            (25, 7),
+        ] {
+            m.push_reply(key_reply(0x0B, layout, v));
+        }
+        let keys = collect_keys(&mut kb(m), &two_key_matrix()).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].error.is_some());
+        assert!(keys[1].error.is_none());
+        assert_eq!(keys[1].switch, Some(7));
     }
 }
