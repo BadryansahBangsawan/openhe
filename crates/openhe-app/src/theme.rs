@@ -94,12 +94,21 @@ pub mod font {
     use eframe::egui::{FontFamily, FontId};
 
     /// The bold family installed by [`super::apply`] (a system bold face
-    /// when one is found, else egui's default font).
+    /// when one is found, else egui's default font). Prefer [`bold`], which
+    /// falls back to the regular face when the family is not ready.
     pub fn bold_family() -> FontFamily {
         FontFamily::Name(super::BOLD_FAMILY.into())
     }
+
+    /// Bold text. On a thread where [`super::ensure_fonts`] has not seen the
+    /// bold family in the current context (e.g. a test that skipped
+    /// `theme::apply`), this is the regular face instead of a panic.
     pub fn bold(size: f32) -> FontId {
-        FontId::new(size, bold_family())
+        if super::bold_ready() {
+            FontId::new(size, bold_family())
+        } else {
+            FontId::new(size, FontFamily::Proportional)
+        }
     }
     pub fn title() -> FontId {
         bold(22.0)
@@ -158,6 +167,28 @@ const SYSTEM_FONTS: (&[&str], &[&str]) = (
 
 fn first_readable(paths: &[&str]) -> Option<Vec<u8>> {
     paths.iter().find_map(|p| std::fs::read(p).ok())
+}
+
+thread_local! {
+    /// Whether the egui context drawn on this thread has the bold family
+    /// bound right now (set each frame by [`ensure_fonts`]).
+    static BOLD_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn bold_ready() -> bool {
+    BOLD_READY.with(|b| b.get())
+}
+
+/// Call at the start of every frame (the app shell does). Records whether
+/// the bold family is bound, so [`font::bold`] never names a missing
+/// family; if `theme::apply` was forgotten, installs the fonts for the
+/// next frame.
+pub fn ensure_fonts(ctx: &egui::Context) {
+    let ready = ctx.fonts(|f| f.families().contains(&font::bold_family()));
+    if !ready {
+        install_fonts(ctx);
+    }
+    BOLD_READY.with(|b| b.set(ready));
 }
 
 /// Installs fonts: a system sans as the proportional face when available,

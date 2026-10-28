@@ -23,6 +23,7 @@ use eframe::egui::{
 };
 use openhe_device::keyboard::performance::{PerformanceChange, MAX_DEADZONE_UM, MIN_RT_UM};
 use openhe_device::{Error, KeySettings};
+use openhe_device::{Keyboard, Transport};
 use openhe_proto::model::MIN_ACTUATION_UM;
 use openhe_proto::{Micrometers, Model, TouchMode};
 use std::collections::BTreeSet;
@@ -176,12 +177,107 @@ pub fn max_travel(snap: &DeviceSnapshot, keys: &[u8], form: &Form, touched: &Tou
 }
 
 /// What the apply job hands back.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub write: Result<(), Error>,
     /// Settings re-read after the write, for every key that could be read.
     pub reloaded: Vec<(u8, KeySettings)>,
     /// Set when re-reading failed; the page then asks for a full reload.
     pub reload_error: Option<Error>,
+}
+
+/// The Performa write job. Runs on the worker thread; generic over the
+/// transport so tests drive it with `MockTransport`.
+///
+/// Writes with `set_performance`, then re-reads every key, also when the
+/// write failed (a batch can fail halfway, leaving some keys written). A
+/// disconnect at any point is returned as `Err(Disconnected)` so the worker
+/// drops the keyboard; other read-back failures stop the re-read and are
+/// reported in `reload_error`.
+pub fn apply_job<T: Transport>(
+    kb: &mut Keyboard<T>,
+    keys: &[u8],
+    change: &PerformanceChange,
+) -> Result<ApplyOutcome, Error> {
+    let write = kb.set_performance(keys, change);
+    if write == Err(Error::Disconnected) {
+        return Err(Error::Disconnected);
+    }
+    let mut reloaded = Vec::with_capacity(keys.len());
+    let mut reload_error = None;
+    for &k in keys {
+        match kb.key_settings(k) {
+            Ok(s) => reloaded.push((k, s)),
+            Err(Error::Disconnected) => return Err(Error::Disconnected),
+            Err(e) => {
+                reload_error = Some(e);
+                break;
+            }
+        }
+    }
+    Ok(ApplyOutcome {
+        write,
+        reloaded,
+        reload_error,
+    })
+}
+
+/// What the page does with a finished apply job (pure, so it is tested
+/// without a UI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyEffects {
+    /// Freshly read settings to store in the snapshot.
+    pub patch: Vec<(u8, KeySettings)>,
+    /// Ask the worker for a full reload (the re-read did not finish).
+    pub request_reload: bool,
+    /// Indonesian text for the inline error box.
+    pub error: Option<String>,
+    /// Raw error text, for the "Detail teknis" tooltip.
+    pub technical: Option<String>,
+    /// The write went through: drop the edits and reload the form.
+    pub applied: bool,
+}
+
+pub fn apply_effects(result: Result<ApplyOutcome, Error>) -> ApplyEffects {
+    match result {
+        Ok(out) => {
+            let reread = !out.reloaded.is_empty();
+            let (error, technical) = match &out.write {
+                Ok(()) => (None, None),
+                Err(e) => {
+                    let mut msg = i18n::device_error(e);
+                    if reread {
+                        msg = format!("{msg} {}", t::RELOADED_HINT);
+                    }
+                    (Some(msg), Some(i18n::technical(e)))
+                }
+            };
+            ApplyEffects {
+                applied: out.write.is_ok(),
+                patch: out.reloaded,
+                request_reload: out.reload_error.is_some(),
+                error,
+                technical,
+            }
+        }
+        // Mid-batch disconnect: some keys may already be written. The
+        // worker reloads everything on reconnect.
+        Err(Error::Disconnected) => ApplyEffects {
+            patch: Vec::new(),
+            request_reload: false,
+            error: Some(t::PARTIAL_WRITE.to_string()),
+            technical: Some(i18n::technical(&Error::Disconnected)),
+            applied: false,
+        },
+        // E.g. an internal error: the state is unknown, read it all again.
+        Err(e) => ApplyEffects {
+            patch: Vec::new(),
+            request_reload: true,
+            error: Some(i18n::device_error(&e)),
+            technical: Some(i18n::technical(&e)),
+            applied: false,
+        },
+    }
 }
 
 // ------------------------------------------------------------------ page
@@ -202,7 +298,10 @@ pub struct Page {
     /// The last change sent, for "Coba lagi".
     last_sent: Option<(Vec<u8>, PerformanceChange)>,
     error: Option<String>,
+    error_technical: Option<String>,
     applied: bool,
+    /// Values were clamped to a newly chosen switch's travel.
+    clamped: bool,
     view: View,
 }
 
@@ -216,7 +315,9 @@ impl Default for Page {
             pending: None,
             last_sent: None,
             error: None,
+            error_technical: None,
             applied: false,
+            clamped: false,
             view: View::Actuation,
         }
     }
@@ -243,39 +344,27 @@ impl Page {
             return;
         };
         self.pending = None;
-        match result {
-            Ok(out) => {
-                if !out.reloaded.is_empty() {
-                    let fresh = out.reloaded;
-                    ctx.worker.patch_snapshot(move |s| {
-                        for (k, v) in fresh {
-                            s.keys.insert(k, v);
-                        }
-                    });
+        let fx = apply_effects(result);
+        if !fx.patch.is_empty() {
+            let fresh = fx.patch;
+            ctx.worker.patch_snapshot(move |s| {
+                for (k, v) in fresh {
+                    s.keys.insert(k, v);
                 }
-                if out.reload_error.is_some() {
-                    ctx.worker.request_reload();
-                }
-                match out.write {
-                    Ok(()) => {
-                        self.error = None;
-                        self.applied = true;
-                        self.touched = Touched::default();
-                        self.loaded_from = None; // reload the form from the device
-                    }
-                    Err(e) => {
-                        self.error = Some(i18n::device_error(&e));
-                        self.applied = false;
-                    }
-                }
-            }
-            Err(e) => {
-                // Disconnected (or the worker is gone): the snapshot is
-                // reloaded on reconnect; keep the edits for a retry.
-                self.error = Some(i18n::device_error(&e));
-                self.applied = false;
-            }
+            });
         }
+        if fx.request_reload {
+            ctx.worker.request_reload();
+        }
+        self.error = fx.error;
+        self.error_technical = fx.technical;
+        self.applied = fx.applied;
+        if fx.applied {
+            self.touched = Touched::default();
+            self.clamped = false;
+            self.loaded_from = None; // reload the form from the device
+        }
+        // On failure the edits stay, so "Coba lagi" resends the same change.
     }
 
     /// Reloads the form when the selection or the device data changed and
@@ -298,7 +387,9 @@ impl Page {
         if !same_selection {
             self.touched = Touched::default();
             self.applied = false;
+            self.clamped = false;
             self.error = None;
+            self.error_technical = None;
         }
         let codes = self.selection.codes_in(&snap.matrix);
         if let Some(f) = Form::from_keys(&codes, snap) {
@@ -319,30 +410,11 @@ impl Page {
         self.error = None;
         self.applied = false;
         self.last_sent = Some((keys.clone(), change.clone()));
-        self.pending = Some(ctx.worker.submit("performance-apply", move |kb| {
-            let write = kb.set_performance(&keys, &change);
-            if write == Err(Error::Disconnected) {
-                return Err(Error::Disconnected);
-            }
-            // Never trust the cache after a write: read the keys back.
-            let mut reloaded = Vec::with_capacity(keys.len());
-            let mut reload_error = None;
-            for &k in &keys {
-                match kb.key_settings(k) {
-                    Ok(s) => reloaded.push((k, s)),
-                    Err(Error::Disconnected) => return Err(Error::Disconnected),
-                    Err(e) => {
-                        reload_error = Some(e);
-                        break;
-                    }
-                }
-            }
-            Ok(ApplyOutcome {
-                write,
-                reloaded,
-                reload_error,
-            })
-        }));
+        self.error_technical = None;
+        self.pending = Some(
+            ctx.worker
+                .submit("performance-apply", move |kb| apply_job(kb, &keys, &change)),
+        );
     }
 
     // -------------------------------------------------------------- centre
@@ -579,6 +651,9 @@ impl Page {
 
         let max = max_travel(snap, &codes, &self.form, &self.touched);
         self.clamp_to(max);
+        if self.clamped {
+            card::hint(ui, format!("{} {} mm.", t::CLAMPED, mm_short(max)));
+        }
 
         // Actuation
         value_header(ui, t::ACTUATION, |ui| {
@@ -700,14 +775,28 @@ impl Page {
         card::hint(ui, t::SWITCH_HINT);
     }
 
-    /// Keeps form values inside the limits of the current switch.
+    /// After the user picks a switch with less travel, values beyond it are
+    /// clamped **and marked touched**, so the clamped value is what gets
+    /// sent (`set_performance` would refuse to keep them) and a note says
+    /// so. Without a switch change nothing is clamped: a value outside the
+    /// slider's range (another selected key's switch) is shown as it is and
+    /// is not sent unless edited.
     fn clamp_to(&mut self, max: u16) {
+        if !self.touched.switch {
+            return;
+        }
         let f = &mut self.form;
-        f.actuation = f.actuation.clamp(MIN_ACTUATION_UM, max);
-        f.rt_press = f.rt_press.clamp(MIN_RT_UM, max);
-        f.rt_release = f.rt_release.clamp(MIN_RT_UM, max);
-        f.top_dz = f.top_dz.min(MAX_DEADZONE_UM);
-        f.bottom_dz = f.bottom_dz.min(MAX_DEADZONE_UM);
+        if f.actuation > max {
+            f.actuation = max;
+            self.touched.actuation = true;
+            self.clamped = true;
+        }
+        if f.rt_press > max || f.rt_release > max {
+            f.rt_press = f.rt_press.min(max);
+            f.rt_release = f.rt_release.min(max);
+            self.touched.rt = true;
+            self.clamped = true;
+        }
     }
 
     fn apply_area(&mut self, ctx: &AppCtx, ui: &mut Ui) {
@@ -717,8 +806,9 @@ impl Page {
             let clicked = card::error_box(
                 ui,
                 t::APPLY_FAILED,
-                &format!("{err} {}", t::RELOADED_HINT),
+                &err,
                 retry.then_some(i18n::common::RETRY),
+                self.error_technical.as_deref(),
             );
             if clicked {
                 if let Some((keys, change)) = self.last_sent.clone() {
@@ -808,6 +898,7 @@ fn value_header(ui: &mut Ui, label: &str, value: impl FnOnce(&mut Ui)) {
 /// A deadzone box ("Atas  0.10"); returns true when changed.
 fn dz_box(ui: &mut Ui, label: &str, value: &mut u16, enabled: bool) -> bool {
     let mut mm = f64::from(*value) / 1000.0;
+    let mut edited = false;
     Frame::new()
         .fill(color::PANEL)
         .stroke(line(1.0, color::BORDER_STRONG))
@@ -817,23 +908,36 @@ fn dz_box(ui: &mut Ui, label: &str, value: &mut u16, enabled: bool) -> bool {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(label).color(color::MUTED));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_enabled(
-                        enabled,
-                        egui::DragValue::new(&mut mm)
-                            .range(0.0..=f64::from(MAX_DEADZONE_UM) / 1000.0)
-                            .speed(0.01)
-                            .fixed_decimals(2),
-                    );
+                    edited = ui
+                        .add_enabled(
+                            enabled,
+                            egui::DragValue::new(&mut mm)
+                                .range(0.0..=f64::from(MAX_DEADZONE_UM) / 1000.0)
+                                .clamp_existing_to_range(false)
+                                .speed(0.01)
+                                .fixed_decimals(2),
+                        )
+                        .changed();
                 });
             });
         });
-    let um = ((mm * 100.0).round() * 10.0).clamp(0.0, f64::from(MAX_DEADZONE_UM)) as u16;
+    // Only a real edit counts: a stored 0.205 mm shown as "0.21" must not
+    // be rounded and sent just because the box was drawn.
+    if !edited {
+        return false;
+    }
+    let um = dz_um(mm);
     if um != *value {
         *value = um;
         true
     } else {
         false
     }
+}
+
+/// Deadzone box value (mm) to µm, on the 0.01 mm grid, within 0..=1.0 mm.
+fn dz_um(mm: f64) -> u16 {
+    ((mm * 100.0).round() * 10.0).clamp(0.0, f64::from(MAX_DEADZONE_UM)) as u16
 }
 
 #[derive(Clone, Copy)]
@@ -1220,14 +1324,240 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             frame(&mut page, 1);
         }
-        assert_eq!(
-            page.error.as_deref(),
-            Some(i18n::common::DISCONNECTED_WRITE)
-        );
+        assert_eq!(page.error.as_deref(), Some(t::PARTIAL_WRITE));
         assert_eq!(page.last_sent, Some((vec![0x04, 0x07, 0x16, 0x1A], change)));
         assert!(page.touched.actuation, "edits survive a failed apply");
         assert_eq!(page.form.actuation, 550);
         frame(&mut page, 2); // the error box renders without panicking
+    }
+
+    // ---- apply job and its effects, against MockTransport
+
+    use openhe_device::{MockTransport, Transport};
+    use openhe_proto::frame::FrameError;
+
+    fn key_reply(key: u8, layout: u8, v: u16) -> [u8; 64] {
+        let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
+        raw[2] = 0xA3;
+        raw[5] = key;
+        raw[6] = layout;
+        raw[7..9].copy_from_slice(&v.to_le_bytes());
+        raw
+    }
+
+    fn fail_reply() -> [u8; 64] {
+        let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
+        raw[2] = 0xFF;
+        raw
+    }
+
+    /// The seven replies of `key_settings`: Global, given actuation.
+    fn push_settings(m: &mut MockTransport, key: u8, actuation: u16) {
+        for (layout, v) in [
+            (8, 0x0010),
+            (4, actuation),
+            (20, 20),
+            (21, 20),
+            (22, 200),
+            (23, 200),
+            (25, 0),
+        ] {
+            m.push_reply(key_reply(key, layout, v));
+        }
+    }
+
+    fn actuation(um: u16) -> PerformanceChange {
+        PerformanceChange {
+            actuation: Some(Micrometers(um)),
+            ..Default::default()
+        }
+    }
+
+    fn kb(m: MockTransport) -> Keyboard<MockTransport> {
+        Keyboard::new(m, Model::Win68HeMax)
+    }
+
+    #[test]
+    fn verify_failure_still_rereads_and_patches() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x1A, 8, 0x0010)); // Mode (Single)
+        m.push_reply(key_reply(0x1A, 25, 0)); // Switch
+        m.push_reply(key_reply(0x1A, 4, 500)); // SET echo
+        m.push_reply(key_reply(0x1A, 4, 2000)); // verify: did not stick
+        push_settings(&mut m, 0x1A, 2000); // re-read
+        let out = apply_job(&mut kb(m), &[0x1A], &actuation(500)).unwrap();
+        assert!(matches!(out.write, Err(Error::Io(ref s)) if s.starts_with("verify failed")));
+        assert_eq!(out.reloaded.len(), 1);
+        assert_eq!(out.reloaded[0].1.actuation, Micrometers(2000));
+        assert_eq!(out.reload_error, None);
+
+        let fx = apply_effects(Ok(out));
+        assert!(!fx.applied);
+        assert!(!fx.request_reload);
+        assert_eq!(fx.patch.len(), 1, "the true value replaces the cache");
+        assert_eq!(
+            fx.error.as_deref(),
+            Some(format!("{} {}", i18n::error::VERIFY, t::RELOADED_HINT).as_str())
+        );
+        assert!(fx.technical.unwrap().contains("verify failed"));
+    }
+
+    #[test]
+    fn a_failing_reread_asks_for_a_full_reload() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x1A, 8, 0x0010));
+        m.push_reply(key_reply(0x1A, 25, 0));
+        m.push_reply(key_reply(0x1A, 4, 500)); // SET echo
+        m.push_reply(key_reply(0x1A, 4, 500)); // verify ok
+                                               // Re-read: no replies, so it times out.
+        let out = apply_job(&mut kb(m), &[0x1A], &actuation(500)).unwrap();
+        assert_eq!(out.write, Ok(()));
+        assert!(out.reloaded.is_empty());
+        assert_eq!(out.reload_error, Some(Error::Timeout));
+
+        let fx = apply_effects(Ok(out));
+        assert!(fx.applied);
+        assert!(fx.request_reload);
+        assert_eq!(fx.error, None);
+    }
+
+    #[test]
+    fn a_batch_failing_halfway_rereads_every_key() {
+        // 15 keys: two SET packets (14 + 1); the keyboard rejects the second.
+        let keys: Vec<u8> = (0x04..0x04 + 15).collect();
+        let mut m = MockTransport::new();
+        for &k in &keys {
+            m.push_reply(key_reply(k, 8, 0x0010));
+            m.push_reply(key_reply(k, 25, 0));
+        }
+        m.push_reply(key_reply(0x04, 4, 800)); // packet 1 echo
+        m.push_reply(fail_reply()); // packet 2 rejected
+        for &k in &keys {
+            let written = k != *keys.last().unwrap();
+            push_settings(&mut m, k, if written { 800 } else { 2000 });
+        }
+        let out = apply_job(&mut kb(m), &keys, &actuation(800)).unwrap();
+        assert_eq!(out.write, Err(Error::Frame(FrameError::DeviceFail)));
+        assert_eq!(out.reloaded.len(), 15);
+        assert_eq!(out.reloaded[0].1.actuation, Micrometers(800));
+        assert_eq!(out.reloaded[14].1.actuation, Micrometers(2000));
+
+        let fx = apply_effects(Ok(out));
+        assert!(!fx.applied);
+        assert_eq!(fx.patch.len(), 15, "the partial state is shown as it is");
+        assert!(fx.error.unwrap().starts_with(i18n::error::FRAME));
+    }
+
+    /// Fails every call after `n` writes, like a keyboard pulled mid-batch.
+    struct UnplugAfter {
+        inner: MockTransport,
+        writes_left: usize,
+    }
+
+    impl Transport for UnplugAfter {
+        fn write(&mut self, r: &[u8; 64]) -> Result<(), Error> {
+            if self.writes_left == 0 {
+                return Err(Error::Disconnected);
+            }
+            self.writes_left -= 1;
+            self.inner.write(r)
+        }
+        fn read(&mut self, t: u32) -> Result<Option<[u8; 64]>, Error> {
+            self.inner.read(t)
+        }
+    }
+
+    #[test]
+    fn unplugged_mid_batch_is_disconnected_with_a_partial_write_message() {
+        let keys: Vec<u8> = (0x04..0x04 + 15).collect();
+        let mut m = MockTransport::new();
+        for &k in &keys {
+            m.push_reply(key_reply(k, 8, 0x0010));
+            m.push_reply(key_reply(k, 25, 0));
+        }
+        m.push_reply(key_reply(0x04, 4, 800)); // packet 1 echo
+                                               // 30 reads + 1 SET go through; the second SET fails.
+        let t = UnplugAfter {
+            inner: m,
+            writes_left: 31,
+        };
+        let mut k = Keyboard::new(t, Model::Win68HeMax);
+        let r = apply_job(&mut k, &keys, &actuation(800));
+        assert_eq!(r, Err(Error::Disconnected));
+        let fx = apply_effects(r);
+        assert_eq!(fx.error.as_deref(), Some(t::PARTIAL_WRITE));
+        assert!(!fx.applied && fx.patch.is_empty());
+    }
+
+    #[test]
+    fn other_job_errors_reload_everything() {
+        let fx = apply_effects(Err(Error::Io(format!(
+            "{}: boom",
+            crate::worker::INTERNAL_ERROR
+        ))));
+        assert!(fx.request_reload);
+        assert_eq!(fx.error.as_deref(), Some(i18n::error::INTERNAL));
+    }
+
+    #[test]
+    fn error_texts_have_no_english() {
+        let all = [
+            Error::Timeout,
+            Error::Disconnected,
+            Error::Permission("denied by udev".into()),
+            Error::Unsupported("bootloader".into()),
+            Error::Unsupported("no supported keyboard was found".into()),
+            Error::Frame(FrameError::DeviceFail),
+            Error::InvalidInput("key 0x1A: actuation 3400 um is outside".into()),
+            Error::Io("verify failed: key 0x1A".into()),
+            Error::Io("unexpected reply".into()),
+        ];
+        for e in all {
+            let s = i18n::device_error(&e);
+            for word in [
+                "key 0x",
+                "um is",
+                "failed",
+                "denied",
+                "unexpected",
+                "timed out",
+            ] {
+                assert!(!s.contains(word), "{e:?} -> {s}");
+            }
+        }
+    }
+
+    #[test]
+    fn deadzone_grid() {
+        assert_eq!(dz_um(0.205), 210);
+        assert_eq!(dz_um(0.2), 200);
+        assert_eq!(dz_um(1.7), 1000);
+    }
+
+    #[test]
+    fn switch_change_clamps_and_sends_values_beyond_the_new_travel() {
+        let mut page = Page {
+            form: Form {
+                actuation: 3400,
+                rt_press: 3400,
+                rt_release: 100,
+                ..Form::default()
+            },
+            ..Page::default()
+        };
+        // Without a switch change nothing is clamped or sent.
+        page.clamp_to(3300);
+        assert_eq!(page.form.actuation, 3400);
+        assert!(!page.touched.any() && !page.clamped);
+        // After choosing a 3.3 mm switch both values are clamped and sent.
+        page.touched.switch = true;
+        page.clamp_to(3300);
+        assert_eq!((page.form.actuation, page.form.rt_press), (3300, 3300));
+        assert!(page.touched.actuation && page.touched.rt && page.clamped);
+        let c = build_change(&page.form, &page.touched);
+        assert_eq!(c.actuation, Some(Micrometers(3300)));
     }
 
     #[test]

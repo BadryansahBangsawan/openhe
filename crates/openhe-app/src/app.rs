@@ -2,11 +2,11 @@
 
 use crate::i18n;
 use crate::pages;
-use crate::storage::AppData;
+use crate::storage::{AppData, LoadNotice};
 use crate::theme::{self, color, font, line, size, Theme};
 use crate::widgets::card::Card;
 use crate::widgets::segmented::Segmented;
-use crate::worker::{ConnectionStatus, DeviceSnapshot, Worker, LOAD_LABEL};
+use crate::worker::{ConnectionStatus, DeviceSnapshot, Worker, WorkerNotice, LOAD_LABEL};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Mesh, Pos2, Rect, RichText,
     Sense, Ui,
@@ -18,6 +18,28 @@ use std::cell::RefCell;
 ///
 /// Strings come from [`crate::i18n`] (plain `pub const`s, so there is no
 /// runtime object to pass).
+///
+/// # How a page writes to the keyboard
+///
+/// Copy the Performa page (`pages/performance.rs`):
+///
+/// 1. Put the whole device conversation in a transport-generic function,
+///    e.g. `pub fn apply_job<T: Transport>(kb: &mut Keyboard<T>, ..) ->
+///    Result<Outcome, Error>`. It does the write, then **always** re-reads
+///    the affected state (also after a failed write), and returns both the
+///    write result and what it read. It returns `Err(Disconnected)` as is,
+///    so the worker can reconnect.
+/// 2. Submit it: `ctx.worker.submit("label", move |kb| apply_job(kb, ..))`
+///    and keep the [`crate::worker::Pending`]; poll it once per frame.
+/// 3. Turn the result into UI effects with a pure function (e.g.
+///    `apply_effects(result) -> Effects`: what to patch into the snapshot
+///    with [`Worker::patch_snapshot`], whether to
+///    [`Worker::request_reload`], the Indonesian error text via
+///    [`i18n::device_error`]). Never keep cached values after a failure.
+/// 4. Test steps 1 and 3 with `MockTransport`, including a verify failure,
+///    a failing re-read, and a failure halfway through a batch.
+/// 5. Disable write controls unless [`AppCtx::can_write`] and no job of
+///    the page is pending.
 pub struct AppCtx<'a> {
     pub worker: &'a Worker,
     /// The device snapshot while connected.
@@ -100,6 +122,7 @@ pub struct OpenHeApp {
     theme: Theme,
     page: PageId,
     data: RefCell<AppData>,
+    data_notice: Option<LoadNotice>,
     performance: pages::performance::Page,
     advanced: pages::advanced::Page,
     remap: pages::remap::Page,
@@ -115,10 +138,12 @@ impl OpenHeApp {
         let worker = Worker::spawn();
         let ctx = cc.egui_ctx.clone();
         worker.set_repaint(move || ctx.request_repaint());
-        // A broken data file must not stop the app; start empty and keep
-        // the file untouched until the user saves something.
-        let data = AppData::load().unwrap_or_default();
-        Self::with_worker(worker, data)
+        // A broken data file must not stop the app: it is moved aside (so
+        // the next save cannot overwrite it) and the shell says so.
+        let (data, notice) = AppData::load();
+        let mut app = Self::with_worker(worker, data);
+        app.data_notice = notice;
+        app
     }
 
     /// Builds the app around an existing worker (tests use one whose
@@ -129,6 +154,7 @@ impl OpenHeApp {
             theme: Theme::default(),
             page: PageId::Performance,
             data: RefCell::new(data),
+            data_notice: None,
             performance: Default::default(),
             advanced: Default::default(),
             remap: Default::default(),
@@ -164,6 +190,7 @@ impl OpenHeApp {
     /// One frame drawn for `status` instead of the worker's (screenshots
     /// and tests render a connected keyboard this way).
     pub fn draw_with_status(&mut self, ctx: &egui::Context, status: ConnectionStatus) {
+        theme::ensure_fonts(ctx);
         let snapshot = match &status {
             ConnectionStatus::Connected(s) => Some(s),
             _ => None,
@@ -216,6 +243,30 @@ impl OpenHeApp {
             line(1.0, color::BORDER),
         );
 
+        let worker_notice = snapshot.and(self.worker.notice());
+        if worker_notice.is_some() || self.data_notice.is_some() {
+            egui::TopBottomPanel::top("notices")
+                .show_separator_line(false)
+                .frame(Frame::new().fill(color::BG).inner_margin(Margin {
+                    left: size::PAGE_MARGIN as i8,
+                    right: size::PAGE_MARGIN as i8,
+                    top: 12,
+                    bottom: 0,
+                }))
+                .show(ctx, |ui| {
+                    if let Some(n) = &worker_notice {
+                        if notice_bar(ui, &worker_notice_text(n), i18n::common::RELOAD, !busy) {
+                            self.worker.request_reload();
+                        }
+                    }
+                    if let Some(n) = &self.data_notice {
+                        if notice_bar(ui, &data_notice_text(n), i18n::common::DISMISS, true) {
+                            self.data_notice = None;
+                        }
+                    }
+                });
+        }
+
         let app_ctx = AppCtx {
             worker: &self.worker,
             snapshot,
@@ -266,6 +317,64 @@ pub fn page_with_right_panel<S>(
     egui::CentralPanel::default()
         .frame(Frame::new().inner_margin(Margin::same(size::PAGE_MARGIN as i8)))
         .show_inside(ui, |ui| center(state, ui));
+}
+
+// ------------------------------------------------------------------ notices
+
+/// Shell text for a worker notice.
+pub fn worker_notice_text(n: &WorkerNotice) -> String {
+    match n {
+        WorkerNotice::ReloadFailed(e) => {
+            format!("{} ({})", i18n::device::STALE_RELOAD, i18n::device_error(e))
+        }
+        WorkerNotice::EventsFailed(e) => {
+            format!("{} ({})", i18n::device::STALE_EVENTS, i18n::device_error(e))
+        }
+        WorkerNotice::KeysSkipped(keys) => {
+            let codes: Vec<u8> = keys.iter().map(|(c, _)| *c).collect();
+            format!(
+                "{} {}",
+                i18n::device::KEYS_SKIPPED,
+                crate::widgets::keyboard::legend_list(&codes, 8)
+            )
+        }
+    }
+}
+
+/// Shell text for a data-file notice.
+pub fn data_notice_text(n: &LoadNotice) -> String {
+    match n {
+        LoadNotice::Recovered { moved_to } => format!(
+            "{} {}",
+            i18n::storage::RECOVERED,
+            moved_to.file_name().map_or_else(
+                || moved_to.display().to_string(),
+                |f| f.to_string_lossy().into_owned()
+            )
+        ),
+        LoadNotice::Unreadable(_) => i18n::storage::UNREADABLE.to_string(),
+    }
+}
+
+/// An amber notice row with one button; true when the button was clicked.
+fn notice_bar(ui: &mut Ui, text: &str, button: &str, enabled: bool) -> bool {
+    let mut clicked = false;
+    Card::new()
+        .fill(color::ACCENT_SOFT)
+        .stroke(color::ACCENT.gamma_multiply(0.5))
+        .padding(10)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("⚠").color(color::ACCENT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    clicked = ui.add_enabled(enabled, egui::Button::new(button)).clicked();
+                    ui.add(egui::Label::new(RichText::new(text).color(color::TEXT)).wrap());
+                });
+            });
+        });
+    ui.add_space(4.0);
+    clicked
 }
 
 // ------------------------------------------------------------------ sidebar
@@ -593,6 +702,56 @@ mod tests {
             run_frames(&ctx, 2, |c| app.draw(c));
         }
         assert_eq!(app.page(), PageId::Settings);
+    }
+
+    #[test]
+    fn notices_render_and_are_indonesian() {
+        use openhe_device::Error;
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let w = offline_worker();
+        w.inject_status(ConnectionStatus::Connected(snapshot68()));
+        w.inject_notice(Some(WorkerNotice::ReloadFailed(Error::Timeout)));
+        let mut app = OpenHeApp::with_worker(w, AppData::default());
+        app.data_notice = Some(LoadNotice::Recovered {
+            moved_to: "/x/openhe.json.bad".into(),
+        });
+        run_frames(&ctx, 3, |c| app.draw(c));
+        let t = worker_notice_text(&WorkerNotice::ReloadFailed(Error::Timeout));
+        assert!(t.starts_with(i18n::device::STALE_RELOAD), "{t}");
+        assert!(!t.contains("timed out"));
+        let k = worker_notice_text(&WorkerNotice::KeysSkipped(vec![(
+            0x1A,
+            Error::Io("unknown key mode".into()),
+        )]));
+        assert!(k.ends_with(" W"), "{k}");
+        assert!(data_notice_text(app.data_notice.as_ref().unwrap()).ends_with("openhe.json.bad"));
+    }
+
+    #[test]
+    fn bold_text_without_theme_apply_does_not_panic() {
+        // The whole shell without theme::apply: the first frame draws bold
+        // text in the regular face and installs the fonts for the next.
+        std::thread::spawn(|| {
+            let ctx = egui::Context::default();
+            let mut app = OpenHeApp::with_worker(offline_worker(), AppData::default());
+            app.worker
+                .inject_status(ConnectionStatus::Connected(snapshot68()));
+            run_frames(&ctx, 3, |c| app.draw(c));
+        })
+        .join()
+        .expect("shell without theme::apply");
+        // A bare page test (no shell, no apply) on a fresh thread.
+        std::thread::spawn(|| {
+            let ctx = egui::Context::default();
+            run_frames(&ctx, 1, |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    ui.label(RichText::new("x").font(font::bold(14.0)));
+                });
+            });
+        })
+        .join()
+        .expect("bold without theme::apply");
     }
 
     #[test]

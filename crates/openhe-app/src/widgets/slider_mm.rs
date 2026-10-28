@@ -179,16 +179,23 @@ pub fn mm_value_box(
                 enabled,
                 egui::DragValue::new(&mut mm)
                     .range(f64::from(min) / 1000.0..=f64::from(max) / 1000.0)
+                    // Show a value outside the range as it is (e.g. a key on
+                    // another switch); only user edits are clamped.
+                    .clamp_existing_to_range(false)
                     .speed(0.001)
                     .fixed_decimals(3)
                     .suffix(" mm"),
             )
         });
     let mut r = inner.inner;
-    let um = (mm * 1000.0).round().clamp(f64::from(min), f64::from(max)) as u16;
-    if um != *value {
-        *value = um;
-        r.mark_changed();
+    if r.changed() {
+        let um = (mm * 1000.0).round().clamp(f64::from(min), f64::from(max)) as u16;
+        if um != *value {
+            *value = um;
+        } else {
+            // Dragged back to the same micrometre: nothing to send.
+            r.flags.remove(egui::response::Flags::CHANGED);
+        }
     }
     r
 }

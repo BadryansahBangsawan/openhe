@@ -10,9 +10,32 @@ use std::path::{Path, PathBuf};
 /// File name inside the config directory.
 pub const FILE_NAME: &str = "openhe.json";
 
+/// What happened to the data file at startup, when it was not loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadNotice {
+    /// The file did not parse; it was moved aside and defaults are used.
+    Recovered { moved_to: PathBuf },
+    /// The file exists but could not be read (permissions, I/O); defaults
+    /// are used and the file was left in place.
+    Unreadable(String),
+}
+
+/// `openhe.json.bad`, or `.bad.2`, `.bad.3`, ... if taken.
+fn free_bad_path(dir: &Path) -> PathBuf {
+    let first = dir.join(format!("{FILE_NAME}.bad"));
+    if !first.exists() {
+        return first;
+    }
+    (2u32..)
+        .map(|n| dir.join(format!("{FILE_NAME}.bad.{n}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
+}
+
 /// One macro step. A serde mirror of `openhe_proto::macros::MacroAction`
 /// (Track A2), kept separate so the proto crate needs no serde.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SavedMacroAction {
     pub code: u16,
     pub down: bool,
@@ -20,7 +43,8 @@ pub struct SavedMacroAction {
 }
 
 /// A macro in the local library.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SavedMacro {
     pub name: String,
     pub actions: Vec<SavedMacroAction>,
@@ -70,11 +94,40 @@ impl AppData {
         std::fs::rename(&tmp, dir.join(FILE_NAME))
     }
 
-    /// Loads from [`AppData::default_dir`]; defaults when there is none.
-    pub fn load() -> io::Result<AppData> {
+    /// Loads from `dir` for the app: never fails. A file that does not
+    /// parse is renamed to `openhe.json.bad` (or `.bad.2`, ...) so the next
+    /// save cannot overwrite it, and the defaults are used; a file that
+    /// cannot be read is left alone. Either way the notice says what
+    /// happened, for the shell to show.
+    pub fn load_or_recover(dir: &Path) -> (AppData, Option<LoadNotice>) {
+        match Self::load_from(dir) {
+            Ok(d) => (d, None),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let from = dir.join(FILE_NAME);
+                let to = free_bad_path(dir);
+                match std::fs::rename(&from, &to) {
+                    Ok(()) => (
+                        AppData::default(),
+                        Some(LoadNotice::Recovered { moved_to: to }),
+                    ),
+                    Err(e) => (
+                        AppData::default(),
+                        Some(LoadNotice::Unreadable(e.to_string())),
+                    ),
+                }
+            }
+            Err(e) => (
+                AppData::default(),
+                Some(LoadNotice::Unreadable(e.to_string())),
+            ),
+        }
+    }
+
+    /// [`AppData::load_or_recover`] in [`AppData::default_dir`].
+    pub fn load() -> (AppData, Option<LoadNotice>) {
         match Self::default_dir() {
-            Some(dir) => Self::load_from(&dir),
-            None => Ok(AppData::default()),
+            Some(dir) => Self::load_or_recover(&dir),
+            None => (AppData::default(), None),
         }
     }
 
@@ -188,6 +241,65 @@ mod tests {
         std::fs::write(dir.0.join(FILE_NAME), b"{not json").unwrap();
         let e = AppData::load_from(&dir.0).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn nested_fields_default_too() {
+        let dir = TempDir::new("nested-default");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(
+            dir.0.join(FILE_NAME),
+            br#"{"macros":[{"name":"x","actions":[{"code":4}]}]}"#,
+        )
+        .unwrap();
+        let d = AppData::load_from(&dir.0).unwrap();
+        assert_eq!(d.macros[0].name, "x");
+        assert_eq!(d.macros[0].repeat, 0);
+        assert_eq!(
+            d.macros[0].actions[0],
+            SavedMacroAction {
+                code: 4,
+                down: false,
+                delay_ms: 0
+            }
+        );
+    }
+
+    #[test]
+    fn corrupt_file_is_moved_aside_not_overwritten() {
+        let dir = TempDir::new("recover");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.0.join(FILE_NAME), b"{not json").unwrap();
+        let (d, notice) = AppData::load_or_recover(&dir.0);
+        assert_eq!(d, AppData::default());
+        let bad = dir.0.join("openhe.json.bad");
+        assert_eq!(
+            notice,
+            Some(LoadNotice::Recovered {
+                moved_to: bad.clone()
+            })
+        );
+        assert_eq!(std::fs::read(&bad).unwrap(), b"{not json");
+        assert!(!dir.0.join(FILE_NAME).exists());
+        // Saving now cannot touch the moved file; a second bad file gets .bad.2.
+        sample().save_to(&dir.0).unwrap();
+        std::fs::write(dir.0.join(FILE_NAME), br#"{"macros": 5}"#).unwrap();
+        let (_, notice) = AppData::load_or_recover(&dir.0);
+        assert_eq!(
+            notice,
+            Some(LoadNotice::Recovered {
+                moved_to: dir.0.join("openhe.json.bad.2")
+            })
+        );
+        assert_eq!(std::fs::read(&bad).unwrap(), b"{not json");
+    }
+
+    #[test]
+    fn good_and_missing_files_give_no_notice() {
+        let dir = TempDir::new("no-notice");
+        assert_eq!(AppData::load_or_recover(&dir.0), (AppData::default(), None));
+        sample().save_to(&dir.0).unwrap();
+        assert_eq!(AppData::load_or_recover(&dir.0), (sample(), None));
     }
 
     #[test]

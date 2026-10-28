@@ -15,24 +15,59 @@ pub mod common {
     pub const WAITING_DEVICE_BODY: &str =
         "Colokkan WIN 68 HE MAX atau WIN 60 HE MAX lewat USB. OpenHE mencari setiap detik.";
     pub const LOADING_DEVICE: &str = "Membaca pengaturan keyboard…";
-    pub const DISCONNECTED_WRITE: &str = "Keyboard terputus. Perubahan belum dikirim.";
+    pub const DISCONNECTED: &str = "Keyboard terputus.";
+    pub const DISMISS: &str = "Tutup";
+    pub const RELOAD: &str = "Muat ulang";
+    pub const TECH_DETAIL: &str = "Detail teknis";
 }
 
-/// Indonesian text for a device error, with the technical detail kept.
+/// Error texts. Every user-facing error goes through [`device_error`], so no
+/// English protocol text reaches the UI (the raw text is only offered as a
+/// "Detail teknis" tooltip via [`technical`]).
+pub mod error {
+    pub const TIMEOUT: &str = "Keyboard tidak menjawab. Coba lagi.";
+    pub const PERMISSION: &str = "Akses ke keyboard ditolak oleh sistem.";
+    pub const PERMISSION_LINUX: &str =
+        "Akses ke keyboard ditolak. Pasang aturan udev packaging/linux/70-openhe.rules lalu colokkan ulang.";
+    pub const BOOTLOADER: &str = "Keyboard sedang dalam mode bootloader. Cabut lalu colokkan lagi.";
+    pub const UNSUPPORTED: &str = "Perangkat ini tidak didukung.";
+    pub const FRAME: &str = "Balasan keyboard tidak dikenali.";
+    pub const INVALID: &str = "Nilai di luar batas yang diizinkan untuk switch tombol ini.";
+    pub const VERIFY: &str = "Keyboard menyimpan nilai yang berbeda dari yang dikirim.";
+    pub const INTERNAL: &str = "Terjadi kesalahan internal di OpenHE. Keyboard disambung ulang.";
+    pub const IO: &str = "Kesalahan komunikasi dengan keyboard.";
+}
+
+/// The raw (English) error text, for a "Detail teknis" tooltip only.
+pub fn technical(e: &openhe_device::Error) -> String {
+    e.to_string()
+}
+
+/// Indonesian text for a device error. Never includes the English detail.
 pub fn device_error(e: &openhe_device::Error) -> String {
     use openhe_device::Error as E;
-    match e {
-        E::Timeout => "Keyboard tidak menjawab. Coba lagi.".to_string(),
-        E::Disconnected => common::DISCONNECTED_WRITE.to_string(),
-        E::Permission(m) => format!("Akses ke keyboard ditolak: {m}"),
-        E::Unsupported(m) => format!("Tidak didukung: {m}"),
-        E::Frame(f) => format!("Balasan keyboard tidak dikenali: {f}"),
-        E::InvalidInput(m) => format!("Nilai tidak valid: {m}"),
-        E::Io(m) if m.starts_with("verify failed") => {
-            format!("Keyboard menyimpan nilai lain dari yang dikirim ({m}).")
-        }
-        E::Io(m) => format!("Kesalahan komunikasi: {m}"),
-    }
+    let s = match e {
+        E::Timeout => error::TIMEOUT,
+        E::Disconnected => common::DISCONNECTED,
+        E::Permission(_) if cfg!(target_os = "linux") => error::PERMISSION_LINUX,
+        E::Permission(_) => error::PERMISSION,
+        E::Unsupported(m) if m == "bootloader" => error::BOOTLOADER,
+        E::Unsupported(_) => error::UNSUPPORTED,
+        E::Frame(_) => error::FRAME,
+        E::InvalidInput(_) => error::INVALID,
+        E::Io(m) if m.starts_with("verify failed") => error::VERIFY,
+        E::Io(m) if m.starts_with(crate::worker::INTERNAL_ERROR) => error::INTERNAL,
+        E::Io(_) => error::IO,
+    };
+    s.to_string()
+}
+
+/// Local data file.
+pub mod storage {
+    pub const RECOVERED: &str =
+        "File data OpenHE rusak, jadi memakai pengaturan kosong. File lama disimpan sebagai";
+    pub const UNREADABLE: &str =
+        "File data OpenHE tidak bisa dibaca; perubahan lokal mungkin tidak tersimpan.";
 }
 
 /// Sidebar navigation.
@@ -67,6 +102,13 @@ pub mod topbar {
 
 /// Device card at the bottom of the sidebar.
 pub mod device {
+    pub const WORKER_STOPPED: &str =
+        "Bagian OpenHE yang menghubungi keyboard berhenti. Tutup lalu buka lagi aplikasinya.";
+    pub const STALE_RELOAD: &str =
+        "Gagal membaca ulang keyboard; nilai di layar mungkin sudah lama. Dicoba lagi otomatis.";
+    pub const STALE_EVENTS: &str =
+        "Gagal membaca kabar dari keyboard; nilai di layar mungkin sudah lama.";
+    pub const KEYS_SKIPPED: &str = "Pengaturan beberapa tombol tidak terbaca dan dilewati:";
     pub const CONNECTED_USB: &str = "Terhubung · USB";
     pub const SEARCHING: &str = "Mencari keyboard…";
     pub const LOADING: &str = "Menyambung…";
@@ -123,6 +165,10 @@ pub mod perf {
     pub const WORKS_WITHOUT_APP: &str = "tetap aktif tanpa app";
     pub const APPLY_FAILED: &str = "Gagal menerapkan";
     pub const RELOADED_HINT: &str = "Nilai di layar sudah dibaca ulang dari keyboard.";
+    pub const PARTIAL_WRITE: &str =
+        "Keyboard terputus. Sebagian perubahan mungkin sudah terkirim; nilai dibaca ulang saat tersambung.";
+    pub const CLAMPED: &str =
+        "Nilai yang melebihi jarak tekan switch baru disesuaikan ke batasnya dan ikut dikirim. Maks";
 
     pub const LEGEND: &str = "Keterangan";
     pub const LEGEND_SELECTED: &str = "Dipilih";

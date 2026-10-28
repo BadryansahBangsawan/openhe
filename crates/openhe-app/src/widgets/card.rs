@@ -74,10 +74,17 @@ pub fn hint(ui: &mut Ui, text: impl Into<String>) {
 }
 
 /// An inline error box with an optional retry button; returns true when
-/// retry was clicked.
-pub fn error_box(ui: &mut Ui, title: &str, detail: &str, retry: Option<&str>) -> bool {
+/// retry was clicked. `technical` (raw error text) is only shown as a
+/// "Detail teknis" tooltip.
+pub fn error_box(
+    ui: &mut Ui,
+    title: &str,
+    detail: &str,
+    retry: Option<&str>,
+    technical: Option<&str>,
+) -> bool {
     let mut clicked = false;
-    Card::new()
+    let resp = Card::new()
         .fill(color::DANGER_SOFT)
         .stroke(color::DANGER.gamma_multiply(0.6))
         .padding(12)
@@ -93,7 +100,11 @@ pub fn error_box(ui: &mut Ui, title: &str, detail: &str, retry: Option<&str>) ->
                     clicked = true;
                 }
             }
-        });
+        })
+        .response;
+    if let Some(t) = technical {
+        resp.on_hover_text(format!("{}: {t}", crate::i18n::common::TECH_DETAIL));
+    }
     clicked
 }
 
