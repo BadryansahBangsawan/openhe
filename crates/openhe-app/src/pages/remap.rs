@@ -21,6 +21,7 @@
 
 use crate::app::{page_with_right_panel, AppCtx};
 use crate::i18n;
+use crate::pages::performance::SentOn;
 use crate::theme::{color, font, line, size};
 use crate::widgets::card::{self, Card};
 use crate::widgets::keyboard::{
@@ -892,6 +893,12 @@ pub struct Page {
     confirm_reset: bool,
     /// Worker generation and profile the cache belongs to.
     seen: Option<(u64, u8)>,
+    /// Profile the pending changes (and "Coba lagi") belong to. Unlike
+    /// `seen` it survives a disconnect, so a profile switch through a
+    /// reconnect still drops them.
+    profile: Option<u8>,
+    /// Profile and connection count when the pending apply was submitted.
+    sent_on: Option<SentOn>,
 }
 
 impl Default for Page {
@@ -914,6 +921,8 @@ impl Default for Page {
             notice: None,
             confirm_reset: false,
             seen: None,
+            profile: None,
+            sent_on: None,
         }
     }
 }
@@ -1048,6 +1057,16 @@ impl Page {
     fn finish_apply(&mut self, ctx: &AppCtx, result: Result<ApplyOutcome, Error>) {
         let sent = self.last_sent.clone().map(|(e, _)| e).unwrap_or_default();
         let fx = apply_effects(&sent, result);
+        let sent_on = self.sent_on.take();
+        if sent_on.is_none() || sent_on != SentOn::now(ctx) {
+            // Read after a profile switch or a reconnect: the codes read
+            // back then are not this keyboard state's; read the layer again.
+            self.clear_cache();
+            self.error = fx.error;
+            self.error_technical = fx.technical;
+            self.applied = false;
+            return;
+        }
         if fx.invalidate {
             self.clear_cache();
         }
@@ -1100,13 +1119,21 @@ impl Page {
             Some((g, p)) if g != generation || p != snap.profile => {
                 self.clear_cache();
                 self.read_error = None;
-                if p != snap.profile {
-                    self.changes.clear();
-                }
             }
             _ => {}
         }
         self.seen = Some((generation, snap.profile));
+        if self.profile.is_some_and(|p| p != snap.profile) {
+            // Made for another profile: never written to this one.
+            self.changes.clear();
+            self.last_sent = None;
+            self.error = None;
+            self.error_technical = None;
+            self.applied = false;
+            self.notice = None;
+            self.confirm_reset = false;
+        }
+        self.profile = Some(snap.profile);
         if self.read.is_none()
             && self.pending.is_none()
             && self.wants_read(self.layer)
@@ -1130,6 +1157,7 @@ impl Page {
         self.error_technical = None;
         self.applied = false;
         self.last_sent = Some((entries.clone(), kind));
+        self.sent_on = SentOn::now(ctx);
         self.pending = Some(
             ctx.worker
                 .submit("remap-apply", move |kb| apply_job(kb, &entries)),
@@ -2547,6 +2575,7 @@ mod tests {
         let mut page = Page::default();
         let entries = vec![(0x1A, Layer::Fn2, 0x52)];
         page.last_sent = Some((entries.clone(), Sent::Changes));
+        page.sent_on = with_ctx(&worker, SentOn::now);
         page.changes.queue(Layer::Fn2, &[0x1A], 0x52, none);
         let ok = ApplyOutcome {
             write: Ok(()),
@@ -2575,6 +2604,7 @@ mod tests {
         page.codes
             .insert(0, BTreeMap::from([(0x04, 0x04), (0x05, 0x05)]));
         page.last_sent = Some((vec![(0x04, Layer::Base, 0x06)], Sent::Changes));
+        page.sent_on = with_ctx(&worker, SentOn::now);
         let gen = worker.generation();
         page.seen = Some((gen.wrapping_sub(1), 1)); // the snapshot reloaded since
         with_ctx(&worker, |c| page.sync(c));
