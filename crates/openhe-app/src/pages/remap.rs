@@ -247,6 +247,12 @@ fn abbreviate(label: &str) -> String {
     }
 }
 
+/// A reserved vendor slot: label "-" in the Special category. The minus
+/// key (0x2D) and keypad minus (0x56) are also labelled "-" and are real.
+fn is_placeholder(k: &KeyCode) -> bool {
+    k.label == "-" && k.category == Category::Special
+}
+
 fn unknown(code: u16) -> String {
     format!("{} 0x{code:04X}", t::UNKNOWN_CODE)
 }
@@ -261,7 +267,7 @@ pub fn code_name(code: u16) -> String {
         return long.to_string();
     }
     match keycodes::lookup(code) {
-        Some(k) if !k.label.starts_with("i18n:") && k.label != "-" => k.label.to_string(),
+        Some(k) if !k.label.starts_with("i18n:") && !is_placeholder(k) => k.label.to_string(),
         _ => unknown(code),
     }
 }
@@ -275,7 +281,7 @@ pub fn short_code_name(code: u16) -> String {
         return short.to_string();
     }
     match keycodes::lookup(code) {
-        Some(k) if !k.label.starts_with("i18n:") && k.label != "-" => abbreviate(k.label),
+        Some(k) if !k.label.starts_with("i18n:") && !is_placeholder(k) => abbreviate(k.label),
         _ => unknown(code),
     }
 }
@@ -334,7 +340,7 @@ pub fn picker_label(code: u16) -> String {
 /// Codes offered by the picker: reserved placeholders ("-"), the unnamed
 /// non-US keys and the two codes with no known meaning are hidden.
 pub fn pickable(k: &KeyCode) -> bool {
-    !(k.label == "-" && k.category == Category::Special)
+    !is_placeholder(k)
         && !matches!(k.code, 0x0032 | 0x0064 | 0x00C7 | 0x00C8)
 }
 
@@ -1920,6 +1926,17 @@ mod tests {
         // Unknown codes from the factory Fn tables.
         assert_eq!(code_name(0x6152), "Kode 0x6152");
         assert_eq!(code_name(0xF344), "Kode 0xF344");
+    }
+
+    #[test]
+    fn the_minus_keys_have_names() {
+        // "-" is the vendor's placeholder only in the Special category;
+        // the minus key and keypad minus are real keys.
+        assert_eq!(code_name(0x002D), "-");
+        assert_eq!(short_code_name(0x002D), "-");
+        assert_eq!(code_name(0x0056), "-"); // like the other numpad keys
+        assert_eq!(code_name(0x00A7), "Kode 0x00A7");
+        assert_eq!(picker_label(0x002D), "-");
     }
 
     #[test]
