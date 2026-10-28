@@ -3,8 +3,8 @@
 
 use openhe_proto::frame::{Cmd, Request, Response};
 use openhe_proto::key::parse_value;
-use openhe_proto::model::PollingRate;
-use openhe_proto::order::{parse_polling, parse_system_mode};
+use openhe_proto::model::{PollingRate, SystemMode};
+use openhe_proto::order::{parse_polling, parse_profile, parse_system_mode};
 use openhe_proto::sync;
 
 fn raw(hex: &str) -> [u8; 64] {
@@ -17,6 +17,7 @@ fn raw(hex: &str) -> [u8; 64] {
 
 const KEY_REPLY: &str = "5C 39 A3 6D 00 29 04 D0 07 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 FF FF FF 00 00 00 00";
 const POLLING_REPLY: &str = "5C 04 80 14 00 50 00 FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+const PROFILE_REPLY: &str = "5C 04 80 14 00 70 00 FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
 const MODE_REPLY: &str = "5C 04 80 14 00 21 01 FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
 
 /// docs/protocol/captures/win68-info.txt; the serial is redacted as sixteen 0x58 ('X').
@@ -51,7 +52,10 @@ fn real_order_replies_checksum_and_values() {
     assert_eq!(parse_polling(&p), Some(PollingRate::Hz8000));
     let m = Response::decode(&raw(MODE_REPLY)).unwrap();
     assert!(m.checksum_ok());
-    assert!(parse_system_mode(&m).is_some());
+    assert_eq!(parse_system_mode(&m), Some(SystemMode::Windows));
+    let pr = Response::decode(&raw(PROFILE_REPLY)).unwrap();
+    assert!(pr.checksum_ok());
+    assert_eq!(parse_profile(&pr), Some(0));
 }
 
 const TRACES: [&str; 3] = [
