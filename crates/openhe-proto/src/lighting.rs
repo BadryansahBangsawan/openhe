@@ -176,8 +176,11 @@ pub fn get() -> Request {
 
 /// Parses a PRGB reply (also the unsolicited 0x98 report) with the SET offsets.
 ///
-/// Values are returned as read, except that a mode above 21 is reported as 21
-/// (custom). Run `Lighting::validate` before writing a parsed value back.
+/// Every field is checked like `Lighting::validate`: a brightness or speed
+/// above 4, a mode above 21, a sleep timeout that is not one of
+/// `SLEEP_MINUTES` or a colour index above 7 is an error (the same
+/// `LightingError` as validation), never clamped, so a value the keyboard
+/// should not report is never written back as something else.
 pub fn parse(r: &Response) -> Result<Lighting, LightingError> {
     if r.cmd != Cmd::Prgb as u8 {
         return Err(LightingError::WrongReply("PRGB"));
@@ -193,17 +196,19 @@ pub fn parse(r: &Response) -> Result<Lighting, LightingError> {
         };
     }
     let flags = b[OFF_FLAGS];
-    Ok(Lighting {
+    let l = Lighting {
         on: flags & FLAG_ON != 0,
         reverse: flags & FLAG_REVERSE != 0,
         brightness: b[OFF_BRIGHTNESS],
-        mode: b[OFF_MODE].min(MODE_CUSTOM),
+        mode: b[OFF_MODE],
         speed: b[OFF_SPEED],
         sleep_minutes: b[OFF_SLEEP],
         static_color: b[OFF_STATIC],
         dynamic_color: b[OFF_DYNAMIC],
         colors,
-    })
+    };
+    l.validate()?;
+    Ok(l)
 }
 
 /// KRGB SET `[01, key, R, G, B]`.
@@ -395,10 +400,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_maps_unknown_mode_to_custom() {
-        let mut body = set(&sample()).unwrap().payload;
-        body[39] = 99;
-        assert_eq!(parse(&reply(0x18, &body)).unwrap().mode, MODE_CUSTOM);
+    fn parse_rejects_out_of_range_values() {
+        // A value the keyboard should never report is an error, not
+        // something silently clamped that a later write would send back.
+        let cases: [(usize, u8, LightingError); 7] = [
+            (38, 5, LightingError::Brightness(5)),
+            (39, 22, LightingError::Mode(22)),
+            (39, 99, LightingError::Mode(99)),
+            (40, 5, LightingError::Speed(5)),
+            (41, 4, LightingError::Sleep(4)),
+            (42, 8, LightingError::StaticColor(8)),
+            (43, 8, LightingError::DynamicColor(8)),
+        ];
+        for (at, v, want) in cases {
+            let mut body = set(&sample()).unwrap().payload;
+            body[at] = v;
+            assert_eq!(parse(&reply(0x18, &body)), Err(want), "byte {at} = {v}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_the_range_edges() {
+        let mut l = sample();
+        l.brightness = 4;
+        l.mode = 20;
+        l.speed = 4;
+        l.sleep_minutes = 120;
+        l.static_color = 7;
+        l.dynamic_color = 7;
+        let body = set(&l).unwrap().payload;
+        assert_eq!(parse(&reply(0x18, &body)), Ok(l));
     }
 
     #[test]

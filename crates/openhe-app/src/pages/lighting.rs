@@ -631,6 +631,9 @@ pub struct Page {
     form: Form,
     /// The lighting last read from (or confirmed by) the keyboard.
     device: Option<Lighting>,
+    /// The latest lighting read worked. "Terapkan" stays off otherwise, so
+    /// nothing is written on top of a state that could not be read.
+    read_ok: bool,
     loading: Option<Pending<Lighting>>,
     loaded_generation: Option<u64>,
     pending: Option<Pending<LightingOutcome>>,
@@ -667,6 +670,7 @@ impl Default for Page {
             tab: Tab::Effects,
             form: Form::default(),
             device: None,
+            read_ok: false,
             loading: None,
             loaded_generation: None,
             pending: None,
@@ -713,6 +717,7 @@ impl Page {
         Page {
             form: Form::from_lighting(&lighting),
             device: Some(lighting),
+            read_ok: true,
             loaded_generation: Some(generation),
             key_loaded_generation: Some(generation),
             key_edit: key_device.clone(),
@@ -756,6 +761,39 @@ impl Page {
         ctx.can_write() && !self.job_pending() && self.key_loaded_generation.is_some()
     }
 
+    /// "Terapkan ke keyboard" may send the form: the lighting was read
+    /// (the latest read worked) and the form differs from it.
+    fn effects_ready(&self) -> bool {
+        self.read_ok && self.device.is_some() && self.dirty()
+    }
+
+    /// A lighting read finished. Unsent edits are kept.
+    fn finish_load(&mut self, r: Result<Lighting, Error>) {
+        match r {
+            Ok(l) => {
+                let keep_edits = self.dirty();
+                self.device = Some(l);
+                if !keep_edits {
+                    self.form = Form::from_lighting(&l);
+                }
+                self.failure = None;
+                self.read_ok = true;
+            }
+            Err(Error::Disconnected) => {
+                self.loaded_generation = None;
+                self.read_ok = false;
+            }
+            Err(e) => {
+                self.read_ok = false;
+                self.failure = Some(Failure {
+                    title: strings::LOAD_FAILED,
+                    text: i18n::device_error(&e),
+                    technical: Some(i18n::technical(&e)),
+                });
+            }
+        }
+    }
+
     fn dirty(&self) -> bool {
         self.device
             .as_ref()
@@ -768,30 +806,14 @@ impl Page {
         if let Some(p) = self.loading.as_mut() {
             if let Some(r) = p.poll() {
                 self.loading = None;
-                match r {
-                    Ok(l) => {
-                        let keep_edits = self.dirty();
-                        self.device = Some(l);
-                        if !keep_edits {
-                            self.form = Form::from_lighting(&l);
-                        }
-                        self.failure = None;
-                    }
-                    Err(Error::Disconnected) => self.loaded_generation = None,
-                    Err(e) => {
-                        self.failure = Some(Failure {
-                            title: strings::LOAD_FAILED,
-                            text: i18n::device_error(&e),
-                            technical: Some(i18n::technical(&e)),
-                        });
-                    }
-                }
+                self.finish_load(r);
             }
         }
         if let Some(p) = self.pending.as_mut() {
             if let Some(r) = p.poll() {
                 self.pending = None;
                 let fx = lighting_effects(r);
+                self.read_ok = fx.reread.is_some();
                 if let Some(l) = fx.reread {
                     self.device = Some(l);
                     self.form = Form::from_lighting(&l);
@@ -1344,7 +1366,11 @@ impl Page {
     fn apply_area(&mut self, ctx: &AppCtx, ui: &mut Ui) {
         let idle = ctx.can_write() && !self.job_pending();
         let (failure, retry_ok) = match self.tab {
-            Tab::Effects => (self.failure.clone(), self.last_sent.is_some()),
+            // Re-sending also waits for a lighting read that worked.
+            Tab::Effects => (
+                self.failure.clone(),
+                self.last_sent.is_some() && self.read_ok,
+            ),
             Tab::Keys => (self.key_failure.clone(), self.key_last_sent.is_some()),
         };
         if let Some(f) = failure {
@@ -1358,7 +1384,7 @@ impl Page {
 
         match self.tab {
             Tab::Effects => {
-                let can = idle && self.device.is_some() && self.dirty();
+                let can = idle && self.effects_ready();
                 if card::primary_button(ui, strings::APPLY, can).clicked() {
                     let l = self.form.to_lighting();
                     self.submit_lighting(ctx, l);
@@ -2190,6 +2216,24 @@ mod tests {
     }
 
     // ---- rendering
+
+    #[test]
+    fn apply_needs_a_lighting_read_that_worked() {
+        let mut page = Page::default();
+        assert!(!page.effects_ready(), "nothing read yet");
+        page.finish_load(Ok(sample()));
+        page.form.brightness = 1; // an edit
+        assert!(page.effects_ready());
+        // A later read fails (e.g. the keyboard reported a value out of
+        // range): the edits stay, but nothing is sent until a read works.
+        page.finish_load(Err(Error::Io("unexpected lighting reply".into())));
+        assert!(!page.effects_ready());
+        assert_eq!(page.form.brightness, 1, "edits kept");
+        assert!(page.failure.is_some());
+        page.finish_load(Ok(sample()));
+        assert!(page.effects_ready());
+        assert_eq!(page.form.brightness, 1, "still kept: unsent edits");
+    }
 
     #[test]
     fn the_page_renders_offline_and_connected() {

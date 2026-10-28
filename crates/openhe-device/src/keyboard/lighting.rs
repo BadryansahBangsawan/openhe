@@ -5,10 +5,18 @@ use openhe_proto::lighting::{self, Lighting, LightingError, Rgb};
 use openhe_proto::order::{self, OrderType};
 use std::collections::HashSet;
 
+/// A lighting reply that does not parse or holds out-of-range values: a
+/// problem with what the keyboard sent (`Error::Io`). Values the caller
+/// passes in are checked with [`invalid`] instead.
 impl From<LightingError> for Error {
     fn from(e: LightingError) -> Self {
-        Error::InvalidInput(e.to_string())
+        Error::Io(format!("unexpected lighting reply: {e}"))
     }
+}
+
+/// A lighting value from the caller that the firmware would refuse.
+fn invalid(e: LightingError) -> Error {
+    Error::InvalidInput(e.to_string())
 }
 
 impl<T: Transport> Keyboard<T> {
@@ -27,10 +35,11 @@ impl<T: Transport> Keyboard<T> {
     ///
     /// The speed of static and custom modes is sent as 0, so that is what the
     /// read-back must show. Out-of-range fields are `Error::InvalidInput`,
-    /// returned before any I/O. A difference is an `Error::Io` starting with
+    /// returned before any I/O; a read-back with out-of-range values is an
+    /// `Error::Io`. A difference is an `Error::Io` starting with
     /// "verify failed".
     pub fn set_lighting(&mut self, l: &Lighting) -> Result<(), Error> {
-        let req = lighting::set(l)?;
+        let req = lighting::set(l).map_err(invalid)?;
         self.session.call(&req)?;
         let want = Lighting {
             speed: l.wire_speed(),
@@ -77,7 +86,7 @@ impl<T: Transport> Keyboard<T> {
                     "duplicate colour for key 0x{key:02X}"
                 )));
             }
-            reqs.push(lighting::krgb_set(key, c)?);
+            reqs.push(lighting::krgb_set(key, c).map_err(invalid)?);
         }
         if reqs.is_empty() {
             return Ok(());
@@ -228,6 +237,27 @@ mod tests {
         let e = k.set_lighting(&l).unwrap_err();
         assert!(matches!(e, Error::InvalidInput(_)), "{e:?}");
         assert!(k.session_mut().transport().written().is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_lighting_read_is_an_io_error() {
+        // The keyboard reports brightness 9: a reply problem, not bad input.
+        let mut body = lighting::set(&sample()).unwrap().payload;
+        body[38] = 9;
+        let mut m = MockTransport::new();
+        m.push_reply(nack_reply());
+        m.push_reply(reply(0x18, &body));
+        let e = kb(m).lighting().unwrap_err();
+        assert!(
+            matches!(&e, Error::Io(s) if s.contains("brightness 9")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn lighting_reply_errors_are_io_errors() {
+        let e = Error::from(LightingError::WrongReply("KRGB"));
+        assert!(matches!(e, Error::Io(_)), "{e:?}");
     }
 
     #[test]

@@ -15,10 +15,17 @@ use openhe_proto::macros::{self, MacroAction, MacroError, PlayMode};
 
 pub use openhe_proto::macros::MacroBinding;
 
+/// A MACRO_MODE reply that does not parse: a problem with what the keyboard
+/// sent (`Error::Io`). Macros passed in are checked with [`invalid`].
 impl From<MacroError> for Error {
     fn from(e: MacroError) -> Self {
-        Error::InvalidInput(e.to_string())
+        Error::Io(format!("unexpected macro reply: {e}"))
     }
+}
+
+/// A macro from the caller that the keyboard cannot store.
+fn invalid(e: MacroError) -> Error {
+    Error::InvalidInput(e.to_string())
 }
 
 impl<T: Transport> Keyboard<T> {
@@ -53,9 +60,10 @@ impl<T: Transport> Keyboard<T> {
         repeat: u16,
         interval_ms: u32,
     ) -> Result<(), Error> {
-        macros::validate(actions, repeat, interval_ms)?;
-        let packets = macros::data_packets(actions)?;
-        let mode_req = macros::mode_set(key, actions.len() as u8, mode, repeat, interval_ms)?;
+        macros::validate(actions, repeat, interval_ms).map_err(invalid)?;
+        let packets = macros::data_packets(actions).map_err(invalid)?;
+        let mode_req = macros::mode_set(key, actions.len() as u8, mode, repeat, interval_ms)
+            .map_err(invalid)?;
 
         let mut current = self.macro_key_mode(key)?;
         if !matches!(current.advanced, Advanced::None | Advanced::Macro) {
@@ -393,6 +401,20 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert_eq!(w[1][2], 0x21);
         assert_eq!(w[1][5], KEY);
+    }
+
+    #[test]
+    fn an_unknown_play_mode_in_a_reply_is_an_io_error() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(KEY, 8, 0x0006));
+        let mut body = macros::mode_set(KEY, 5, PlayMode::Once, 1, 100)
+            .unwrap()
+            .payload;
+        body[5] = 9; // not a play mode
+        m.push_reply(reply(0x21, &body));
+        let e = kb(m).macro_binding(KEY).unwrap_err();
+        assert!(matches!(e, Error::Io(_)), "{e:?}");
+        assert!(matches!(Error::from(MacroError::WrongReply), Error::Io(_)));
     }
 
     #[test]
