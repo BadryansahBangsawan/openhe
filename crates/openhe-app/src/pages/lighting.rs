@@ -27,8 +27,7 @@ use crate::widgets::toggle::toggle;
 use crate::worker::Pending;
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, StrokeKind,
-    Ui,
+    self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, StrokeKind, Ui,
 };
 use openhe_device::{Error, Keyboard, Transport};
 use openhe_proto::lighting::{
@@ -1280,7 +1279,8 @@ impl Page {
         value_header(
             ui,
             strings::BRIGHTNESS,
-            &format!("{} / 5", self.form.brightness),
+            // Levels 1..=5 read as 20..100 %, as in the mockup.
+            &format!("{}%", u32::from(self.form.brightness.clamp(1, 5)) * 20),
         );
         changed |= level_slider(ui, &mut self.form.brightness, editable);
         ui.add_space(8.0);
@@ -1652,8 +1652,29 @@ fn value_header(ui: &mut Ui, label: &str, value: &str) {
 fn level_slider(ui: &mut Ui, v: &mut u8, enabled: bool) -> bool {
     ui.add_enabled_ui(enabled, |ui| {
         ui.spacing_mut().slider_width = ui.available_width() - 8.0;
-        ui.add(egui::Slider::new(v, 1..=5).show_value(false).integer())
-            .changed()
+        ui.spacing_mut().slider_rail_height = 4.0;
+        // The part up to the thumb in the accent colour (as `SliderMm`).
+        ui.visuals_mut().selection.bg_fill = color::ACCENT;
+        let r = ui.add(
+            egui::Slider::new(v, 1..=5)
+                .show_value(false)
+                .integer()
+                .trailing_fill(true),
+        );
+        // A solid thumb instead of egui's hollow one: drawn over it, at the
+        // same place (egui: radius = height / 2.5, range shrunk by it).
+        let rect = r.rect;
+        let radius = rect.height() / 2.5;
+        let t = f32::from((*v).clamp(1, 5) - 1) / 4.0;
+        let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
+        let fill = if enabled { color::TEXT } else { color::MUTED };
+        ui.painter().circle(
+            egui::pos2(x, rect.center().y),
+            radius * 0.7,
+            fill,
+            line(2.0, color::BG),
+        );
+        r.changed()
     })
     .inner
 }
@@ -1848,13 +1869,15 @@ fn tile(ui: &mut Ui, width: f32, label: &str, selected: bool, enabled: bool) -> 
         line(if selected { 1.5 } else { 1.0 }, dim(stroke)),
         StrokeKind::Inside,
     );
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        font::body(),
-        dim(text),
-    );
+    // Long effect names wrap inside the tile instead of running out of it.
+    let mut job =
+        egui::text::LayoutJob::simple(label.to_string(), font::body(), dim(text), width - 12.0);
+    job.halign = egui::Align::Center;
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let pos = egui::pos2(rect.center().x, rect.center().y - galley.size().y / 2.0);
+    ui.painter()
+        .with_clip_rect(rect.shrink(1.0))
+        .galley(pos, galley, dim(text));
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
