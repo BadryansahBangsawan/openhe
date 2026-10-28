@@ -134,6 +134,8 @@ impl Request {
     /// - Key: R[1..3] is the key and layout (`payload[1..3]`, the same place in
     ///   GET and SET). A multi-entry SET is matched on its first entry only.
     /// - DefKey: R[1] is the first requested row (`payload[1]`).
+    /// - Rm6x21: R[1] is the SUB (`payload[0]`); only the first of the reply's
+    ///   3 reports carries a header, the rest are raw continuations.
     ///
     /// A payload too short to carry those fields never matches.
     pub fn expects(&self, resp: &Response) -> bool {
@@ -146,6 +148,7 @@ impl Request {
             Cmd::Order => p.first().is_some_and(|&t| body[1] == t),
             Cmd::Key => p.get(1..3).is_some_and(|kl| body[1..3] == *kl),
             Cmd::DefKey => p.get(1).is_some_and(|&row| body[1] == row),
+            Cmd::Rm6x21 => p.first().is_some_and(|&sub| body[1] == sub),
             _ => true,
         }
     }
@@ -360,6 +363,24 @@ mod tests {
             payload: vec![0],
         };
         assert!(!empty.expects(&Response::decode(&reply(0xAB, &[0, 0])).unwrap()));
+    }
+
+    #[test]
+    fn rm6x21_reply_must_echo_the_requested_sub() {
+        let q = Request {
+            cmd: Cmd::Rm6x21,
+            payload: vec![2, 1, 0xFF, 0xFF],
+        };
+        // body = [status, SUB, ...]
+        assert!(q.expects(&Response::decode(&reply(0x92, &[0, 2])).unwrap()));
+        assert!(!q.expects(&Response::decode(&reply(0x92, &[0, 6])).unwrap()));
+        assert!(!q.expects(&Response::decode(&reply(0x92, &[0, 3])).unwrap()));
+        assert!(!q.expects(&Response::decode(&reply(0x80, &[0, 2])).unwrap()));
+        let empty = Request {
+            cmd: Cmd::Rm6x21,
+            payload: vec![],
+        };
+        assert!(!empty.expects(&Response::decode(&reply(0x92, &[0, 2])).unwrap()));
     }
 
     #[test]
