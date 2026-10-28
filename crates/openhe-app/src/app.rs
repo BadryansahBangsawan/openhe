@@ -452,9 +452,11 @@ impl OpenHeApp {
             theme: &self.theme,
             data: &self.data,
         };
-        // Per-app profile switching and Pengaturan's restart flows run
-        // whichever page is shown.
-        if let Some(e) = self.settings.background(&app_ctx, calibrating, ctx) {
+        // Pengaturan's restart flows run whichever page is shown; per-app
+        // profile switching runs on its own thread and is told here what
+        // the UI holds it back with (calibration, a top-bar switch).
+        let auto_locked = calibrating || self.switch.is_some();
+        if let Some(e) = self.settings.background(&app_ctx, auto_locked, ctx) {
             self.shell_error = Some((e, None));
         }
         egui::CentralPanel::default()

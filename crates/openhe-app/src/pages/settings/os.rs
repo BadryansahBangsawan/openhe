@@ -22,7 +22,8 @@ pub struct Foreground {
 }
 
 /// A light background thread that reads the foreground app's name every
-/// second. Stops when dropped.
+/// second and hands it to a `tick` callback (the per-app profile switcher),
+/// so switching works without UI frames. Stops when dropped.
 pub struct ForegroundWatcher {
     seen: Arc<Mutex<Foreground>>,
     stop: Arc<AtomicBool>,
@@ -30,8 +31,12 @@ pub struct ForegroundWatcher {
 
 impl ForegroundWatcher {
     /// Starts watching; `changed` is called (from the watcher thread) when
-    /// the foreground app changes, so the UI can wake up.
-    pub fn spawn(changed: impl Fn() + Send + 'static) -> std::io::Result<ForegroundWatcher> {
+    /// the foreground app changes, so the UI can wake up, and `tick` once
+    /// per check with the app in front. A panicking `tick` is contained.
+    pub fn spawn(
+        changed: impl Fn() + Send + 'static,
+        mut tick: impl FnMut(Option<&str>) + Send + 'static,
+    ) -> std::io::Result<ForegroundWatcher> {
         let seen = Arc::new(Mutex::new(Foreground::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let (s, st) = (Arc::clone(&seen), Arc::clone(&stop));
@@ -53,6 +58,8 @@ impl ForegroundWatcher {
                     if moved {
                         changed();
                     }
+                    let current = s.lock().unwrap_or_else(|p| p.into_inner()).current.clone();
+                    let _ = catch_unwind(AssertUnwindSafe(|| tick(current.as_deref())));
                     std::thread::sleep(WATCH_INTERVAL);
                 }
             })?;

@@ -18,7 +18,7 @@ use crate::widgets::card::{self, Card};
 use crate::widgets::keyboard::legend_list;
 use crate::widgets::segmented::Segmented;
 use crate::widgets::toggle::toggle;
-use crate::worker::{DeviceSnapshot, Pending};
+use crate::worker::{DeviceSnapshot, Pending, WorkerHandle};
 use eframe::egui::{self, Align, Align2, CornerRadius, Layout, Rect, RichText, Sense, Ui};
 use openhe_device::{Error, Keyboard, Transport, WriteOutcome};
 use openhe_proto::{PollingRate, SystemMode};
@@ -28,6 +28,8 @@ use profile_file::{
     ProfileData, ProfileFile,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ------------------------------------------------------- switch jobs
@@ -346,6 +348,128 @@ impl AutoSwitch {
     }
 }
 
+/// What the per-app switcher needs from the worker. [`WorkerHandle`] in
+/// the app; a fake in tests.
+pub trait SwitchPort {
+    /// The active profile while connected.
+    fn profile(&self) -> Option<u8>;
+    /// The worker is busy (a job queued or running, or loading) or may be
+    /// calibrating (its calibration guard is set).
+    fn locked(&self) -> bool;
+    /// Starts a profile switch ([`profile_job`]).
+    fn switch(&self, profile: u8) -> Pending<SwitchOutcome>;
+    /// Applies a finished switch: patches the snapshot, asks for a reload.
+    fn apply(&self, fx: SwitchEffects);
+}
+
+impl<T: Transport + 'static> SwitchPort for WorkerHandle<T> {
+    fn profile(&self) -> Option<u8> {
+        WorkerHandle::profile(self)
+    }
+
+    fn locked(&self) -> bool {
+        self.is_busy() || self.calibration_guard()
+    }
+
+    fn switch(&self, profile: u8) -> Pending<SwitchOutcome> {
+        self.submit("auto-profile", move |kb| profile_job(kb, profile))
+    }
+
+    fn apply(&self, fx: SwitchEffects) {
+        if fx.profile.is_some() || fx.system_mode.is_some() {
+            let (p, m) = (fx.profile, fx.system_mode);
+            self.patch_snapshot(move |s| {
+                if let Some(p) = p {
+                    s.profile = p;
+                }
+                if let Some(m) = m {
+                    s.system_mode = m;
+                }
+            });
+        }
+        if fx.request_reload {
+            self.request_reload();
+        }
+    }
+}
+
+/// State shared by the Pengaturan page (UI thread) and the per-app switcher
+/// (watcher thread).
+#[derive(Debug, Default)]
+pub struct AutoShared {
+    rules: Mutex<Vec<(String, u8)>>,
+    /// The rules changed: forget which switch was already tried.
+    rules_changed: AtomicBool,
+    /// The UI holds switches back: a restart flow, an import planned or
+    /// running, a profile or mode switch of the UI. (Busy jobs and the
+    /// calibration guard are read from the worker directly.)
+    pub ui_lock: AtomicBool,
+    /// A failed automatic switch, for the shell to show.
+    error: Mutex<Option<String>>,
+}
+
+impl AutoShared {
+    pub fn set_rules(&self, rules: Vec<(String, u8)>) {
+        *self.rules.lock().unwrap_or_else(|p| p.into_inner()) = rules;
+        self.rules_changed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn set_ui_lock(&self, on: bool) {
+        self.ui_lock.store(on, Ordering::SeqCst);
+    }
+
+    /// The last failed automatic switch (Indonesian), once.
+    pub fn take_error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    fn rules(&self) -> Vec<(String, u8)> {
+        self.rules.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+/// The per-app switcher. It runs on the foreground-watcher thread, so it
+/// works while the window is hidden or minimised (when the UI may not run
+/// any frames): it decides, submits the switch through a [`SwitchPort`],
+/// and collects and applies the result itself.
+#[derive(Default)]
+pub struct AutoSwitcher {
+    decide: AutoSwitch,
+    pending: Option<Pending<SwitchOutcome>>,
+}
+
+impl AutoSwitcher {
+    /// One watcher tick with the app in front (`None`: OpenHE itself or
+    /// unknown). Collects a finished switch, then starts one when a rule
+    /// asks for it and nothing holds switches back. True when a switch
+    /// finished (the UI may want to repaint).
+    pub fn tick(&mut self, app: Option<&str>, port: &impl SwitchPort, shared: &AutoShared) -> bool {
+        if shared.rules_changed.swap(false, Ordering::SeqCst) {
+            self.decide = AutoSwitch::default();
+        }
+        let mut finished = false;
+        if let Some(r) = self.pending.as_mut().and_then(Pending::poll) {
+            self.pending = None;
+            finished = true;
+            let fx = switch_effects(r, i18n::events::AUTO_SWITCH_FAILED);
+            if let Some(e) = fx.error.clone() {
+                *shared.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+            }
+            port.apply(fx);
+        }
+        if self.pending.is_some() || shared.ui_lock.load(Ordering::SeqCst) || port.locked() {
+            return finished;
+        }
+        let Some(current) = port.profile() else {
+            return finished;
+        };
+        if let Some(p) = self.decide.decide(app, &shared.rules(), current) {
+            self.pending = Some(port.switch(p));
+        }
+        finished
+    }
+}
+
 // --------------------------------------------------------------- page
 
 mod strings {
@@ -562,9 +686,9 @@ pub struct Page {
     polling_target: Option<PollingRate>,
     transfer: Transfer,
     auto_enabled: bool,
+    /// Runs the per-app switcher (see [`AutoSwitcher`]) while enabled.
     watcher: Option<ForegroundWatcher>,
-    auto: AutoSwitch,
-    auto_pending: Option<Pending<SwitchOutcome>>,
+    auto: Arc<AutoShared>,
     app_error: Option<String>,
     new_rule: (String, u8),
     reset_open: bool,
@@ -583,8 +707,7 @@ impl Default for Page {
             transfer: Transfer::Idle,
             auto_enabled: false,
             watcher: None,
-            auto: AutoSwitch::default(),
-            auto_pending: None,
+            auto: Arc::default(),
             app_error: None,
             new_rule: (String::new(), 0),
             reset_open: false,
@@ -595,9 +718,10 @@ impl Default for Page {
 
 impl Page {
     /// Runs every frame, whichever page is shown: finishes jobs, follows a
-    /// keyboard restart, and runs per-app switching. `locked` (e.g. while
-    /// calibrating) holds automatic switches back. Returns an error for the
-    /// shell to show (a failed automatic switch).
+    /// keyboard restart, and tells the per-app switcher (which runs on the
+    /// watcher thread) what the UI holds it back with. `locked` (e.g. while
+    /// calibrating, or a top-bar switch) holds automatic switches back.
+    /// Returns an error for the shell to show (a failed automatic switch).
     pub fn background(
         &mut self,
         ctx: &AppCtx,
@@ -629,38 +753,10 @@ impl Page {
         }
         self.poll_transfer(ctx);
 
-        let mut shell = None;
-        if let Some(r) = self.auto_pending.as_mut().and_then(Pending::poll) {
-            self.auto_pending = None;
-            if let Some((e, _)) = apply_switch_effects(
-                ctx.worker,
-                switch_effects(r, i18n::events::AUTO_SWITCH_FAILED),
-            ) {
-                shell = Some(e);
-            }
-        }
-        if self.auto_enabled {
-            if let (Some(w), Some(snap)) = (&self.watcher, ctx.snapshot) {
-                let seen = w.seen();
-                let idle = ctx.can_write()
-                    && !locked
-                    && self.auto_pending.is_none()
-                    && !self.auto_locked();
-                if idle {
-                    let rules = ctx.data.borrow().app_profile_rules.clone();
-                    if let Some(p) = self
-                        .auto
-                        .decide(seen.current.as_deref(), &rules, snap.profile)
-                    {
-                        self.auto_pending = Some(
-                            ctx.worker
-                                .submit("auto-profile", move |kb| profile_job(kb, p)),
-                        );
-                    }
-                }
-            }
-        }
-        shell
+        // The switcher itself runs on the watcher thread; the UI only says
+        // what it holds switches back with and shows failures.
+        self.auto.set_ui_lock(locked || self.auto_locked());
+        self.auto.take_error()
     }
 
     fn poll_transfer(&mut self, ctx: &AppCtx) {
@@ -1197,7 +1293,7 @@ impl Page {
             setting_row(ui, t::AUTO, Some(t::AUTO_HINT), true, |ui| {
                 let mut on = self.auto_enabled;
                 if toggle(ui, &mut on, true).changed() {
-                    self.set_auto(on, ui.ctx());
+                    self.set_auto(on, ctx, ui.ctx());
                 }
             });
             if self.auto_enabled {
@@ -1242,16 +1338,29 @@ impl Page {
         });
     }
 
-    fn set_auto(&mut self, on: bool, egui_ctx: &egui::Context) {
+    /// Starts or stops per-app switching. The watcher thread reads the
+    /// foreground app every second and runs an [`AutoSwitcher`] against a
+    /// [`WorkerHandle`], so switching does not depend on UI frames.
+    fn set_auto(&mut self, on: bool, ctx: &AppCtx, egui_ctx: &egui::Context) {
         self.app_error = None;
-        self.auto = AutoSwitch::default();
+        self.watcher = None;
         if !on {
             self.auto_enabled = false;
-            self.watcher = None;
             return;
         }
+        self.auto
+            .set_rules(ctx.data.borrow().app_profile_rules.clone());
         let c = egui_ctx.clone();
-        match ForegroundWatcher::spawn(move || c.request_repaint()) {
+        let repaint = c.clone();
+        let handle = ctx.worker.handle();
+        let shared = Arc::clone(&self.auto);
+        let mut switcher = AutoSwitcher::default();
+        let tick = move |app: Option<&str>| {
+            if switcher.tick(app, &handle, &shared) {
+                repaint.request_repaint();
+            }
+        };
+        match ForegroundWatcher::spawn(move || c.request_repaint(), tick) {
             Ok(w) => {
                 self.watcher = Some(w);
                 self.auto_enabled = true;
@@ -1348,7 +1457,8 @@ impl Page {
                 card::hint(ui, t::AUTO_SESSION);
             });
         if changed {
-            self.auto = AutoSwitch::default();
+            self.auto
+                .set_rules(ctx.data.borrow().app_profile_rules.clone());
             if ctx.save_data().is_err() {
                 self.app_error = Some(t::SAVE_FAILED.to_string());
             }
@@ -1751,6 +1861,161 @@ mod tests {
         // OpenHE itself in front (None): nothing, and it resets.
         assert_eq!(a.decide(None, &rules(), 1), None);
         assert_eq!(a.decide(Some("Code"), &rules(), 1), Some(0));
+    }
+
+    // ------------------------------- per-app switching off the UI thread
+
+    use crate::worker::pending_channel;
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::Ordering;
+
+    type Reply = std::sync::mpsc::Sender<Result<SwitchOutcome, Error>>;
+
+    /// A worker stand-in: its profile, whether it is locked, the switches
+    /// asked for (their results are sent by the test) and the effects
+    /// applied.
+    #[derive(Default)]
+    struct FakePort {
+        profile: Cell<Option<u8>>,
+        locked: Cell<bool>,
+        sent: RefCell<Vec<(u8, Reply)>>,
+        applied: RefCell<Vec<SwitchEffects>>,
+    }
+
+    impl SwitchPort for FakePort {
+        fn profile(&self) -> Option<u8> {
+            self.profile.get()
+        }
+        fn locked(&self) -> bool {
+            self.locked.get()
+        }
+        fn switch(&self, profile: u8) -> Pending<SwitchOutcome> {
+            let (tx, p) = pending_channel("auto-profile");
+            self.sent.borrow_mut().push((profile, tx));
+            p
+        }
+        fn apply(&self, fx: SwitchEffects) {
+            self.applied.borrow_mut().push(fx);
+        }
+    }
+
+    fn shared_with(rules: Vec<(String, u8)>) -> AutoShared {
+        let s = AutoShared::default();
+        s.set_rules(rules);
+        s
+    }
+
+    #[test]
+    fn the_switcher_decides_and_submits_without_the_ui() {
+        let port = FakePort::default();
+        port.profile.set(Some(0));
+        let shared = shared_with(rules());
+        let mut sw = AutoSwitcher::default();
+        // Valorant in front, keyboard on profile 0: switch to 1.
+        assert!(!sw.tick(Some("Valorant"), &port, &shared));
+        assert_eq!(port.sent.borrow().len(), 1);
+        assert_eq!(port.sent.borrow()[0].0, 1);
+        // One switch at a time.
+        sw.tick(Some("Code"), &port, &shared);
+        assert_eq!(port.sent.borrow().len(), 1);
+        // It finishes: its effects are applied on the watcher thread.
+        let ok = SwitchOutcome {
+            write: Ok(()),
+            profile: Some(1),
+            system_mode: None,
+        };
+        port.sent.borrow()[0].1.send(Ok(ok)).unwrap();
+        port.profile.set(Some(1));
+        assert!(sw.tick(Some("Valorant"), &port, &shared), "finished");
+        assert_eq!(port.applied.borrow()[0].profile, Some(1));
+        assert_eq!(shared.take_error(), None);
+        assert_eq!(port.sent.borrow().len(), 1, "already on 1");
+    }
+
+    #[test]
+    fn the_switcher_respects_every_lock() {
+        let shared = shared_with(rules());
+        let mut sw = AutoSwitcher::default();
+        let port = FakePort::default();
+        // Disconnected.
+        sw.tick(Some("Valorant"), &port, &shared);
+        port.profile.set(Some(0));
+        // The worker is busy or calibrating.
+        port.locked.set(true);
+        sw.tick(Some("Valorant"), &port, &shared);
+        port.locked.set(false);
+        // The UI holds it back (restart, import planned or running, a
+        // switch from the top bar).
+        shared.set_ui_lock(true);
+        sw.tick(Some("Valorant"), &port, &shared);
+        assert!(port.sent.borrow().is_empty());
+        shared.set_ui_lock(false);
+        sw.tick(Some("Valorant"), &port, &shared);
+        assert_eq!(port.sent.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_switch_is_reported_once_and_not_retried_in_a_loop() {
+        let port = FakePort::default();
+        port.profile.set(Some(0));
+        let shared = shared_with(rules());
+        let mut sw = AutoSwitcher::default();
+        sw.tick(Some("Valorant"), &port, &shared);
+        port.sent.borrow()[0].1.send(Err(Error::Timeout)).unwrap();
+        sw.tick(Some("Valorant"), &port, &shared);
+        let e = shared.take_error().expect("shown by the shell");
+        assert!(e.starts_with(i18n::events::AUTO_SWITCH_FAILED), "{e}");
+        assert_eq!(shared.take_error(), None, "taken once");
+        assert!(port.applied.borrow()[0].request_reload);
+        sw.tick(Some("Valorant"), &port, &shared);
+        assert_eq!(port.sent.borrow().len(), 1, "no retry loop");
+        // Edited rules start over.
+        shared.set_rules(rules());
+        sw.tick(Some("Valorant"), &port, &shared);
+        assert_eq!(port.sent.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_real_worker_switches_from_another_thread() {
+        use crate::worker::tests::{order_reply, push_snapshot};
+        use crate::worker::{Worker, WorkerConfig};
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                for _ in 0..3 {
+                    m.push_reply(order_reply(0x70, 2)); // SET, verify, re-read
+                }
+                push_snapshot(&mut m, 2); // the reload afterwards
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            WorkerConfig {
+                retry_interval: Duration::from_millis(5),
+                idle_poll: Duration::from_millis(2),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !w.is_connected() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let handle = w.handle();
+        let shared = std::sync::Arc::new(shared_with(vec![("Game".into(), 2)]));
+        let sh = shared.clone();
+        // The watcher thread: no UI frame runs meanwhile.
+        std::thread::spawn(move || {
+            let mut sw = AutoSwitcher::default();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !sw.tick(Some("Game"), &handle, &sh) {
+                assert!(Instant::now() < deadline, "never switched");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(w.snapshot().unwrap().profile, 2);
+        assert_eq!(shared.take_error(), None);
+        assert!(!shared.ui_lock.load(Ordering::SeqCst));
     }
 
     // ----------------------------------------------------- import

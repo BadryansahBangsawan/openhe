@@ -524,41 +524,16 @@ impl<T: Transport + 'static> Worker<T> {
         counted: bool,
         job: impl FnOnce(&mut Keyboard<T>) -> Result<R, Error> + Send + 'static,
     ) -> Pending<R> {
-        let (rtx, rrx) = mpsc::channel();
-        let wrapped: Job<T> = Box::new(move |kb| {
-            let ran = kb.is_some();
-            let (result, panicked) = match kb {
-                Some(k) => guarded(|| job(k)),
-                None => (Err(Error::Disconnected), false),
-            };
-            JobDone {
-                disconnected: ran && matches!(result, Err(Error::Disconnected)),
-                panicked,
-                deliver: Box::new(move || {
-                    let _ = rtx.send(result);
-                }),
-            }
-        });
-        if counted {
-            self.ctl.outstanding.fetch_add(1, Ordering::SeqCst);
-        }
-        if self
-            .tx
-            .send(Msg {
-                label,
-                job: wrapped,
-                counted,
-            })
-            .is_err()
-            && counted
-        {
-            // The thread is gone; dropping the job drops its sender.
-            self.ctl.outstanding.fetch_sub(1, Ordering::SeqCst);
-        }
-        Pending {
-            rx: rrx,
-            label,
-            done: false,
+        enqueue(&self.tx, &self.ctl, label, counted, job)
+    }
+
+    /// A cheap, cloneable handle for other threads (the per-app profile
+    /// switcher): it submits jobs and reads the state like the worker
+    /// itself, but does not keep the thread alive or stop it.
+    pub fn handle(&self) -> WorkerHandle<T> {
+        WorkerHandle {
+            tx: self.tx.clone(),
+            ctl: Arc::clone(&self.ctl),
         }
     }
 
@@ -656,6 +631,123 @@ impl<T: Transport + 'static> Worker<T> {
     /// can wake up (the app passes `egui::Context::request_repaint`).
     pub fn set_repaint(&self, f: impl Fn() + Send + Sync + 'static) {
         self.ctl.lock().repaint = Some(Arc::new(f));
+    }
+}
+
+/// A cloneable handle to the worker for other threads (see
+/// [`Worker::handle`]). Jobs submitted after the worker is gone fail with
+/// `Err(Disconnected)`.
+pub struct WorkerHandle<T: Transport + 'static = HidTransport> {
+    tx: Sender<Msg<T>>,
+    ctl: Arc<Control>,
+}
+
+impl<T: Transport + 'static> Clone for WorkerHandle<T> {
+    fn clone(&self) -> Self {
+        WorkerHandle {
+            tx: self.tx.clone(),
+            ctl: Arc::clone(&self.ctl),
+        }
+    }
+}
+
+impl<T: Transport + 'static> WorkerHandle<T> {
+    /// Like [`Worker::submit`] (counted: the app is busy meanwhile).
+    pub fn submit<R: Send + 'static>(
+        &self,
+        label: &'static str,
+        job: impl FnOnce(&mut Keyboard<T>) -> Result<R, Error> + Send + 'static,
+    ) -> Pending<R> {
+        enqueue(&self.tx, &self.ctl, label, true, job)
+    }
+
+    /// The active profile while connected (no snapshot copy).
+    pub fn profile(&self) -> Option<u8> {
+        match &self.ctl.lock().status {
+            ConnectionStatus::Connected(s) => Some(s.profile),
+            _ => None,
+        }
+    }
+
+    /// See [`Worker::is_busy`].
+    pub fn is_busy(&self) -> bool {
+        self.ctl.outstanding.load(Ordering::SeqCst) > 0 || self.ctl.lock().current.is_some()
+    }
+
+    /// See [`Worker::calibration_guard`].
+    pub fn calibration_guard(&self) -> bool {
+        self.ctl.calibrating.load(Ordering::SeqCst)
+    }
+
+    /// See [`Worker::request_reload`].
+    pub fn request_reload(&self) {
+        self.ctl.reload.store(true, Ordering::SeqCst);
+    }
+
+    /// See [`Worker::patch_snapshot`].
+    pub fn patch_snapshot(&self, f: impl FnOnce(&mut DeviceSnapshot)) {
+        self.ctl.patch_snapshot(f);
+    }
+}
+
+/// A [`Pending`] whose result the test sends itself (for fakes of the
+/// worker).
+#[cfg(test)]
+pub(crate) fn pending_channel<R>(label: &'static str) -> (Sender<Result<R, Error>>, Pending<R>) {
+    let (tx, rx) = mpsc::channel();
+    (
+        tx,
+        Pending {
+            rx,
+            label,
+            done: false,
+        },
+    )
+}
+
+/// Queues a job on the worker thread (shared by [`Worker`] and
+/// [`WorkerHandle`]).
+fn enqueue<T: Transport + 'static, R: Send + 'static>(
+    tx: &Sender<Msg<T>>,
+    ctl: &Control,
+    label: &'static str,
+    counted: bool,
+    job: impl FnOnce(&mut Keyboard<T>) -> Result<R, Error> + Send + 'static,
+) -> Pending<R> {
+    let (rtx, rrx) = mpsc::channel();
+    let wrapped: Job<T> = Box::new(move |kb| {
+        let ran = kb.is_some();
+        let (result, panicked) = match kb {
+            Some(k) => guarded(|| job(k)),
+            None => (Err(Error::Disconnected), false),
+        };
+        JobDone {
+            disconnected: ran && matches!(result, Err(Error::Disconnected)),
+            panicked,
+            deliver: Box::new(move || {
+                let _ = rtx.send(result);
+            }),
+        }
+    });
+    if counted {
+        ctl.outstanding.fetch_add(1, Ordering::SeqCst);
+    }
+    if tx
+        .send(Msg {
+            label,
+            job: wrapped,
+            counted,
+        })
+        .is_err()
+        && counted
+    {
+        // The thread is gone; dropping the job drops its sender.
+        ctl.outstanding.fetch_sub(1, Ordering::SeqCst);
+    }
+    Pending {
+        rx: rrx,
+        label,
+        done: false,
     }
 }
 
