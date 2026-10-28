@@ -36,6 +36,8 @@ pub enum FrameError {
     ShortReport,
     #[error("device reported failure")]
     DeviceFail,
+    #[error("report is not a protocol reply")]
+    NotAReply,
 }
 
 /// Expects `payload.len() >= len`; a missing last byte is treated as 0.
@@ -76,7 +78,7 @@ impl Request {
     }
 }
 
-/// A keyboard-to-host reply: `[?, LEN, CMD|0x80, CHK, R...]`.
+/// A keyboard-to-host reply: `[5C, LEN, CMD|0x80, CHK, R...]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     /// Command byte with the 0x80 reply bit cleared.
@@ -86,14 +88,18 @@ pub struct Response {
 }
 
 impl Response {
-    /// Byte 0 is not validated (meaning unknown). Input longer than a report
-    /// is truncated to its first 64 bytes.
+    /// A reply starts with the 0x5C magic (verified on hardware) and has the
+    /// 0x80 bit set in its command byte; anything else is `NotAReply`.
+    /// Input longer than a report is truncated to its first 64 bytes.
     pub fn decode(report: &[u8]) -> Result<Response, FrameError> {
         if report.len() < REPORT_LEN {
             return Err(FrameError::ShortReport);
         }
         let mut raw = [0u8; REPORT_LEN];
         raw.copy_from_slice(&report[..REPORT_LEN]);
+        if raw[0] != MAGIC || raw[2] & 0x80 == 0 {
+            return Err(FrameError::NotAReply);
+        }
         if raw[2] == 0xFF {
             return Err(FrameError::DeviceFail);
         }
@@ -121,17 +127,27 @@ impl Response {
 
 impl Request {
     /// Whether `resp` answers this request.
+    ///
+    /// The command byte must match, and for commands whose reply echoes the
+    /// request so must the echoed fields:
+    /// - Order: R[1] is the TYPE (`payload[0]`).
+    /// - Key: R[1..3] is the key and layout (`payload[1..3]`, the same place in
+    ///   GET and SET). A multi-entry SET is matched on its first entry only.
+    /// - DefKey: R[1] is the first requested row (`payload[1]`).
+    ///
+    /// A payload too short to carry those fields never matches.
     pub fn expects(&self, resp: &Response) -> bool {
         if resp.cmd != self.cmd as u8 {
             return false;
         }
-        if self.cmd == Cmd::Order {
-            return match self.payload.first() {
-                Some(&t) => resp.body()[1] == t,
-                None => false,
-            };
+        let body = resp.body();
+        let p = &self.payload;
+        match self.cmd {
+            Cmd::Order => p.first().is_some_and(|&t| body[1] == t),
+            Cmd::Key => p.get(1..3).is_some_and(|kl| body[1..3] == *kl),
+            Cmd::DefKey => p.get(1).is_some_and(|&row| body[1] == row),
+            _ => true,
         }
-        true
     }
 }
 
@@ -211,6 +227,7 @@ mod tests {
 
     fn reply(cmd_byte: u8, body: &[u8]) -> Vec<u8> {
         let mut raw = vec![0u8; REPORT_LEN];
+        raw[0] = MAGIC;
         raw[1] = 2;
         raw[2] = cmd_byte;
         raw[4..4 + body.len()].copy_from_slice(body);
@@ -282,9 +299,86 @@ mod tests {
     fn key_reply_matches() {
         let q = Request {
             cmd: Cmd::Key,
-            payload: vec![1],
+            payload: vec![1, 0x0A, 4, 0xDC, 0x05],
         };
-        assert!(q.expects(&Response::decode(&reply(0xA3, &[])).unwrap()));
-        assert!(!q.expects(&Response::decode(&reply(0x80, &[])).unwrap()));
+        let echo = Response::decode(&reply(0xA3, &[0, 0x0A, 4, 0xDC, 0x05])).unwrap();
+        assert!(q.expects(&echo));
+        assert!(!q.expects(&Response::decode(&reply(0x80, &[0, 0x0A, 4])).unwrap()));
+    }
+
+    #[test]
+    fn key_reply_must_carry_the_requested_key_and_layout() {
+        for payload in [vec![0, 0x0A, 4, 0, 0], vec![1, 0x0A, 4, 0xDC, 0x05]] {
+            let q = Request {
+                cmd: Cmd::Key,
+                payload,
+            };
+            let other_key = Response::decode(&reply(0xA3, &[0, 0x0B, 4, 0xDC, 0x05])).unwrap();
+            let other_layout = Response::decode(&reply(0xA3, &[0, 0x0A, 20, 0xDC, 0x05])).unwrap();
+            let same = Response::decode(&reply(0xA3, &[0, 0x0A, 4, 0xD0, 0x07])).unwrap();
+            assert!(!q.expects(&other_key), "{:?}", q.payload);
+            assert!(!q.expects(&other_layout), "{:?}", q.payload);
+            assert!(q.expects(&same), "{:?}", q.payload);
+        }
+    }
+
+    #[test]
+    fn multi_entry_key_set_matches_on_its_first_entry() {
+        let q = Request {
+            cmd: Cmd::Key,
+            payload: vec![1, 0x0A, 4, 0xDC, 0x05, 0x0B, 20, 0x64, 0x00],
+        };
+        let first = Response::decode(&reply(0xA3, &[0, 0x0A, 4, 0xDC, 0x05])).unwrap();
+        let second = Response::decode(&reply(0xA3, &[0, 0x0B, 20, 0x64, 0x00])).unwrap();
+        assert!(q.expects(&first));
+        assert!(!q.expects(&second));
+    }
+
+    #[test]
+    fn short_key_payload_never_matches() {
+        let resp = Response::decode(&reply(0xA3, &[0, 0x0A, 4])).unwrap();
+        for payload in [vec![], vec![0], vec![0, 0x0A]] {
+            let q = Request {
+                cmd: Cmd::Key,
+                payload,
+            };
+            assert!(!q.expects(&resp));
+        }
+    }
+
+    #[test]
+    fn defkey_reply_must_carry_the_requested_first_row() {
+        let q = Request {
+            cmd: Cmd::DefKey,
+            payload: vec![0, 2, 3],
+        };
+        assert!(q.expects(&Response::decode(&reply(0xAB, &[0, 2])).unwrap()));
+        assert!(!q.expects(&Response::decode(&reply(0xAB, &[0, 0])).unwrap()));
+        assert!(!q.expects(&Response::decode(&reply(0xAB, &[0, 4])).unwrap()));
+        let empty = Request {
+            cmd: Cmd::DefKey,
+            payload: vec![0],
+        };
+        assert!(!empty.expects(&Response::decode(&reply(0xAB, &[0, 0])).unwrap()));
+    }
+
+    #[test]
+    fn decode_rejects_reports_without_the_magic_byte() {
+        let mut raw = reply(0xA3, &[0, 0x0A, 4]);
+        raw[0] = 0x00;
+        assert_eq!(Response::decode(&raw), Err(FrameError::NotAReply));
+        raw[0] = 0x35;
+        assert_eq!(Response::decode(&raw), Err(FrameError::NotAReply));
+    }
+
+    #[test]
+    fn decode_rejects_reports_without_the_reply_bit() {
+        for cmd in [0x00, 0x01, 0x23, 0x7F] {
+            assert_eq!(
+                Response::decode(&reply(cmd, &[])),
+                Err(FrameError::NotAReply),
+                "{cmd:#04X}"
+            );
+        }
     }
 }

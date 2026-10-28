@@ -149,6 +149,7 @@ mod tests {
 
     fn defkey_reply(row_a: u8, a: &[u8], row_b: u8, b: &[u8]) -> [u8; 64] {
         let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
         raw[2] = 0xAB;
         raw[5] = row_a;
         raw[6..6 + a.len()].copy_from_slice(a);
@@ -163,6 +164,7 @@ mod tests {
 
     fn key_reply(key: u8, layout: u8, v: u16) -> [u8; 64] {
         let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
         raw[2] = 0xA3;
         raw[5] = key;
         raw[6] = layout;
@@ -172,6 +174,7 @@ mod tests {
 
     fn order_reply(ty: u8, v: u8) -> [u8; 64] {
         let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
         raw[2] = 0x80;
         raw[5] = ty;
         raw[6] = v;
@@ -230,19 +233,23 @@ mod tests {
     }
 
     #[test]
-    fn wrong_key_code_is_io_error() {
+    fn wrong_key_code_is_never_taken_as_the_answer() {
         let mut m = MockTransport::new();
         m.push_reply(key_reply(0x0B, 4, 1500));
-        let e = kb(m).key_param(0x0A, KeyParam::Actuation).unwrap_err();
-        assert!(matches!(e, Error::Io(_)), "{e:?}");
+        let mut k = kb(m);
+        assert_eq!(k.key_param(0x0A, KeyParam::Actuation), Err(Error::Timeout));
+        let ev = k.take_events();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(key::parse_value(&ev[0]), Some((0x0B, 4, 1500)));
     }
 
     #[test]
-    fn wrong_layout_is_io_error() {
+    fn wrong_layout_is_never_taken_as_the_answer() {
         let mut m = MockTransport::new();
         m.push_reply(key_reply(0x0A, 20, 1500));
-        let e = kb(m).key_param(0x0A, KeyParam::Actuation).unwrap_err();
-        assert!(matches!(e, Error::Io(_)), "{e:?}");
+        let mut k = kb(m);
+        assert_eq!(k.key_param(0x0A, KeyParam::Actuation), Err(Error::Timeout));
+        assert_eq!(k.take_events().len(), 1);
     }
 
     #[test]
@@ -308,6 +315,38 @@ mod tests {
     }
 
     #[test]
+    fn unsolicited_key_event_during_set_does_not_replace_the_read_back() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x0A, 4, 1500)); // SET echo
+        m.push_reply(key_reply(0x0B, 4, 1500)); // unsolicited: another key, same layout and value
+        m.push_reply(key_reply(0x0A, 4, 1500)); // the real read-back
+        let mut k = kb(m);
+        assert_eq!(
+            k.set_key_params(&[(0x0A, KeyParam::Actuation, 1500)]),
+            Ok(())
+        );
+        let ev = k.take_events();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(key::parse_value(&ev[0]), Some((0x0B, 4, 1500)));
+        assert_eq!(k.session_mut().transport().written().len(), 2);
+    }
+
+    #[test]
+    fn unsolicited_key_event_during_set_cannot_fake_a_passing_verify() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x0A, 4, 1500)); // SET echo
+        m.push_reply(key_reply(0x0A, 20, 1500)); // unsolicited: same key, other layout
+        m.push_reply(key_reply(0x0A, 4, 2000)); // the real read-back: the write did not stick
+        let e = kb(m)
+            .set_key_params(&[(0x0A, KeyParam::Actuation, 1500)])
+            .unwrap_err();
+        assert_eq!(
+            e,
+            Error::Io("verify failed: key 0x0A layout 4: wrote 1500, read 2000".to_string())
+        );
+    }
+
+    #[test]
     fn set_nothing_does_no_io() {
         let mut k = kb(MockTransport::new());
         assert_eq!(k.set_key_params(&[]), Ok(()));
@@ -318,6 +357,7 @@ mod tests {
     fn failed_set_is_not_read_back() {
         let mut m = MockTransport::new();
         let mut fail = [0u8; 64];
+        fail[0] = 0x5C;
         fail[2] = 0xFF;
         m.push_reply(fail); // the keyboard rejects the SET
         m.push_reply(key_reply(0x0A, 4, 1500)); // a read-back would accept this; it must stay unread

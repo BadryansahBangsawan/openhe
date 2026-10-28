@@ -59,6 +59,7 @@ mod tests {
 
     fn reply(row_a: u8, a: &[u8], row_b: u8, b: &[u8]) -> Response {
         let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
         raw[2] = 0xAB;
         raw[4 + 1] = row_a;
         raw[4 + 2..4 + 2 + a.len()].copy_from_slice(a);
@@ -135,6 +136,7 @@ mod tests {
     #[test]
     fn apply_rejects_wrong_cmd() {
         let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
         raw[2] = 0x81;
         let mut m = Matrix::default();
         assert_eq!(

@@ -313,6 +313,7 @@ mod tests {
 
     fn key_reply(key: u8, layout: u8, v: u16) -> [u8; 64] {
         let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
         raw[2] = 0xA3;
         raw[5] = key;
         raw[6] = layout;
@@ -358,8 +359,8 @@ mod tests {
     #[test]
     fn per_key_io_error_is_recorded_and_dump_continues() {
         let mut m = MockTransport::new();
-        // Key 0x0A: wrong layout for the first param -> Io error.
-        m.push_reply(key_reply(0x0A, 20, 1));
+        // Key 0x0A: an unknown mode value -> Io error, and its other params are not read.
+        m.push_reply(key_reply(0x0A, 8, 0x07));
         // Key 0x0B: seven good replies.
         for (layout, v) in [
             (8u8, 0x20u16),
@@ -459,6 +460,7 @@ mod tests {
 
     fn defkey_reply(row_a: u8, a: &[u8], row_b: u8, b: &[u8]) -> [u8; 64] {
         let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
         raw[2] = 0xAB;
         raw[5] = row_a;
         raw[6..6 + a.len()].copy_from_slice(a);

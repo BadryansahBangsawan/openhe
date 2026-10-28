@@ -165,6 +165,7 @@ mod tests {
 
     fn resp(cmd: u8, body: &[u8]) -> Response {
         let mut raw = [0u8; REPORT_LEN];
+        raw[0] = 0x5C;
         raw[2] = cmd | 0x80;
         raw[4..4 + body.len()].copy_from_slice(body);
         Response::decode(&raw).unwrap()

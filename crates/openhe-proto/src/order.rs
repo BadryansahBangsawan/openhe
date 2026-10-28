@@ -66,6 +66,7 @@ mod tests {
 
     fn resp(cmd_byte: u8, body: &[u8]) -> Response {
         let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
         raw[1] = 2;
         raw[2] = cmd_byte;
         raw[4..4 + body.len()].copy_from_slice(body);

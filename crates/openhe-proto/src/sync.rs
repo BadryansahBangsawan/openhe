@@ -49,6 +49,7 @@ mod tests {
     #[test]
     fn parse_sync() {
         let mut raw = [0u8; 64];
+        raw[0] = 0x5C;
         raw[2] = 0x81;
         put(&mut raw, 1, &0x1901_0001u32.to_le_bytes());
         put(&mut raw, 9, b"A68M240193000000");

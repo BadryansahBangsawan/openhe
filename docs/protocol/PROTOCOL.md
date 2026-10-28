@@ -134,6 +134,7 @@ Anchors: `MAX_RETRIES",3`, `waitForResponse`, `flushQueue`.
 - **One command in flight at a time.** There is a global FIFO queue per device.
 - **No matching.** Responses are matched **purely by arrival order**. The command byte is not checked, and input reports received before the command was enqueued are discarded.
   - An unsolicited event report (for example the user pressing Fn+profile) that arrives between send and reply **will be consumed as the reply**. Your Rust app should match on `CMD|0x80` and queue the rest as events.
+  - OpenHE does this: a reply must match `CMD|0x80` and the fields it echoes (order TYPE at R[1]; KEY key and layout at R[1..3], first entry for a SET; DEFKEY first row at R[1]). Input already waiting before a write is drained into the event queue, and reports without the 0x5C magic or the 0x80 bit are ignored.
 - **Timeout and retries.** 1000 ms per attempt, up to 3 attempts when nothing arrives. The facade swaps the `timeout` and `sendTime` arguments twice, and the two swaps cancel out.
 - **Failure path.** When all attempts fail, the app's queue throws and leaves the promise hanging (an app bug). Do not copy this.
 - **Multiple-response commands.** `RM6X21` (live travel and calibration) uses `sendDataAndWaitMultiple(pkt, 3)`. It collects 3 input reports, concatenates them, and strips only the first 4 bytes.
@@ -789,6 +790,7 @@ Suggested safe probes are GETs only: SYNC, DEFKEY, KEY GET, PRGB GET, 0x00 queri
 14. **Persistence.** Are settings saved to flash immediately, given that SAVING_PARAMETER 0x02 is never used? KRGB needs the explicit 0xFE commit.
 15. **Bootloader re-enumeration.** Does the bootloader appear with the same VID/PID/usage page? The official updater exe flow is not in this app.
 16. **macOS permissions.** Whether macOS needs Input Monitoring permission to open the 0xFFA0 interface with hidapi. It probably does not, since this is a vendor usage page.
+17. **Multi-entry KEY SET echo.** Only single-entry SETs have been seen on hardware (7.x finding 11). OpenHE matches a SET reply on the key and layout of the packet's **first** entry (`Request::expects`). Before Phase 4 sends batched remaps, check on hardware what a multi-entry SET echoes (first entry, last entry, or all of them) and adjust the matching if needed.
 
 ### 7.x Hardware findings (WIN 68 HE MAX, FW App V1.1.3)
 
