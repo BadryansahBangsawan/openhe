@@ -15,13 +15,14 @@
 //! (before or after the action) follows the mockup ("jeda setelahnya") but
 //! is not confirmed. The UI says so.
 
+use super::advanced::Func;
 use crate::app::{page_with_right_panel, AppCtx};
 use crate::i18n;
 use crate::storage::{SavedMacro, SavedMacroAction};
 use crate::theme::{color, font, line, size};
 use crate::widgets::card::{self, Card};
 use crate::widgets::keyboard::{KeyboardView, Selection};
-use crate::worker::Pending;
+use crate::worker::{DeviceSnapshot, Pending};
 use eframe::egui::{
     self, Align, Align2, CornerRadius, Event, Frame, Key, Layout, Margin, Modifiers, RichText,
     Sense, StrokeKind, Ui,
@@ -120,6 +121,10 @@ mod strings {
         "Arti jeda (sebelum atau sesudah langkah) belum diuji di keyboard sungguhan.";
 
     pub const BIND: &str = "Pasang ke tombol";
+    pub const REPLACES: &str = "Tombol ini punya fungsi lanjutan";
+    pub const REPLACES_TAIL: &str = "Memasang macro menghapus fungsi itu.";
+    pub const REPLACES_SOCD: &str = "Pasangan SOCD-nya ikut dilepas.";
+    pub const CONFIRM_REPLACE: &str = "Ya, ganti dengan macro";
     pub const BINDING: &str = "Memasang…";
     pub const BOUND: &str = "Macro terpasang di keyboard";
     pub const BIND_FAILED: &str = "Gagal memasang macro";
@@ -544,6 +549,29 @@ pub fn target_blocked(code: u8) -> bool {
     code == 0x01
 }
 
+/// The advanced function (DKS, MT, TGL, MPT, SOCD or END; not a macro) that
+/// `key` holds in the snapshot. Binding a macro clears it first (and the
+/// partner of a SOCD pair), so the page asks before it does.
+pub fn replaced_function(snap: &DeviceSnapshot, key: u8) -> Option<Func> {
+    snap.keys
+        .get(&key)
+        .and_then(|s| Func::of_nibble(s.mode.advanced))
+}
+
+/// "Tombol ini punya fungsi lanjutan SOCD. Memasang macro ...".
+pub fn replace_warning(f: Func) -> String {
+    let mut text = format!(
+        "{} {}. {}",
+        strings::REPLACES,
+        f.label(),
+        strings::REPLACES_TAIL
+    );
+    if f == Func::Socd {
+        text = format!("{text} {}", strings::REPLACES_SOCD);
+    }
+    text
+}
+
 /// What the bind job hands back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindOutcome {
@@ -712,6 +740,12 @@ pub struct Page {
     last_bind: Option<(u8, SavedMacro)>,
     failure: Option<Failure>,
     bound: bool,
+    /// The user saw that the target's function will be replaced and
+    /// clicked once; the next click binds.
+    confirm_replace: bool,
+    /// The running bind replaces a function: reload afterwards (a SOCD
+    /// partner changed too).
+    bind_replaces: bool,
 }
 
 impl Default for Page {
@@ -737,6 +771,8 @@ impl Default for Page {
             last_bind: None,
             failure: None,
             bound: false,
+            confirm_replace: false,
+            bind_replaces: false,
         }
     }
 }
@@ -935,7 +971,9 @@ impl Page {
                     Some(b) => self.binding = Some(Ok(b)),
                     None => self.binding_for = None, // read again
                 }
-                if fx.request_reload {
+                // Binding over a function also changed its SOCD partner (and
+                // the job re-reads only the target): read everything again.
+                if fx.request_reload || std::mem::take(&mut self.bind_replaces) {
                     ctx.worker.request_reload();
                 }
                 self.failure = fx.error.map(|text| Failure {
@@ -968,9 +1006,24 @@ impl Page {
         );
     }
 
+    /// "Pasang ke tombol" was clicked; true when the bind should go out. A
+    /// target that holds another function needs a second, confirming click.
+    fn bind_clicked(&mut self, replaces: Option<Func>) -> bool {
+        if replaces.is_some() && !self.confirm_replace {
+            self.confirm_replace = true;
+            return false;
+        }
+        self.confirm_replace = false;
+        true
+    }
+
     fn submit_bind(&mut self, ctx: &AppCtx, key: u8, m: SavedMacro) {
         self.failure = None;
         self.bound = false;
+        self.confirm_replace = false;
+        self.bind_replaces = ctx
+            .snapshot
+            .is_some_and(|s| replaced_function(s, key).is_some());
         self.last_bind = Some((key, m.clone()));
         let actions = m.to_actions();
         let (mode, repeat, interval) = (m.play_mode(), m.repeat_count(), m.interval_ms);
@@ -1477,7 +1530,7 @@ impl Page {
         card::section(ui, strings::TARGET);
         self.target_row(ctx, ui);
         ui.add_space(6.0);
-        self.binding_row(ui);
+        self.binding_row(ctx, ui);
         ui.add_space(12.0);
         card::hint(ui, strings::WARN_REPLACE);
         card::hint(ui, strings::WARN_DELAY);
@@ -1532,8 +1585,16 @@ impl Page {
         }
     }
 
-    fn binding_row(&self, ui: &mut Ui) {
-        if self.target.is_none() {
+    fn binding_row(&self, ctx: &AppCtx, ui: &mut Ui) {
+        let Some(key) = self.target else {
+            return;
+        };
+        if let Some(f) = ctx.snapshot.and_then(|s| replaced_function(s, key)) {
+            ui.label(
+                RichText::new(replace_warning(f))
+                    .font(font::small())
+                    .color(color::ACCENT),
+            );
             return;
         }
         ui.horizontal_wrapped(|ui| {
@@ -1566,7 +1627,19 @@ impl Page {
         let current = self.current(ctx);
         let problem = current.as_ref().and_then(macro_problem);
         let can = idle && self.target.is_some() && current.is_some() && problem.is_none();
-        if card::primary_button(ui, strings::BIND, can).clicked() {
+        let replaces = match (ctx.snapshot, self.target) {
+            (Some(s), Some(k)) => replaced_function(s, k),
+            _ => None,
+        };
+        if replaces.is_none() {
+            self.confirm_replace = false;
+        }
+        let label = if self.confirm_replace {
+            strings::CONFIRM_REPLACE
+        } else {
+            strings::BIND
+        };
+        if card::primary_button(ui, label, can).clicked() && self.bind_clicked(replaces) {
             if let (Some(k), Some(m)) = (self.target, current) {
                 self.submit_bind(ctx, k, m);
             }
@@ -1652,6 +1725,7 @@ impl Page {
                 self.binding_for = None;
                 self.failure = None;
                 self.bound = false;
+                self.confirm_replace = false;
             }
         }
     }
@@ -2563,6 +2637,33 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn a_key_with_a_function_shows_it_and_needs_a_confirmed_bind() {
+        use crate::app::test_support::snapshot68;
+        use openhe_proto::key::Advanced;
+        let mut snap = snapshot68();
+        snap.keys.get_mut(&0x04).unwrap().mode.advanced = Advanced::Socd;
+        snap.keys.get_mut(&0x16).unwrap().mode.advanced = Advanced::Macro;
+        assert_eq!(replaced_function(&snap, 0x04), Some(Func::Socd));
+        assert_eq!(replaced_function(&snap, 0x16), None, "a macro is rebound");
+        assert_eq!(replaced_function(&snap, 0x1A), None);
+        let text = replace_warning(Func::Socd);
+        assert!(
+            text.contains("SOCD") && text.contains(strings::REPLACES_SOCD),
+            "{text}"
+        );
+        assert!(!replace_warning(Func::Mt).contains(strings::REPLACES_SOCD));
+
+        let mut page = Page::default();
+        // A key with a function: the first click only asks.
+        assert!(!page.bind_clicked(Some(Func::Socd)));
+        assert!(page.confirm_replace);
+        assert!(page.bind_clicked(Some(Func::Socd)), "confirmed");
+        assert!(!page.confirm_replace);
+        // A plain key binds at once.
+        assert!(page.bind_clicked(None));
     }
 
     #[test]
