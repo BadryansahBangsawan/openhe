@@ -26,12 +26,11 @@ impl Micrometers {
         if !mm.is_finite() {
             return Err(RangeError::NotFinite);
         }
-        // Go through the shortest decimal form so 1.13f32 is read as 1.13.
-        let mm: f64 = format!("{mm}").parse().map_err(|_| RangeError::NotFinite)?;
-        let um = (mm * 1000.0).round();
-        if um < 0.0 {
+        if mm < 0.0 {
             return Err(RangeError::Negative);
         }
+        // Widen to f64 first: f32 1.13 is 1.12999999523..., so 1129.99999523 rounds to 1130.
+        let um = (f64::from(mm) * 1000.0).round();
         if um > f64::from(u16::MAX) {
             return Err(RangeError::TooLarge);
         }
@@ -55,6 +54,9 @@ mod tests {
     fn rounds_not_truncates() {
         assert_eq!(Micrometers::from_mm(1.13), Ok(Micrometers(1130)));
         assert_eq!(Micrometers::from_mm(0.4), Ok(Micrometers(400)));
+        assert_eq!(Micrometers::from_mm(1.0006), Ok(Micrometers(1001)));
+        assert_eq!(Micrometers::from_mm(0.0005), Ok(Micrometers(1)));
+        assert_eq!(Micrometers::from_mm(1.0004), Ok(Micrometers(1000)));
     }
 
     #[test]
@@ -69,6 +71,7 @@ mod tests {
     #[test]
     fn rejects_negative_and_too_large() {
         assert_eq!(Micrometers::from_mm(-0.5), Err(RangeError::Negative));
+        assert_eq!(Micrometers::from_mm(-0.0004), Err(RangeError::Negative));
         assert_eq!(Micrometers::from_mm(65.536), Err(RangeError::TooLarge));
         assert_eq!(Micrometers::from_mm(65.535), Ok(Micrometers(65535)));
     }
