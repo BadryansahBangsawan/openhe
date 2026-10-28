@@ -575,7 +575,9 @@ impl KeyboardView {
             // Text stays inside the cap: the second line is elided to the
             // inner width, and the badge shrinks to a dot when it would
             // touch the legend.
-            let inner_w = (r.width() - 2.0 * pad.x + 2.0).max(4.0);
+            // Right margin smaller than the left: the text may run up to 3 px
+            // from the cap's edge.
+            let inner_w = (r.width() - pad.x - 3.0).max(4.0);
             let legend_right = if let Some(dir) = arrow_dir(k.code) {
                 paint_arrow(
                     &painter,
