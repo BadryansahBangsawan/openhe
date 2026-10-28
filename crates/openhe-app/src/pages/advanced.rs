@@ -1197,7 +1197,11 @@ impl Page {
         });
         let nibble = |k: u8| snap.keys.get(&k).map(|s| s.mode.advanced);
         // Never edit one key with another key's form.
-        if self.editor.as_ref().is_some_and(|e| Some(e.key) != self.key) {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| Some(e.key) != self.key)
+        {
             self.editor = None;
             self.picking_partner = false;
         }

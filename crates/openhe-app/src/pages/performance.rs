@@ -179,6 +179,66 @@ pub fn max_travel(snap: &DeviceSnapshot, keys: &[u8], form: &Form, touched: &Tou
         .unwrap_or(SAFE_MAX_TRAVEL_UM)
 }
 
+/// One batch of an apply: the keys and the change they all get.
+pub type Batch = (Vec<u8>, PerformanceChange);
+
+/// Which of a key's own (untouched) travel values exceed `max`.
+fn over(s: &KeySettings, base: &PerformanceChange, max: u16) -> [bool; 3] {
+    [
+        base.actuation.is_none() && s.actuation.0 > max,
+        base.rt_press.is_none() && s.rt_press.0 > max,
+        base.rt_release.is_none() && s.rt_release.0 > max,
+    ]
+}
+
+/// The writes for an apply: [`build_change`] for every key and, when the
+/// switch changes, each key's own untouched travel values beyond the new
+/// switch clamped to it (`set_performance` refuses to keep them, and the
+/// form only shows the first key's values). Keys needing the same clamps
+/// share a batch; the key order is kept.
+pub fn plan_changes(
+    snap: &DeviceSnapshot,
+    keys: &[u8],
+    form: &Form,
+    touched: &Touched,
+) -> Vec<Batch> {
+    let base = build_change(form, touched);
+    if !touched.switch {
+        return vec![(keys.to_vec(), base)];
+    }
+    let max = switch_max(snap.model, form.switch);
+    let mut groups: Vec<([bool; 3], Vec<u8>)> = Vec::new();
+    for &k in keys {
+        let o = snap
+            .keys
+            .get(&k)
+            .map_or([false; 3], |s| over(s, &base, max));
+        match groups.iter_mut().find(|(g, _)| *g == o) {
+            Some((_, ks)) => ks.push(k),
+            None => groups.push((o, vec![k])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|([a, p, r], ks)| {
+            let mut c = base.clone();
+            let clamp = |on: bool| on.then_some(Micrometers(max));
+            c.actuation = c.actuation.or(clamp(a));
+            c.rt_press = c.rt_press.or(clamp(p));
+            c.rt_release = c.rt_release.or(clamp(r));
+            (ks, c)
+        })
+        .collect()
+}
+
+/// Some selected key has its own value beyond the chosen switch's travel.
+fn needs_clamp(snap: &DeviceSnapshot, keys: &[u8], form: &Form, touched: &Touched) -> bool {
+    touched.switch
+        && plan_changes(snap, keys, form, touched)
+            .iter()
+            .any(|(_, c)| *c != build_change(form, touched))
+}
+
 /// What the apply job hands back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
@@ -202,13 +262,30 @@ pub fn apply_job<T: Transport>(
     keys: &[u8],
     change: &PerformanceChange,
 ) -> Result<ApplyOutcome, Error> {
-    let write = kb.set_performance(keys, change);
+    apply_plan_job(kb, &[(keys.to_vec(), change.clone())])
+}
+
+/// [`apply_job`] for a plan of several batches ([`plan_changes`]): they are
+/// written in order, stopping at the first failure, then every key of the
+/// plan is re-read.
+pub fn apply_plan_job<T: Transport>(
+    kb: &mut Keyboard<T>,
+    plan: &[Batch],
+) -> Result<ApplyOutcome, Error> {
+    let mut write = Ok(());
+    for (keys, change) in plan {
+        write = kb.set_performance(keys, change);
+        if write.is_err() {
+            break;
+        }
+    }
     if write == Err(Error::Disconnected) {
         return Err(Error::Disconnected);
     }
+    let keys: Vec<u8> = plan.iter().flat_map(|(k, _)| k.iter().copied()).collect();
     let mut reloaded = Vec::with_capacity(keys.len());
     let mut reload_error = None;
-    for &k in keys {
+    for &k in &keys {
         match kb.key_settings(k) {
             Ok(s) => reloaded.push((k, s)),
             Err(Error::Disconnected) => return Err(Error::Disconnected),
@@ -319,7 +396,7 @@ pub struct Page {
     /// Profile and connection count when the pending job was submitted.
     sent_on: Option<SentOn>,
     /// The last change sent, for "Coba lagi".
-    last_sent: Option<(Vec<u8>, PerformanceChange)>,
+    last_sent: Option<Vec<Batch>>,
     error: Option<String>,
     error_technical: Option<String>,
     applied: bool,
@@ -489,15 +566,15 @@ impl Page {
         }
     }
 
-    fn submit(&mut self, ctx: &AppCtx, keys: Vec<u8>, change: PerformanceChange) {
+    fn submit(&mut self, ctx: &AppCtx, plan: Vec<Batch>) {
         self.error = None;
         self.applied = false;
-        self.last_sent = Some((keys.clone(), change.clone()));
+        self.last_sent = Some(plan.clone());
         self.error_technical = None;
         self.sent_on = SentOn::now(ctx);
         self.pending = Some(
             ctx.worker
-                .submit("performance-apply", move |kb| apply_job(kb, &keys, &change)),
+                .submit("performance-apply", move |kb| apply_plan_job(kb, &plan)),
         );
     }
 
@@ -787,6 +864,9 @@ impl Page {
 
         let max = max_travel(snap, &codes, &self.form, &self.touched);
         self.clamp_to(max);
+        if needs_clamp(snap, &codes, &self.form, &self.touched) {
+            self.clamped = true;
+        }
         if self.clamped {
             card::hint(ui, format!("{} {} mm.", t::CLAMPED, mm_short(max)));
         }
@@ -911,10 +991,11 @@ impl Page {
         card::hint(ui, t::SWITCH_HINT);
     }
 
-    /// After the user picks a switch with less travel, values beyond it are
-    /// clamped **and marked touched**, so the clamped value is what gets
-    /// sent (`set_performance` would refuse to keep them) and a note says
-    /// so. Without a switch change nothing is clamped: a value outside the
+    /// After the user picks a switch with less travel, the form's values
+    /// beyond it are clamped for display and a note says so. They are not
+    /// marked touched: [`plan_changes`] clamps each selected key's own value
+    /// (the form only shows the first key's), so other keys keep theirs.
+    /// Without a switch change nothing is clamped: a value outside the
     /// slider's range (another selected key's switch) is shown as it is and
     /// is not sent unless edited.
     fn clamp_to(&mut self, max: u16) {
@@ -924,13 +1005,11 @@ impl Page {
         let f = &mut self.form;
         if f.actuation > max {
             f.actuation = max;
-            self.touched.actuation = true;
             self.clamped = true;
         }
         if f.rt_press > max || f.rt_release > max {
             f.rt_press = f.rt_press.min(max);
             f.rt_release = f.rt_release.min(max);
-            self.touched.rt = true;
             self.clamped = true;
         }
     }
@@ -947,8 +1026,8 @@ impl Page {
                 self.error_technical.as_deref(),
             );
             if clicked {
-                if let Some((keys, change)) = self.last_sent.clone() {
-                    self.submit(ctx, keys, change);
+                if let Some(plan) = self.last_sent.clone() {
+                    self.submit(ctx, plan);
                 }
             }
             ui.add_space(8.0);
@@ -957,8 +1036,11 @@ impl Page {
         let can_apply = idle && !self.selection.is_empty() && self.touched.any();
         if card::primary_button(ui, t::APPLY, can_apply).clicked() {
             let keys = self.ordered(ctx);
-            let change = build_change(&self.form, &self.touched);
-            self.submit(ctx, keys, change);
+            let plan = match ctx.snapshot {
+                Some(snap) => plan_changes(snap, &keys, &self.form, &self.touched),
+                None => vec![(keys, build_change(&self.form, &self.touched))],
+            };
+            self.submit(ctx, plan);
         }
         ui.add_space(6.0);
         ui.vertical_centered(|ui| {
@@ -1608,7 +1690,7 @@ mod tests {
                 theme: &theme,
                 data: &data,
             };
-            page.submit(&app_ctx, page.selection.codes(), change.clone());
+            page.submit(&app_ctx, vec![(page.selection.codes(), change.clone())]);
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while page.pending.is_some() {
@@ -1616,7 +1698,10 @@ mod tests {
             frame(&mut page, 1);
         }
         assert_eq!(page.error.as_deref(), Some(t::PARTIAL_WRITE));
-        assert_eq!(page.last_sent, Some((vec![0x04, 0x07, 0x16, 0x1A], change)));
+        assert_eq!(
+            page.last_sent,
+            Some(vec![(vec![0x04, 0x07, 0x16, 0x1A], change)])
+        );
         assert!(page.touched.actuation, "edits survive a failed apply");
         assert_eq!(page.form.actuation, 550);
         frame(&mut page, 2); // the error box renders without panicking
@@ -1842,13 +1927,56 @@ mod tests {
         page.clamp_to(3300);
         assert_eq!(page.form.actuation, 3400);
         assert!(!page.touched.any() && !page.clamped);
-        // After choosing a 3.3 mm switch both values are clamped and sent.
+        // After choosing a 3.3 mm switch the form shows the clamped values;
+        // they are sent per key by `plan_changes`, not as edits.
         page.touched.switch = true;
         page.clamp_to(3300);
         assert_eq!((page.form.actuation, page.form.rt_press), (3300, 3300));
-        assert!(page.touched.actuation && page.touched.rt && page.clamped);
-        let c = build_change(&page.form, &page.touched);
-        assert_eq!(c.actuation, Some(Micrometers(3300)));
+        assert!(page.clamped);
+        assert!(!page.touched.actuation && !page.touched.rt);
+    }
+
+    #[test]
+    fn a_switch_change_clamps_each_keys_own_values() {
+        let mut long = settings(TouchMode::RapidTrigger, 3400, 0);
+        long.rt_release = Micrometers(3400);
+        let short = settings(TouchMode::Single, 1000, 0);
+        let s = snap(&[(0x14, short), (0x1A, long), (0x04, short)]);
+        let form = Form {
+            switch: 3, // Magneto, 3.3 mm
+            ..Form::from_keys(&[0x14], &s).unwrap()
+        };
+        // Only the switch: Q and A keep their values, W is clamped.
+        let touched = Touched {
+            switch: true,
+            ..Touched::default()
+        };
+        let plan = plan_changes(&s, &[0x14, 0x1A, 0x04], &form, &touched);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].0, vec![0x14, 0x04]);
+        assert_eq!(plan[0].1.actuation, None);
+        assert_eq!(plan[0].1.switch, Some(3));
+        assert_eq!(plan[1].0, vec![0x1A]);
+        assert_eq!(plan[1].1.actuation, Some(Micrometers(3300)));
+        assert_eq!(plan[1].1.rt_press, None, "0.15 mm fits");
+        assert_eq!(plan[1].1.rt_release, Some(Micrometers(3300)));
+        assert!(needs_clamp(&s, &[0x14, 0x1A], &form, &touched));
+        assert!(!needs_clamp(&s, &[0x14, 0x04], &form, &touched));
+        // An edited actuation goes to every key as it is; W's release is
+        // still clamped.
+        let touched = Touched {
+            actuation: true,
+            ..touched
+        };
+        let plan = plan_changes(&s, &[0x14, 0x1A], &form, &touched);
+        assert_eq!(plan.len(), 2);
+        assert!(plan
+            .iter()
+            .all(|(_, c)| c.actuation == Some(Micrometers(1000))));
+        assert_eq!(plan[1].1.rt_release, Some(Micrometers(3300)));
+        // Without a switch change there is one batch, nothing added.
+        let plan = plan_changes(&s, &[0x14, 0x1A], &form, &Touched::default());
+        assert_eq!(plan, vec![(vec![0x14, 0x1A], PerformanceChange::default())]);
     }
 
     #[test]

@@ -120,6 +120,30 @@ fn a_rejected_write_shows_the_error_and_the_values_the_keyboard_kept() {
     assert!(!w.has("Gagal menerapkan"));
 }
 
+/// A shorter switch on several keys: a key other than the first one may
+/// hold values beyond it. Each key is clamped to the new travel, the others
+/// keep their own values, and the write goes through.
+#[test]
+fn a_shorter_switch_on_several_keys_clamps_every_key() {
+    let mut w = World::new();
+    w.click_key(W, false);
+    w.edit_value("2.000 mm", 0, "3.4");
+    w.apply("Terapkan ke keyboard");
+    assert_eq!(w.sim().p().key(W, ACT), 3400);
+    w.click_key(0x14, false);
+    w.click_key(W, true);
+    w.click_role(Role::ComboBox, 0);
+    w.click_text("Magneto");
+    assert!(w.has_text("disesuaikan ke batasnya"), "{:?}", w.labels());
+    w.apply("Terapkan ke keyboard");
+    assert!(!w.has("Gagal menerapkan"), "{:?}", w.labels());
+    let s = w.sim();
+    assert_eq!(s.p().key(0x14, AXIS), 3);
+    assert_eq!(s.p().key(W, AXIS), 3);
+    assert_eq!(s.p().key(W, ACT), 3300, "W clamped");
+    assert_eq!(s.p().key(0x14, ACT), 2000, "Q keeps its own value");
+}
+
 /// Top-bar switch to profile `label` ("3"), waiting for the reconnect.
 fn switch_profile(w: &mut World, label: &str) {
     let want: u8 = label.parse::<u8>().unwrap() - 1;
