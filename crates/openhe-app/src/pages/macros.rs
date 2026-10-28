@@ -764,17 +764,22 @@ fn mode_desc(m: PlayMode) -> &'static str {
     }
 }
 
-/// "6 langkah · Sekali per tekan · 1× · 100 ms".
+/// "6 langkah · Sekali per tekan · 1× · 100 ms". The step count is left
+/// out when the keyboard reports len 0, which FW App V1.1.3 always does
+/// (PROTOCOL 7.x finding 24).
 pub fn binding_text(b: &MacroBinding) -> String {
-    format!(
-        "{} {} · {} · {}× · {} {}",
-        b.len,
-        strings::STEPS,
+    let rest = format!(
+        "{} · {}× · {} {}",
         mode_title(b.mode),
         b.repeat,
         b.interval_ms,
         strings::MS
-    )
+    );
+    if b.len == 0 {
+        rest
+    } else {
+        format!("{} {} · {rest}", b.len, strings::STEPS)
+    }
 }
 
 // ------------------------------------------------------------------ page
@@ -2723,6 +2728,20 @@ mod tests {
             binding_text(&b),
             "6 langkah · Sekali per tekan · 1× · 100 ms"
         );
+    }
+
+    /// The keyboard reports len 0 (PROTOCOL 7.x finding 24): no "0 langkah".
+    #[test]
+    fn a_binding_without_a_known_length_leaves_the_step_count_out() {
+        let b = MacroBinding {
+            len: 0,
+            mode: PlayMode::Toggle,
+            repeat: 2,
+            interval_ms: 50,
+        };
+        let text = binding_text(&b);
+        assert!(!text.contains(strings::STEPS), "{text}");
+        assert!(text.starts_with(mode_title(PlayMode::Toggle)), "{text}");
     }
 
     #[test]

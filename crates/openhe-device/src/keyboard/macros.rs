@@ -44,8 +44,10 @@ impl<T: Transport> Keyboard<T> {
     /// 4. write Mode as `(touch << 4) | 6`, keeping the key's current touch mode
     ///    and high byte, verified by a read-back;
     /// 5. write MACRO_MODE;
-    /// 6. read MACRO_MODE back and compare it with what was written
-    ///    ("verify failed" `Error::Io` on a difference).
+    /// 6. read MACRO_MODE back and compare mode, repeat and interval with
+    ///    what was written ("verify failed" `Error::Io` on a difference).
+    ///    `len` is not compared: FW App V1.1.3 reports len 0 in the read-back
+    ///    although the other fields are right (PROTOCOL 7.x finding 24).
     ///
     /// The action data itself has no read-back command, so step 3 is confirmed
     /// by the keyboard's replies only.
@@ -88,7 +90,12 @@ impl<T: Transport> Keyboard<T> {
             interval_ms,
         };
         let got = self.read_macro_mode(key)?;
-        if got != want {
+        // The firmware does not echo len (it reads back 0): compare the rest.
+        let same = MacroBinding {
+            len: want.len,
+            ..got
+        };
+        if same != want {
             return Err(Error::Io(format!(
                 "verify failed: macro mode of key 0x{key:02X}: wrote {want:?}, read {got:?}"
             )));
@@ -97,7 +104,9 @@ impl<T: Transport> Keyboard<T> {
     }
 
     /// The macro bound to `key`, or `None` when the key's advanced mode is not
-    /// Macro (a single KEY read in that case).
+    /// Macro (a single KEY read in that case). `len` is what the keyboard
+    /// reports, which is 0 on FW App V1.1.3 (PROTOCOL 7.x finding 24), so do
+    /// not rely on it.
     pub fn macro_binding(&mut self, key: u8) -> Result<Option<MacroBinding>, Error> {
         if self.macro_key_mode(key)?.advanced != Advanced::Macro {
             return Ok(None);
@@ -215,6 +224,47 @@ mod tests {
         ); // MACRO_MODE SET: len 10, WhileHeld, repeat 2, 100 ms
         assert_eq!(w[6][2], 0x21);
         assert_eq!(w[6][4], 0x00, "MACRO_MODE GET uses flag 00");
+    }
+
+    /// FW App V1.1.3: MACRO_MODE GET reports len 0 after a bind while mode,
+    /// repeat and interval read back right (PROTOCOL 7.x finding 24). The
+    /// verify ignores len.
+    #[test]
+    fn a_read_back_with_len_zero_still_verifies() {
+        let two = [act(4, true, 0), act(4, false, 10)];
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(KEY, 8, 0x0000)); // Mode read
+        m.push_reply(data_reply());
+        m.push_reply(key_reply(KEY, 8, 0x0006)); // Mode SET echo
+        m.push_reply(key_reply(KEY, 8, 0x0006)); // Mode read-back
+        m.push_reply(mode_reply(KEY, 2, PlayMode::Toggle, 3, 50)); // SET reply
+        m.push_reply(mode_reply(KEY, 0, PlayMode::Toggle, 3, 50)); // GET: len 0
+        assert_eq!(kb(m).bind_macro(KEY, &two, PlayMode::Toggle, 3, 50), Ok(()));
+    }
+
+    #[test]
+    fn a_read_back_with_another_mode_repeat_or_interval_still_fails() {
+        let two = [act(4, true, 0), act(4, false, 10)];
+        for got in [
+            mode_reply(KEY, 0, PlayMode::Once, 3, 50),
+            mode_reply(KEY, 2, PlayMode::Toggle, 4, 50),
+            mode_reply(KEY, 2, PlayMode::Toggle, 3, 51),
+        ] {
+            let mut m = MockTransport::new();
+            m.push_reply(key_reply(KEY, 8, 0x0000));
+            m.push_reply(data_reply());
+            m.push_reply(key_reply(KEY, 8, 0x0006));
+            m.push_reply(key_reply(KEY, 8, 0x0006));
+            m.push_reply(mode_reply(KEY, 2, PlayMode::Toggle, 3, 50));
+            m.push_reply(got);
+            let e = kb(m)
+                .bind_macro(KEY, &two, PlayMode::Toggle, 3, 50)
+                .unwrap_err();
+            assert!(
+                matches!(&e, Error::Io(s) if s.starts_with("verify failed")),
+                "{e:?}"
+            );
+        }
     }
 
     #[test]
