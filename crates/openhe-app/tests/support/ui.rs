@@ -303,8 +303,14 @@ impl World {
 
     /// Clicks `label` and waits until the worker is idle again.
     pub fn apply(&mut self, label: &str) {
+        let before = self.sim().log.len();
         self.click(label);
-        self.frames(2);
+        // The job may reach the worker a frame or two later on a slow
+        // machine; waiting for "idle" alone could return before it started.
+        self.until("the apply wrote to the keyboard", 10, |w| {
+            w.frames(1);
+            w.sim().log.len() > before
+        });
         self.idle();
     }
 }

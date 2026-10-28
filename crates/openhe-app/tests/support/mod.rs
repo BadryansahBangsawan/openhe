@@ -43,6 +43,7 @@ pub fn private_home() -> &'static PathBuf {
         std::env::set_var("HOME", &dir);
         std::env::set_var("XDG_CONFIG_HOME", dir.join(".config"));
         std::env::set_var("APPDATA", dir.join("AppData"));
+        std::env::set_var("OPENHE_DATA_DIR", dir.join("OpenHE"));
         dir
     });
     let data = AppData::default_dir().expect("config dir");

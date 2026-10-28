@@ -179,6 +179,11 @@ impl AppData {
 
     /// The OS config directory for OpenHE, if the platform has one.
     pub fn default_dir() -> Option<PathBuf> {
+        // Tests point this at a private folder: on Windows the per-user
+        // folders come from the shell, not from HOME or APPDATA.
+        if let Some(dir) = std::env::var_os("OPENHE_DATA_DIR").filter(|d| !d.is_empty()) {
+            return Some(PathBuf::from(dir));
+        }
         directories::ProjectDirs::from("dev", "OpenHE", "OpenHE")
             .map(|d| d.config_dir().to_path_buf())
     }
