@@ -461,6 +461,8 @@ To delete any advanced function: KEY SET LAYOUT 8 = 0.
   [5..32]  7 colours × (B, G, R, 0xFF)       <- note BGR order
   [33..36] 00 00 00 00
   [37]     flags: bit0 on/off, bit1 direction(reverse), bit4 "superResponse" (UI always 1)
+           other bits unknown; a real keyboard reported 0xC1 (bits 6, 7 set, bit4 clear).
+           OpenHE keeps every bit except 0 and 1 as read and writes them back (7.x finding 22)
   [38]     brightness 0..4   (UI levels 1..5)
   [39]     mode: 0 static, 1..20 dynamic effects, 21 custom per-key
   [40]     speed 0..4        (UI 1..5; forced 0 for static/custom)

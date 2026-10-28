@@ -91,7 +91,16 @@ pub struct Lighting {
     /// 0 = colourful, n = `colors[n - 1]`; up to 7.
     pub dynamic_color: u8,
     pub colors: [Rgb; COLOR_SLOTS],
+    /// The flag bits other than on (bit0) and reverse (bit1), kept as the
+    /// keyboard reported them so a SET of a read value writes them back
+    /// unchanged (a real keyboard reported 0xC1: bits 6 and 7 set, bit4
+    /// clear). [`DEFAULT_EXTRA_FLAGS`] for a state built from scratch.
+    pub extra_flags: u8,
 }
+
+/// `extra_flags` of a lighting state that was not read from the keyboard:
+/// bit4 ("superResponse"), which the official app always sets.
+pub const DEFAULT_EXTRA_FLAGS: u8 = FLAG_ALWAYS;
 
 impl Lighting {
     /// Checks every field against the ranges the firmware accepts.
@@ -143,7 +152,9 @@ const OFF_STATIC: usize = 42;
 const OFF_DYNAMIC: usize = 43;
 const PRGB_LEN: usize = 44;
 
-/// PRGB SET (flag 01), LEN 44. Fails on any out-of-range field.
+/// PRGB SET (flag 01), LEN 44. Fails on any out-of-range field. The flags
+/// byte is `extra_flags` with on (bit0) and reverse (bit1) set from `on` and
+/// `reverse`.
 pub fn set(l: &Lighting) -> Result<Request, LightingError> {
     l.validate()?;
     let mut p = vec![0u8; PRGB_LEN];
@@ -152,8 +163,9 @@ pub fn set(l: &Lighting) -> Result<Request, LightingError> {
         let o = OFF_COLORS + i * 4;
         p[o..o + 4].copy_from_slice(&[c.b, c.g, c.r, 0xFF]);
     }
-    p[OFF_FLAGS] =
-        FLAG_ALWAYS | if l.on { FLAG_ON } else { 0 } | if l.reverse { FLAG_REVERSE } else { 0 };
+    p[OFF_FLAGS] = (l.extra_flags & !(FLAG_ON | FLAG_REVERSE))
+        | if l.on { FLAG_ON } else { 0 }
+        | if l.reverse { FLAG_REVERSE } else { 0 };
     p[OFF_BRIGHTNESS] = l.brightness;
     p[OFF_MODE] = l.mode;
     p[OFF_SPEED] = l.wire_speed();
@@ -191,8 +203,9 @@ pub fn get() -> Request {
 /// `SLEEP_MINUTES` or a colour index above 7 is an error (the same
 /// `LightingError` as validation), never clamped, so a value the keyboard
 /// should not report is never written back as something else. Flag bits
-/// other than bit0 (on) and bit1 (reverse) are ignored: a real reply had
-/// flags 0xC1 (bits 6 and 7 set, bit4 clear).
+/// other than bit0 (on) and bit1 (reverse) are not checked; they are kept
+/// in `extra_flags` (a real reply had flags 0xC1: bits 6 and 7 set, bit4
+/// clear).
 pub fn parse(r: &Response) -> Result<Lighting, LightingError> {
     if r.cmd != Cmd::Prgb as u8 {
         return Err(LightingError::WrongReply("PRGB"));
@@ -218,6 +231,7 @@ pub fn parse(r: &Response) -> Result<Lighting, LightingError> {
         static_color: b[OFF_STATIC],
         dynamic_color: b[OFF_DYNAMIC],
         colors,
+        extra_flags: flags & !(FLAG_ON | FLAG_REVERSE),
     };
     l.validate()?;
     Ok(l)
@@ -294,6 +308,7 @@ mod tests {
                 rgb(0xAA, 0xBB, 0xCC),
                 rgb(0, 0, 0),
             ],
+            extra_flags: DEFAULT_EXTRA_FLAGS,
         }
     }
 
@@ -441,6 +456,19 @@ mod tests {
             let mut body = set(&sample()).unwrap().payload;
             body[at] = v;
             assert_eq!(parse(&reply(0x18, &body)), Err(want), "byte {at} = {v}");
+        }
+    }
+
+    /// Flags the keyboard reported (0xC1: bits 6 and 7 set, bit4 clear) go
+    /// back unchanged, so a read value can be restored exactly.
+    #[test]
+    fn unknown_flag_bits_survive_a_parse_and_set() {
+        for flags in [0xC1u8, 0xC3, 0xC0, 0x10, 0x00, 0xFF] {
+            let mut body = set(&sample()).unwrap().payload;
+            body[37] = flags;
+            let read = parse(&reply(0x18, &body)).unwrap();
+            let again = set(&read).unwrap().payload;
+            assert_eq!(again[1..], body[1..], "flags {flags:#04X}");
         }
     }
 

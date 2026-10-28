@@ -136,6 +136,18 @@ fn real_prgb_reply_parses_with_unknown_flag_bits() {
                 rgb(0, 0x7F, 0x7F),
                 rgb(0x7F, 0x7F, 0x7F),
             ],
+            extra_flags: 0xC0,
         })
     );
+}
+
+#[test]
+fn the_real_prgb_reply_is_written_back_byte_for_byte() {
+    use openhe_proto::lighting::{parse, set};
+    let r = Response::decode(&raw(PRGB_REPLY)).unwrap();
+    let l = parse(&r).unwrap();
+    let p = set(&l).unwrap().payload;
+    assert_eq!(p[0], 0x01, "SET flag");
+    assert_eq!(p[37], 0xC1, "flags as read: bits 6/7 kept, bit4 clear");
+    assert_eq!(p[1..44], r.body()[1..44]);
 }

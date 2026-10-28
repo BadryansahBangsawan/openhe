@@ -31,7 +31,9 @@ use eframe::egui::{
     Ui,
 };
 use openhe_device::{Error, Keyboard, Transport};
-use openhe_proto::lighting::{Lighting, Rgb, EFFECTS, MODE_CUSTOM, MODE_STATIC, SLEEP_MINUTES};
+use openhe_proto::lighting::{
+    Lighting, Rgb, DEFAULT_EXTRA_FLAGS, EFFECTS, MODE_CUSTOM, MODE_STATIC, SLEEP_MINUTES,
+};
 use std::collections::BTreeMap;
 
 mod strings {
@@ -195,6 +197,9 @@ pub struct Form {
     pub static_color: ColorChoice,
     pub dynamic_color: ColorChoice,
     pub colors: [Rgb; 7],
+    /// Flag bits the page does not edit, kept as read so applying writes
+    /// them back unchanged (`Lighting::extra_flags`).
+    pub extra_flags: u8,
 }
 
 impl Default for Form {
@@ -209,6 +214,7 @@ impl Default for Form {
             static_color: ColorChoice::Colorful,
             dynamic_color: ColorChoice::Colorful,
             colors: DEFAULT_PALETTE,
+            extra_flags: DEFAULT_EXTRA_FLAGS,
         }
     }
 }
@@ -265,6 +271,7 @@ impl Form {
             static_color: ColorChoice::from_static(l.static_color),
             dynamic_color: ColorChoice::from_dynamic(l.dynamic_color),
             colors: l.colors,
+            extra_flags: l.extra_flags,
         }
     }
 
@@ -285,6 +292,7 @@ impl Form {
             static_color: self.static_color.to_static(),
             dynamic_color: self.dynamic_color.to_dynamic(),
             colors: self.colors,
+            extra_flags: self.extra_flags,
         }
     }
 
@@ -1825,10 +1833,23 @@ mod tests {
             static_color: 7,
             dynamic_color: 3,
             colors: DEFAULT_PALETTE,
+            extra_flags: 0xC0,
         }
     }
 
     // ---- UI state <-> Lighting
+
+    #[test]
+    fn unknown_flag_bits_pass_through_the_form() {
+        // Read from the keyboard: kept, so applying writes them back.
+        let f = Form::from_lighting(&sample());
+        assert_eq!(f.to_lighting().extra_flags, 0xC0);
+        // Built from scratch: the official app's 0x10, as before.
+        let fresh = Form::default().to_lighting();
+        assert_eq!(fresh.extra_flags, 0x10);
+        let p = openhe_proto::lighting::set(&fresh).unwrap().payload;
+        assert_eq!(p[37], 0x11, "on + bit4");
+    }
 
     #[test]
     fn brightness_and_speed_map_one_to_five_onto_zero_to_four() {

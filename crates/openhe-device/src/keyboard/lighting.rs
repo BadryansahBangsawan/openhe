@@ -148,6 +148,7 @@ mod tests {
                 rgb(0xAA, 0xBB, 0xCC),
                 rgb(0, 0, 0),
             ],
+            extra_flags: lighting::DEFAULT_EXTRA_FLAGS,
         }
     }
 
@@ -223,6 +224,27 @@ mod tests {
         let mut m = MockTransport::new();
         m.fail_with(Error::Disconnected);
         assert_eq!(kb(m).lighting(), Err(Error::Disconnected));
+    }
+
+    #[test]
+    fn a_read_lighting_with_unknown_flags_is_written_back_and_verified() {
+        let mut body = lighting::set(&sample()).unwrap().payload;
+        body[0] = 0;
+        body[37] = 0xC1;
+        let mut m = MockTransport::new();
+        m.push_reply(reply(0x7F, &[])); // RGBNACK rejected
+        m.push_reply(reply(0x18, &body));
+        let mut k = kb(m);
+        let read = k.lighting().unwrap();
+        let m = k.session_mut().transport_mut();
+        m.push_reply(reply(0x18, &body)); // SET reply
+        m.push_reply(reply(0x7F, &[]));
+        m.push_reply(reply(0x18, &body)); // read-back
+        assert_eq!(k.set_lighting(&read), Ok(()));
+        let w = k.session_mut().transport().written();
+        assert_eq!(w[2][4], 0x01, "the SET");
+        assert_eq!(w[2][4 + 37], 0xC1);
+        assert_eq!(w[2][5..48], body[1..44]);
     }
 
     #[test]

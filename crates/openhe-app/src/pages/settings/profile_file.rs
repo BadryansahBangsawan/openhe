@@ -18,7 +18,7 @@ use openhe_device::keyboard::performance::{MAX_DEADZONE_UM, MIN_RT_UM};
 use openhe_device::{AdvancedConfig, Error, KeySettings, Keyboard, PerformanceChange, Transport};
 use openhe_proto::advanced::{self, Dks, End, Mpt, Mt, Socd, SocdMode, Tgl};
 use openhe_proto::key::{Advanced, KeyMode};
-use openhe_proto::lighting::{Lighting, Rgb, COLOR_SLOTS};
+use openhe_proto::lighting::{Lighting, Rgb, COLOR_SLOTS, DEFAULT_EXTRA_FLAGS};
 use openhe_proto::model::MIN_ACTUATION_UM;
 use openhe_proto::{Layer, Micrometers, Model, TouchMode};
 use serde::{Deserialize, Serialize};
@@ -195,6 +195,14 @@ pub struct LightingEntry {
     pub dynamic_color: u8,
     /// Seven `[r, g, b]` colours.
     pub colors: Vec<[u8; 3]>,
+    /// Flag bits other than on and reverse, as the keyboard reported them.
+    /// Files without it (older exports) get the default 0x10.
+    #[serde(default = "default_extra_flags")]
+    pub extra_flags: u8,
+}
+
+fn default_extra_flags() -> u8 {
+    DEFAULT_EXTRA_FLAGS
 }
 
 /// Why a file cannot be used (shown to the user in Indonesian).
@@ -369,6 +377,7 @@ impl ProfileFile {
                 static_color: l.static_color,
                 dynamic_color: l.dynamic_color,
                 colors: l.colors.iter().map(|c| [c.r, c.g, c.b]).collect(),
+                extra_flags: l.extra_flags,
             }),
             key_colors: d
                 .key_colors
@@ -441,6 +450,7 @@ impl ProfileFile {
                     static_color: l.static_color,
                     dynamic_color: l.dynamic_color,
                     colors,
+                    extra_flags: l.extra_flags,
                 };
                 lighting
                     .validate()
@@ -864,6 +874,7 @@ mod tests {
                     g: 178,
                     b: 36,
                 }; COLOR_SLOTS],
+                extra_flags: 0xC0,
             }),
             key_colors: vec![(0x1A, Rgb { r: 1, g: 2, b: 3 })],
         }
@@ -879,6 +890,17 @@ mod tests {
         let back = ProfileFile::from_json(&json).unwrap();
         assert_eq!(back, file);
         assert_eq!(back.to_data().unwrap(), data);
+    }
+
+    #[test]
+    fn lighting_flag_bits_round_trip_and_old_files_get_the_default() {
+        let file = ProfileFile::from_data(&sample());
+        let json = file.to_json();
+        assert!(json.contains("\"extra_flags\": 192"));
+        // A file written before the field existed: the old 0x10 behaviour.
+        let old = json.replace("\"extra_flags\": 192", "\"extra_flags_gone\": 0");
+        let back = ProfileFile::from_json(&old).unwrap().to_data().unwrap();
+        assert_eq!(back.lighting.unwrap().extra_flags, 0x10);
     }
 
     #[test]
