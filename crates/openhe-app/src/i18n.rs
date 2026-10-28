@@ -4,6 +4,9 @@
 /// App-wide strings.
 pub mod common {
     pub const APP_NAME: &str = "OpenHE";
+    pub const ALREADY_RUNNING: &str = "OpenHE sudah berjalan";
+    pub const ALREADY_RUNNING_BODY: &str =
+        "OpenHE sudah terbuka di jendela lain. Pakai jendela itu: hanya satu OpenHE yang boleh terhubung ke keyboard.";
     pub const COMING_SOON: &str = "Segera hadir";
     pub const COMING_SOON_BODY: &str =
         "Halaman ini sedang dibuat. Pengaturan lain sudah bisa dipakai.";

@@ -29,6 +29,10 @@ rfd = "0.17.2"
 auto-launch = "0.6.0"
 # Foreground app name for per-app profile switching.
 active-win-pos-rs = "0.11.0"
+# Single-instance guard: an advisory lock on a file in the config dir
+# (flock / LockFileEx), released by the OS when the process ends, also after
+# a crash. rust-version 1.75; only its default `sync` feature.
+fs4 = "1.1.0"
 
 [features]
 # Hooks that put pages into demo states, for offscreen screenshots only.
