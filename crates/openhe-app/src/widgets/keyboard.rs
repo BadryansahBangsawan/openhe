@@ -337,14 +337,65 @@ fn paint_arrow(p: &egui::Painter, center: Pos2, len: f32, dir: Vec2, c: Color32)
     p.line_segment([tip, back - side], stroke);
 }
 
+/// The second line of a key cap: its text and, optionally, its own colour
+/// (otherwise muted, or the accent on a selected key). Built from a string
+/// with `.into()`; reads as `&str` (`label2.as_deref()`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Label2 {
+    pub text: String,
+    pub color: Option<Color32>,
+}
+
+impl Label2 {
+    /// A second line in its own colour (e.g. a green "✔").
+    pub fn colored(text: impl Into<String>, color: Color32) -> Label2 {
+        Label2 {
+            text: text.into(),
+            color: Some(color),
+        }
+    }
+}
+
+impl From<&str> for Label2 {
+    fn from(text: &str) -> Label2 {
+        Label2 {
+            text: text.to_string(),
+            color: None,
+        }
+    }
+}
+
+impl From<String> for Label2 {
+    fn from(text: String) -> Label2 {
+        Label2 { text, color: None }
+    }
+}
+
+impl std::ops::Deref for Label2 {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+/// One line of `text`, cut with "…" to `width`.
+fn elided(text: &str, font: FontId, c: Color32, width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::simple(text.to_string(), font, c, width);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    job
+}
+
 /// Per-key extras drawn by the page.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KeyDecoration {
-    /// Second line under the legend (e.g. "1.20").
-    pub label2: Option<String>,
+    /// Second line under the legend (e.g. "1.20"), elided to the key width.
+    pub label2: Option<Label2>,
     pub fill: Option<Color32>,
     pub stroke: Option<Color32>,
-    /// Small pill in the top-right corner.
+    /// Small pill in the top-right corner; a dot in that colour when the
+    /// text is empty or the pill would touch the legend.
     pub badge: Option<(String, Color32)>,
 }
 
@@ -521,7 +572,11 @@ impl KeyboardView {
                 (unit * 0.12).clamp(4.0, 8.0),
             );
             let text_c = if selected { color::ACCENT } else { color::TEXT };
-            if let Some(dir) = arrow_dir(k.code) {
+            // Text stays inside the cap: the second line is elided to the
+            // inner width, and the badge shrinks to a dot when it would
+            // touch the legend.
+            let inner_w = (r.width() - 2.0 * pad.x + 2.0).max(4.0);
+            let legend_right = if let Some(dir) = arrow_dir(k.code) {
                 paint_arrow(
                     &painter,
                     r.min + pad + egui::vec2(fs * 0.45, fs * 0.6),
@@ -529,37 +584,50 @@ impl KeyboardView {
                     dir,
                     dim(text_c),
                 );
+                r.min.x + pad.x + fs * 0.9
             } else {
-                painter.text(
-                    r.min + pad,
-                    Align2::LEFT_TOP,
-                    keycodes::legend(k.code),
-                    font::bold(fs),
-                    dim(text_c),
-                );
-            }
+                painter
+                    .text(
+                        r.min + pad,
+                        Align2::LEFT_TOP,
+                        keycodes::legend(k.code),
+                        font::bold(fs),
+                        dim(text_c),
+                    )
+                    .right()
+            };
             if let Some(l2) = &deco.label2 {
-                let c = if selected {
-                    color::ACCENT
-                } else {
-                    color::MUTED
+                let c = match (l2.color, selected) {
+                    (Some(c), _) => c,
+                    (None, true) => color::ACCENT,
+                    (None, false) => color::MUTED,
                 };
-                painter.text(
-                    egui::pos2(r.min.x + pad.x, r.max.y - pad.y),
-                    Align2::LEFT_BOTTOM,
-                    l2,
+                let galley = painter.layout_job(elided(
+                    &l2.text,
                     FontId::new(fs2, FontFamily::Proportional),
                     dim(c),
-                );
+                    inner_w,
+                ));
+                let pos = egui::pos2(r.min.x + pad.x, r.max.y - pad.y - galley.size().y);
+                painter.galley(pos, galley, dim(c));
             }
             if let Some((text, c)) = &deco.badge {
-                let font = FontId::new((fs2 - 1.5).max(8.0), FontFamily::Proportional);
+                let font = FontId::new((fs2 - 2.0).max(8.0), FontFamily::Proportional);
                 let galley = painter.layout_no_wrap(text.clone(), font, dim(*c));
                 let bsize = galley.size() + egui::vec2(6.0, 2.0);
                 let brect =
                     Rect::from_min_size(egui::pos2(r.max.x - bsize.x - 4.0, r.min.y + 4.0), bsize);
-                painter.rect_filled(brect, CornerRadius::same(4), dim(c.gamma_multiply(0.18)));
-                painter.galley(brect.min + egui::vec2(3.0, 1.0), galley, *c);
+                if !text.is_empty() && brect.left() >= legend_right + 3.0 {
+                    painter.rect_filled(brect, CornerRadius::same(4), dim(c.gamma_multiply(0.18)));
+                    painter.galley(brect.min + egui::vec2(3.0, 1.0), galley, *c);
+                } else {
+                    let rad = (unit * 0.055).clamp(2.5, 3.5);
+                    painter.circle_filled(
+                        egui::pos2(r.max.x - rad - 5.0, r.min.y + rad + 5.0),
+                        rad,
+                        dim(*c),
+                    );
+                }
             }
         }
         if let Some(r) = drag_rect {
@@ -594,6 +662,35 @@ impl KeyboardView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn second_lines_are_elided_to_the_key_width() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        let font = FontId::new(10.0, FontFamily::Proportional);
+        let g =
+            ctx.fonts(|f| f.layout_job(elided("Kode 0xF344", font.clone(), Color32::WHITE, 30.0)));
+        assert!(g.size().x <= 30.5, "{}", g.size().x);
+        let last = g.rows[0].glyphs.last().map(|x| x.chr);
+        assert_eq!(last, Some('…'));
+        assert_eq!(g.rows.len(), 1);
+        let g = ctx.fonts(|f| f.layout_job(elided("2.00", font, Color32::WHITE, 30.0)));
+        let shown: String = g.rows[0].glyphs.iter().map(|x| x.chr).collect();
+        assert_eq!(shown, "2.00");
+    }
+
+    #[test]
+    fn a_second_line_can_carry_its_own_colour() {
+        let plain: Label2 = "✔".into();
+        assert_eq!((&*plain, plain.color), ("✔", None));
+        let green = Label2::colored("✔", color::SUCCESS);
+        assert_eq!(green.color, Some(color::SUCCESS));
+        let d = KeyDecoration {
+            label2: Some(green),
+            ..KeyDecoration::default()
+        };
+        assert_eq!(d.label2.as_deref(), Some("✔"));
+    }
 
     fn rows_of(l: &KeyLayout) -> Vec<Vec<KeyGeom>> {
         let mut rows = vec![Vec::new(); l.rows];

@@ -1098,7 +1098,7 @@ fn decorate(snap: Option<&DeviceSnapshot>, code: u8) -> KeyDecoration {
         return KeyDecoration::default();
     };
     KeyDecoration {
-        label2: Some(mm_short(s.actuation.0)),
+        label2: Some(mm_short(s.actuation.0).into()),
         fill: None,
         stroke: (s.actuation.0 != DEFAULT_ACTUATION_UM).then_some(color::INFO.gamma_multiply(0.7)),
         badge: (s.mode.touch == TouchMode::RapidTrigger).then(|| ("RT".to_string(), color::ACCENT)),
@@ -1490,7 +1490,7 @@ fn live_decoration(snap: Option<&DeviceSnapshot>, live: &LiveDepth, code: u8) ->
     };
     let frac = f32::from(depth.min(max)) / f32::from(max.max(1));
     KeyDecoration {
-        label2: Some(mm_short(depth)),
+        label2: Some(mm_short(depth).into()),
         fill: (depth > 0).then(|| {
             color::KEY.lerp_to_gamma(Color32::from_rgb(0x5A, 0x40, 0x10), frac.clamp(0.0, 1.0))
         }),

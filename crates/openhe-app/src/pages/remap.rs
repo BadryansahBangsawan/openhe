@@ -292,7 +292,9 @@ pub fn short_code_name(code: u16) -> String {
     }
     match keycodes::lookup(code) {
         Some(k) if !k.label.starts_with("i18n:") && !is_placeholder(k) => abbreviate(k.label),
-        _ => unknown(code),
+        // Not in the vendor table (e.g. the factory Fn1 Caps code 0xF344,
+        // PROTOCOL 7 finding 17): the bare code fits a cap, "Kode" does not.
+        _ => format!("0x{code:04X}"),
     }
 }
 
@@ -948,7 +950,7 @@ pub fn decoration(
 ) -> KeyDecoration {
     if is_locked(layer, key) {
         return KeyDecoration {
-            label2: Some(t::LOCKED_BADGE.to_string()),
+            label2: Some(t::LOCKED_BADGE.into()),
             fill: None,
             stroke: Some(color::FAINT),
             badge: None,
@@ -956,7 +958,7 @@ pub fn decoration(
     }
     if let Some(code) = pending {
         return KeyDecoration {
-            label2: Some(short_code_name(code)),
+            label2: Some(short_code_name(code).into()),
             fill: Some(color::ACCENT_SOFT),
             stroke: Some(color::ACCENT),
             badge: None,
@@ -978,14 +980,14 @@ pub fn decoration(
     }
     if layer == Layer::Base && code == TRANSPARENT {
         return KeyDecoration {
-            label2: Some(layer_short_code_name(layer, code)),
+            label2: Some(layer_short_code_name(layer, code).into()),
             fill: None,
             stroke: Some(color::DANGER),
             badge: None,
         };
     }
     KeyDecoration {
-        label2: Some(short_code_name(code)),
+        label2: Some(short_code_name(code).into()),
         fill: None,
         stroke: (!unchanged).then(|| color::INFO.gamma_multiply(0.7)),
         badge: None,
@@ -1970,6 +1972,7 @@ mod tests {
         // Unknown codes from the factory Fn tables.
         assert_eq!(code_name(0x6152), "Kode 0x6152");
         assert_eq!(code_name(0xF344), "Kode 0xF344");
+        assert_eq!(short_code_name(0xF344), "0xF344");
     }
 
     /// Left and right modifiers carry the same vendor label ("Ctrl"), so

@@ -944,7 +944,7 @@ pub fn decorate(
     let mut deco = KeyDecoration::default();
     if partner == Some(code) {
         deco.stroke = Some(Func::Socd.color());
-        deco.label2 = Some(Func::Socd.label().to_string());
+        deco.label2 = Some(Func::Socd.label().into());
         deco.badge = Some((DOT.to_string(), Func::Socd.color()));
         return deco;
     }
@@ -961,7 +961,7 @@ pub fn decorate(
     }
     deco.fill = Some(c.gamma_multiply(0.12));
     deco.stroke = Some(c.gamma_multiply(0.8));
-    deco.label2 = Some(text.to_string());
+    deco.label2 = Some(text.into());
     deco.badge = Some((DOT.to_string(), c));
     deco
 }
