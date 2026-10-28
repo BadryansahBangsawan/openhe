@@ -1562,7 +1562,9 @@ impl Page {
             .as_ref()
             .map(ForegroundWatcher::seen)
             .unwrap_or_default();
+        let now = Instant::now();
         let mut changed = false;
+        let mut typed = false;
         let mut remove = None;
         egui::Frame::new()
             .inner_margin(egui::Margin {
@@ -1598,7 +1600,11 @@ impl Page {
                                     .desired_width(200.0)
                                     .hint_text(t::AUTO_APP_HINT),
                             );
-                            changed |= r.lost_focus();
+                            // Like profile names: the switcher gets every
+                            // keystroke, the file is saved after a pause, on
+                            // leaving the field, or when the app closes.
+                            typed |= r.changed();
+                            changed |= self.name_edited(r.changed(), r.lost_focus(), now);
                             let mut p = (*profile).min(3);
                             if Segmented::new(&opts)
                                 .height(30.0)
@@ -1643,9 +1649,11 @@ impl Page {
                 });
                 card::hint(ui, t::AUTO_SESSION);
             });
-        if changed {
+        if changed || typed {
             self.auto
                 .set_rules(ctx.data.borrow().app_profile_rules.clone());
+        }
+        if changed {
             if ctx.save_data().is_err() {
                 self.app_error = Some(t::SAVE_FAILED.to_string());
             }
@@ -2396,6 +2404,70 @@ mod tests {
         page.name_edited(true, false, t0);
         assert!(page.name_edited(false, true, t0));
         assert!(!page.names_due(t0 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn typed_rule_names_reach_the_switcher_and_are_saved_on_close() {
+        use crate::app::test_support::offline_worker;
+        use crate::storage::AppData;
+        use egui_kittest::kittest::Queryable;
+        use std::cell::RefCell;
+        struct S {
+            page: Page,
+            w: crate::worker::Worker,
+            data: RefCell<AppData>,
+            theme: crate::theme::Theme,
+            status: crate::worker::ConnectionStatus,
+        }
+        let mut d = AppData::default();
+        d.app_profile_rules.push(("Valorant".into(), 1));
+        d.set_save_blocked(true); // never touch the real data file
+        let state = S {
+            page: Page {
+                auto_enabled: true, // rules editor without a watcher
+                ..Page::default()
+            },
+            w: offline_worker(),
+            data: RefCell::new(d),
+            theme: crate::theme::Theme::default(),
+            status: crate::worker::ConnectionStatus::Searching,
+        };
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 1400.0))
+            .build_ui_state(
+                |ui, s: &mut S| {
+                    let ctx = AppCtx {
+                        worker: &s.w,
+                        snapshot: None,
+                        status: &s.status,
+                        busy: false,
+                        theme: &s.theme,
+                        data: &s.data,
+                    };
+                    s.page.ui(&ctx, ui);
+                },
+                state,
+            );
+        h.run_steps(2);
+        macro_rules! field {
+            () => {
+                h.query_by(|n| {
+                    n.role() == egui::accesskit::Role::TextInput
+                        && n.value().is_some_and(|v| v.starts_with("Valorant"))
+                })
+                .expect("rule field")
+            };
+        }
+        field!().focus();
+        h.run_steps(2);
+        field!().type_text("X");
+        h.run_steps(2);
+        let s = h.state_mut();
+        assert_eq!(s.data.borrow().app_profile_rules[0].0, "ValorantX");
+        // The switcher uses the name while the field still has focus...
+        assert_eq!(s.page.auto.rules(), vec![("ValorantX".to_string(), 1)]);
+        // ...and closing the app now saves it.
+        assert!(s.page.take_unsaved_names());
     }
 
     #[test]
