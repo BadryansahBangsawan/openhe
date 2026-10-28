@@ -3,12 +3,17 @@
 //!
 //! Nothing here is sent anywhere; the file lives in the user's config dir.
 
+use openhe_proto::macros::{MacroAction, PlayMode};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// File name inside the config directory.
 pub const FILE_NAME: &str = "openhe.json";
+
+/// Why [`AppData::save`] refused to write (Indonesian, shown to the user).
+pub const WRITE_REFUSED: &str =
+    "File data OpenHE tidak bisa dibaca saat dibuka, jadi perubahan tidak disimpan agar file lama tidak tertimpa.";
 
 /// What happened to the data file at startup, when it was not loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +37,15 @@ fn free_bad_path(dir: &Path) -> PathBuf {
         .unwrap_or(first)
 }
 
+/// Defaults for a data file that could not be read or moved aside: saving
+/// is blocked so the file stays as it is.
+fn blocked_defaults() -> AppData {
+    AppData {
+        save_blocked: true,
+        ..AppData::default()
+    }
+}
+
 /// One macro step. A serde mirror of `openhe_proto::macros::MacroAction`
 /// (Track A2), kept separate so the proto crate needs no serde.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +54,26 @@ pub struct SavedMacroAction {
     pub code: u16,
     pub down: bool,
     pub delay_ms: u32,
+}
+
+impl From<MacroAction> for SavedMacroAction {
+    fn from(a: MacroAction) -> Self {
+        SavedMacroAction {
+            code: a.code,
+            down: a.down,
+            delay_ms: a.delay_ms,
+        }
+    }
+}
+
+impl From<SavedMacroAction> for MacroAction {
+    fn from(a: SavedMacroAction) -> Self {
+        MacroAction {
+            code: a.code,
+            down: a.down,
+            delay_ms: a.delay_ms,
+        }
+    }
 }
 
 /// A macro in the local library.
@@ -54,6 +88,47 @@ pub struct SavedMacro {
     pub interval_ms: u32,
 }
 
+impl SavedMacro {
+    /// An empty macro: play once, repeat 1, 100 ms interval (the official
+    /// app's defaults).
+    pub fn new(name: impl Into<String>) -> SavedMacro {
+        SavedMacro {
+            name: name.into(),
+            actions: Vec::new(),
+            mode: PlayMode::Once as u8,
+            repeat: 1,
+            interval_ms: 100,
+        }
+    }
+
+    pub fn to_actions(&self) -> Vec<MacroAction> {
+        self.actions.iter().copied().map(Into::into).collect()
+    }
+
+    /// The stored mode; an unknown value reads as `Once`.
+    pub fn play_mode(&self) -> PlayMode {
+        PlayMode::from_u8(self.mode).unwrap_or(PlayMode::Once)
+    }
+
+    /// The stored repeat count; 0 (an old or hand-edited file) reads as 1,
+    /// the smallest value the keyboard accepts.
+    pub fn repeat_count(&self) -> u16 {
+        self.repeat.max(1)
+    }
+
+    /// Sum of all step delays, in milliseconds.
+    pub fn total_ms(&self) -> u64 {
+        self.actions.iter().map(|a| u64::from(a.delay_ms)).sum()
+    }
+
+    pub fn duplicate_named(&self, name: impl Into<String>) -> SavedMacro {
+        SavedMacro {
+            name: name.into(),
+            ..self.clone()
+        }
+    }
+}
+
 /// Everything the app keeps locally. Missing fields load as defaults, so
 /// older files keep working when fields are added.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +140,11 @@ pub struct AppData {
     /// `(app name, profile index 0..=3)`.
     pub app_profile_rules: Vec<(String, u8)>,
     pub launch_at_login: bool,
+    /// Set when the data file existed but could not be read or moved aside
+    /// at load. [`AppData::save`] then refuses to write, so that file is
+    /// never replaced by defaults. Not stored in the file.
+    #[serde(skip)]
+    pub save_blocked: bool,
 }
 
 impl AppData {
@@ -86,7 +166,16 @@ impl AppData {
 
     /// Saves to `dir` (created if needed), via a temp file and a rename so a
     /// crash never leaves a half-written file.
+    ///
+    /// Refuses (`PermissionDenied`, text [`WRITE_REFUSED`]) when
+    /// [`AppData::save_blocked`] is set, without touching the disk.
     pub fn save_to(&self, dir: &Path) -> io::Result<()> {
+        if self.save_blocked {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                WRITE_REFUSED,
+            ));
+        }
         std::fs::create_dir_all(dir)?;
         let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         let tmp = dir.join(format!("{FILE_NAME}.tmp"));
@@ -111,13 +200,13 @@ impl AppData {
                         Some(LoadNotice::Recovered { moved_to: to }),
                     ),
                     Err(e) => (
-                        AppData::default(),
+                        blocked_defaults(),
                         Some(LoadNotice::Unreadable(e.to_string())),
                     ),
                 }
             }
             Err(e) => (
-                AppData::default(),
+                blocked_defaults(),
                 Some(LoadNotice::Unreadable(e.to_string())),
             ),
         }
@@ -206,6 +295,7 @@ mod tests {
             ],
             app_profile_rules: vec![("Valorant".into(), 1)],
             launch_at_login: true,
+            save_blocked: false,
         }
     }
 
@@ -300,6 +390,83 @@ mod tests {
         assert_eq!(AppData::load_or_recover(&dir.0), (AppData::default(), None));
         sample().save_to(&dir.0).unwrap();
         assert_eq!(AppData::load_or_recover(&dir.0), (sample(), None));
+    }
+
+    #[test]
+    fn unreadable_file_blocks_saving_and_is_left_untouched() {
+        let dir = TempDir::new("unreadable");
+        // A directory where the file should be: reading fails with an error
+        // that is neither "not found" nor "invalid data".
+        std::fs::create_dir_all(dir.0.join(FILE_NAME)).unwrap();
+        let (d, notice) = AppData::load_or_recover(&dir.0);
+        assert!(matches!(notice, Some(LoadNotice::Unreadable(_))));
+        assert!(d.save_blocked);
+        let err = d.save_to(&dir.0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains(WRITE_REFUSED));
+        // Nothing was written or replaced.
+        assert!(dir.0.join(FILE_NAME).is_dir());
+        assert!(!dir.0.join("openhe.json.tmp").exists());
+    }
+
+    #[test]
+    fn recovered_and_missing_files_can_be_saved() {
+        let dir = TempDir::new("recovered-save");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(dir.0.join(FILE_NAME), b"{not json").unwrap();
+        let (d, notice) = AppData::load_or_recover(&dir.0);
+        assert!(matches!(notice, Some(LoadNotice::Recovered { .. })));
+        assert!(!d.save_blocked);
+        d.save_to(&dir.0).unwrap();
+        let fresh = TempDir::new("missing-save");
+        let (d, notice) = AppData::load_or_recover(&fresh.0);
+        assert_eq!((notice, d.save_blocked), (None, false));
+        d.save_to(&fresh.0).unwrap();
+    }
+
+    #[test]
+    fn save_blocked_flag_is_never_written_to_disk() {
+        let dir = TempDir::new("flag-not-saved");
+        sample().save_to(&dir.0).unwrap();
+        let text = std::fs::read_to_string(dir.0.join(FILE_NAME)).unwrap();
+        assert!(!text.contains("save_blocked"));
+    }
+
+    #[test]
+    fn saved_macro_converts_to_and_from_proto_actions() {
+        let m = sample().macros.remove(0);
+        let actions = m.to_actions();
+        assert_eq!(
+            actions[1],
+            MacroAction {
+                code: 0x06,
+                down: true,
+                delay_ms: 35
+            }
+        );
+        assert_eq!(m.play_mode(), PlayMode::WhileHeld);
+        let back: Vec<SavedMacroAction> = actions.into_iter().map(Into::into).collect();
+        assert_eq!(back, m.actions);
+    }
+
+    #[test]
+    fn saved_macro_helpers() {
+        let m = SavedMacro::new("Baru");
+        assert_eq!((m.repeat, m.interval_ms, m.mode), (1, 100, 0));
+        assert!(m.actions.is_empty());
+        let s = sample().macros.remove(0);
+        assert_eq!(s.total_ms(), 55);
+        // Unknown stored mode falls back to Once; repeat 0 is sent as 1.
+        let odd = SavedMacro {
+            mode: 9,
+            repeat: 0,
+            ..s.clone()
+        };
+        assert_eq!(odd.play_mode(), PlayMode::Once);
+        assert_eq!(odd.repeat_count(), 1);
+        let copy = s.duplicate_named("Salin (salinan)");
+        assert_eq!(copy.name, "Salin (salinan)");
+        assert_eq!(copy.actions, s.actions);
     }
 
     #[test]
