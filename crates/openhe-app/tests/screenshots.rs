@@ -9,7 +9,11 @@ use openhe_app::storage::{AppData, SavedMacro, SavedMacroAction};
 use std::path::PathBuf;
 use support::*;
 
+/// The minimum window (`theme::size::MIN_WINDOW`).
 const DESKTOP: Vec2 = Vec2::new(1280.0, 800.0);
+/// The start window (`theme::size::START_WINDOW`); the mockups' proportions
+/// match this size.
+const START: Vec2 = Vec2::new(1440.0, 900.0);
 const SMALL: Vec2 = Vec2::new(900.0, 600.0);
 /// `World::with`'s window size.
 const TALL: Vec2 = Vec2::new(1600.0, 1500.0);
@@ -68,6 +72,13 @@ fn shot(w: &mut World, name: &str, size: Vec2) {
     w.frames(3);
 }
 
+/// `name.png` at the minimum window and `name-1440x900.png` at the start
+/// window.
+fn shots(w: &mut World, name: &str) {
+    shot(w, name, DESKTOP);
+    shot(w, &format!("{name}-1440x900"), START);
+}
+
 /// Performa with W, A, S, D on rapid trigger and selected; also shot at a
 /// small window size, to check clipping.
 #[test]
@@ -79,7 +90,7 @@ fn screenshot_01_performa() {
     w.edit_value("2.000 mm", 0, "0.4");
     w.edit_value("0.020 mm", 0, "0.15");
     w.apply("Terapkan ke keyboard");
-    shot(&mut w, "01-performa", DESKTOP);
+    shots(&mut w, "01-performa");
     shot(&mut w, "01-performa-900x600", SMALL);
 }
 
@@ -125,7 +136,7 @@ fn screenshot_02_tombol_lanjutan() {
     w.pick_code("Kosong", 0, "c", "C");
     w.click("DKS 1 · Mulai tekan");
     w.click("DKS 2 · Tekan penuh");
-    shot(&mut w, "02-tombol-lanjutan", DESKTOP);
+    shots(&mut w, "02-tombol-lanjutan");
 }
 
 #[test]
@@ -154,7 +165,7 @@ fn screenshot_03_remap() {
     w.click_role(eframe::egui::accesskit::Role::TextInput, 0);
     w.replace_text("");
     w.click("Navigasi");
-    shot(&mut w, "03-remap", DESKTOP);
+    shots(&mut w, "03-remap");
 }
 
 fn step(code: u16, down: bool, delay_ms: u32) -> SavedMacroAction {
@@ -215,7 +226,7 @@ fn screenshot_04_macro() {
     w.click("Pilih tombol");
     w.click_key(0x0A, false); // G
     w.idle();
-    shot(&mut w, "04-macro", DESKTOP);
+    shots(&mut w, "04-macro");
 }
 
 #[test]
@@ -229,7 +240,7 @@ fn screenshot_05_lampu() {
     if w.has("Pelangi") {
         w.click("Pelangi");
     }
-    shot(&mut w, "05-lampu", DESKTOP);
+    shots(&mut w, "05-lampu");
 }
 
 #[test]
@@ -262,7 +273,7 @@ fn screenshot_06_kalibrasi() {
         }
     }
     w.frames(40);
-    shot(&mut w, "06-kalibrasi", DESKTOP);
+    shots(&mut w, "06-kalibrasi");
     w.click("Batal");
     w.until("stopped", 10, |w| !w.sim().calibrating);
 }
@@ -273,5 +284,5 @@ fn screenshot_07_pengaturan() {
     let mut w = world(profile_names());
     w.page("Pengaturan");
     w.idle();
-    shot(&mut w, "07-pengaturan", DESKTOP);
+    shots(&mut w, "07-pengaturan");
 }
