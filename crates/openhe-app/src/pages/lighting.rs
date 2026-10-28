@@ -2321,6 +2321,46 @@ mod tests {
     }
 
     #[test]
+    fn an_out_of_range_lighting_read_gets_its_own_message() {
+        // What the device layer reports for a PRGB reply with brightness 9.
+        let mut body = openhe_proto::lighting::set(&sample()).unwrap().payload;
+        body[38] = 9;
+        let mut m = MockTransport::new();
+        m.push_reply(nack_reply());
+        m.push_reply(reply(0x18, &body));
+        let e = read_lighting_job(&mut kb(m)).unwrap_err();
+        let mut page = Page::default();
+        page.finish_load(Err(e));
+        let f = page.failure.clone().unwrap();
+        assert!(
+            f.text.starts_with(i18n::error::LIGHTING_UNKNOWN),
+            "{}",
+            f.text
+        );
+        assert!(f.text.contains("kecerahan"), "{}", f.text);
+        assert!(f.text.contains(i18n::error::LIGHTING_RECOVER), "{}", f.text);
+        assert!(!f.text.contains("brightness"), "no English: {}", f.text);
+        assert!(!page.effects_ready(), "the parse is not loosened");
+        // Each field gets its Indonesian name; other I/O errors stay generic.
+        for (detail, name) in [
+            ("mode 30 out of range 0..=21", "efek"),
+            ("speed 7 out of range 0..=4", "kecepatan"),
+            ("sleep timeout 4 min is not one of 0, 1", "mati otomatis"),
+            ("static colour index 9 out of range 0..=7", "warna"),
+            ("dynamic colour index 9 out of range 0..=7", "warna"),
+        ] {
+            let e = Error::Io(format!("unexpected lighting reply: {detail}"));
+            assert!(i18n::device_error(&e).contains(name), "{detail}");
+        }
+        assert_eq!(
+            i18n::device_error(&Error::Io(
+                "unexpected lighting reply: reply is not a PRGB reply".into()
+            )),
+            i18n::error::IO
+        );
+    }
+
+    #[test]
     fn a_lighting_change_on_the_keyboard_is_read_again_unless_edited() {
         let mut page = Page::preloaded(3, sample(), [(0x04, rgb(1, 2, 3))]);
         page.follow_lighting(0); // first look: nothing to compare

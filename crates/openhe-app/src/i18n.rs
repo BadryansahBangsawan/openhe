@@ -41,6 +41,9 @@ pub mod error {
     pub const VERIFY: &str = "Keyboard menyimpan nilai yang berbeda dari yang dikirim.";
     pub const INTERNAL: &str = "Terjadi kesalahan internal di OpenHE. Keyboard disambung ulang.";
     pub const IO: &str = "Kesalahan komunikasi dengan keyboard.";
+    pub const LIGHTING_UNKNOWN: &str = "Keyboard melaporkan nilai lampu yang tidak dikenal";
+    pub const LIGHTING_RECOVER: &str =
+        "Untuk memulihkannya, impor profil yang berisi pengaturan lampu (Pengaturan → Impor…).";
 }
 
 /// The raw (English) error text, for a "Detail teknis" tooltip only.
@@ -48,9 +51,39 @@ pub fn technical(e: &openhe_device::Error) -> String {
     e.to_string()
 }
 
+/// Prefix of the device layer's `Error::Io` text for a lighting reply that
+/// does not parse (see `openhe_device::keyboard::lighting`).
+const LIGHTING_REPLY: &str = "unexpected lighting reply: ";
+
+/// The lighting field an out-of-range lighting read names, in Indonesian.
+/// `None` for other lighting reply problems (e.g. a reply of another
+/// command), which stay a plain communication error.
+fn lighting_field(detail: &str) -> Option<&'static str> {
+    [
+        ("brightness ", "kecerahan"),
+        ("mode ", "efek"),
+        ("speed ", "kecepatan"),
+        ("sleep timeout ", "mati otomatis"),
+        ("static colour index ", "warna"),
+        ("dynamic colour index ", "warna"),
+    ]
+    .into_iter()
+    .find(|(en, _)| detail.starts_with(en))
+    .map(|(_, id)| id)
+}
+
 /// Indonesian text for a device error. Never includes the English detail.
 pub fn device_error(e: &openhe_device::Error) -> String {
     use openhe_device::Error as E;
+    if let E::Io(m) = e {
+        if let Some(field) = m.strip_prefix(LIGHTING_REPLY).and_then(lighting_field) {
+            return format!(
+                "{} ({field}); pengaturan lampu belum bisa diubah dari OpenHE. {}",
+                error::LIGHTING_UNKNOWN,
+                error::LIGHTING_RECOVER
+            );
+        }
+    }
     let s = match e {
         E::Timeout => error::TIMEOUT,
         E::Disconnected => common::DISCONNECTED,
