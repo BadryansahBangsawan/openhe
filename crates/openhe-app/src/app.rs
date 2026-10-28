@@ -747,7 +747,7 @@ fn sidebar(ui: &mut Ui, page: &mut PageId, status: &ConnectionStatus, loading: b
 
 fn nav_item(ui: &mut Ui, text: &str, active: bool) -> egui::Response {
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), Sense::click());
     let fill = if active {
         Color32::from_rgb(0x2A, 0x21, 0x12)
     } else if resp.hovered() {
@@ -769,7 +769,11 @@ fn nav_item(ui: &mut Ui, text: &str, active: bool) -> egui::Response {
         egui::pos2(rect.left() + 36.0, rect.center().y),
         Align2::LEFT_CENTER,
         text,
-        egui::FontId::proportional(15.0),
+        if active {
+            font::bold(14.0)
+        } else {
+            egui::FontId::proportional(14.0)
+        },
         text_color,
     );
     resp.widget_info(|| {

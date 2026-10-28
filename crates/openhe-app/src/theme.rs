@@ -111,13 +111,13 @@ pub mod font {
         }
     }
     pub fn title() -> FontId {
-        bold(22.0)
+        bold(20.0)
     }
     pub fn heading() -> FontId {
         bold(17.0)
     }
     pub fn body() -> FontId {
-        FontId::new(14.0, FontFamily::Proportional)
+        FontId::new(13.0, FontFamily::Proportional)
     }
     pub fn small() -> FontId {
         FontId::new(12.0, FontFamily::Proportional)
@@ -233,6 +233,8 @@ pub fn apply(ctx: &egui::Context) {
     v.extreme_bg_color = BG;
     v.faint_bg_color = PANEL;
     v.override_text_color = Some(TEXT);
+    // Placeholders (hint text) in the faint colour, as in the mockups.
+    v.weak_text_color = Some(FAINT);
     v.hyperlink_color = ACCENT;
     v.selection.bg_fill = ACCENT_SOFT;
     v.selection.stroke = line(1.0, ACCENT);
