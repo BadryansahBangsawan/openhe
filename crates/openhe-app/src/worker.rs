@@ -81,7 +81,8 @@ pub enum ConnectionStatus {
     Searching,
     Connected(DeviceSnapshot),
     /// The last connect attempt failed in a way the user may need to fix
-    /// (permissions, bootloader mode, a protocol error). Still retrying.
+    /// (permissions, the keyboard open in another program, bootloader mode,
+    /// a protocol error). Still retrying.
     /// The text is Indonesian (from [`i18n::device_error`]).
     Error(String),
 }
@@ -1452,6 +1453,28 @@ pub(crate) mod tests {
         wait_for("error", || {
             w.status()
                 == ConnectionStatus::Error(i18n::device_error(&Error::Permission("x".into())))
+        });
+        wait_for("retries", || tries.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn a_busy_keyboard_is_reported_and_retried() {
+        let tries = Arc::new(AtomicUsize::new(0));
+        let t = tries.clone();
+        let w: Worker<MockTransport> = Worker::spawn_with(
+            Box::new(move || {
+                t.fetch_add(1, Ordering::SeqCst);
+                Err(Error::Busy(
+                    "exclusive access and device already open".into(),
+                ))
+            }),
+            fast(),
+        );
+        wait_for("busy status", || {
+            w.status()
+                == ConnectionStatus::Error(
+                    "Keyboard sedang dipakai program lain (tutup OpenHE/AULA HUB lain)".into(),
+                )
         });
         wait_for("retries", || tries.load(Ordering::SeqCst) >= 3);
     }

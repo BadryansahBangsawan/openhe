@@ -66,7 +66,7 @@ impl HidTransport {
                 Some(model) if info.usage() == 1 => {
                     let device = info
                         .open_device(&api)
-                        .map_err(|e| Error::Permission(open_failure_message(&e.to_string())))?;
+                        .map_err(|e| open_error(&e.to_string()))?;
                     return Ok((HidTransport { device }, model));
                 }
                 Some(_) => {}
@@ -81,6 +81,22 @@ impl HidTransport {
             ));
         }
         Err(Error::Unsupported(msg))
+    }
+}
+
+/// kIOReturnExclusiveAccess: macOS hidapi opens the keyboard exclusively,
+/// so this is what a second program gets while one holds it.
+const EXCLUSIVE_ACCESS: &str = "0xe00002c5";
+const EXCLUSIVE_ACCESS_TEXT: &str = "exclusive access and device already open";
+
+/// The error for a failed open: `Busy` when another program holds the
+/// keyboard, else `Permission` (with the udev hint on Linux).
+fn open_error(detail: &str) -> Error {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains(EXCLUSIVE_ACCESS) || lower.contains(EXCLUSIVE_ACCESS_TEXT) {
+        Error::Busy(detail.to_string())
+    } else {
+        Error::Permission(open_failure_message(detail))
     }
 }
 
@@ -146,6 +162,29 @@ mod tests {
     #[test]
     fn open_failure_names_the_udev_rule() {
         assert!(open_failure_message("denied").contains("packaging/linux/70-openhe.rules"));
+    }
+
+    /// The text macOS hidapi gives when another program holds the keyboard
+    /// (seen on hardware with a second OpenHE open).
+    const MAC_BUSY: &str = "hid_open_path: failed to open IOHIDDevice from mach entry: \
+        (0xE00002C5) (iokit/common) exclusive access and device already open";
+
+    #[test]
+    fn a_device_held_by_another_program_is_busy_not_a_permission_problem() {
+        match open_error(MAC_BUSY) {
+            Error::Busy(detail) => {
+                assert!(detail.contains("0xE00002C5"));
+                assert!(!detail.contains("udev"), "no Linux hint for a busy device");
+            }
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        // Either half of the message is enough.
+        assert!(matches!(open_error("(0xe00002c5)"), Error::Busy(_)));
+        assert!(matches!(
+            open_error("Exclusive access and device already open"),
+            Error::Busy(_)
+        ));
+        assert!(matches!(open_error("access denied"), Error::Permission(_)));
     }
 
     #[test]

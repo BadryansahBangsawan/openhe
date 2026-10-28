@@ -34,6 +34,7 @@ pub mod error {
     pub const PERMISSION: &str = "Akses ke keyboard ditolak oleh sistem.";
     pub const PERMISSION_LINUX: &str =
         "Akses ke keyboard ditolak. Pasang aturan udev packaging/linux/70-openhe.rules lalu colokkan ulang.";
+    pub const BUSY: &str = "Keyboard sedang dipakai program lain (tutup OpenHE/AULA HUB lain)";
     pub const BOOTLOADER: &str = "Keyboard sedang dalam mode bootloader. Cabut lalu colokkan lagi.";
     pub const UNSUPPORTED: &str = "Perangkat ini tidak didukung.";
     pub const FRAME: &str = "Balasan keyboard tidak dikenali.";
@@ -89,6 +90,7 @@ pub fn device_error(e: &openhe_device::Error) -> String {
         E::Disconnected => common::DISCONNECTED,
         E::Permission(_) if cfg!(target_os = "linux") => error::PERMISSION_LINUX,
         E::Permission(_) => error::PERMISSION,
+        E::Busy(_) => error::BUSY,
         E::Unsupported(m) if m == "bootloader" => error::BOOTLOADER,
         E::Unsupported(_) => error::UNSUPPORTED,
         E::Frame(_) => error::FRAME,
@@ -235,4 +237,25 @@ pub mod events {
     pub const STOP_CALIBRATION: &str = "Hentikan kalibrasi";
     pub const AUTO_SWITCHED: &str = "Profil diganti otomatis untuk";
     pub const AUTO_SWITCH_FAILED: &str = "Ganti profil otomatis gagal.";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openhe_device::Error as E;
+
+    /// macOS: the keyboard is open in another program. That is not a
+    /// permission problem and has nothing to do with udev.
+    #[test]
+    fn a_busy_keyboard_says_another_program_has_it() {
+        let msg = device_error(&E::Busy(
+            "(0xE00002C5) exclusive access and device already open".into(),
+        ));
+        assert_eq!(
+            msg,
+            "Keyboard sedang dipakai program lain (tutup OpenHE/AULA HUB lain)"
+        );
+        assert_ne!(msg, device_error(&E::Permission("x".into())));
+        assert!(!msg.contains("udev"));
+    }
 }

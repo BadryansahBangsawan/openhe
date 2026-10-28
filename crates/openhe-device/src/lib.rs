@@ -25,6 +25,10 @@ pub enum Error {
     Disconnected,
     #[error("permission denied: {0}")]
     Permission(String),
+    /// The keyboard is open in another program (macOS hidapi opens it
+    /// exclusively: a second OpenHE, the CLI or AULA HUB).
+    #[error("keyboard is in use by another program: {0}")]
+    Busy(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
     #[error("protocol error: {0}")]

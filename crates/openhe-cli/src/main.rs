@@ -180,7 +180,7 @@ fn plan_actuation<T: Transport>(
 fn exit_code(e: &Error) -> u8 {
     match e {
         Error::Unsupported(_) => 2,
-        Error::Permission(_) => 3,
+        Error::Permission(_) | Error::Busy(_) => 3,
         _ => 1,
     }
 }
@@ -189,7 +189,11 @@ fn exit_code(e: &Error) -> u8 {
 fn is_fatal(e: &Error) -> bool {
     matches!(
         e,
-        Error::Disconnected | Error::Timeout | Error::Permission(_) | Error::Unsupported(_)
+        Error::Disconnected
+            | Error::Timeout
+            | Error::Permission(_)
+            | Error::Busy(_)
+            | Error::Unsupported(_)
     )
 }
 
@@ -362,6 +366,7 @@ mod tests {
         assert!(is_fatal(&E::Disconnected));
         assert!(is_fatal(&E::Timeout));
         assert!(is_fatal(&E::Permission("x".into())));
+        assert!(is_fatal(&E::Busy("x".into())));
         assert!(is_fatal(&E::Unsupported("x".into())));
         assert!(!is_fatal(&E::Io("x".into())));
         assert!(!is_fatal(&E::Frame(
