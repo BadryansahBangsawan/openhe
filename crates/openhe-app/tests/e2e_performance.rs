@@ -154,6 +154,24 @@ fn switch_profile(w: &mut World, label: &str) {
     w.idle();
 }
 
+/// Unsent edits belong to the profile they were made on: a top-bar switch
+/// (through the reconnect, Performa shown) drops them and the form shows
+/// the new profile's values.
+#[test]
+fn unsent_edits_are_dropped_on_a_profile_switch() {
+    let mut w = World::new();
+    w.sim().profiles[2].keys.insert((0x14, ACT), 1200);
+    w.click_key(0x14, false);
+    w.edit_value("2.000 mm", 0, "1.5");
+    assert!(w.enabled("Terapkan ke keyboard"));
+    switch_profile(&mut w, "3");
+    w.frames(3);
+    assert!(!w.enabled("Terapkan ke keyboard"), "{:?}", w.labels());
+    assert!(w.has_text("=1.200 mm"), "{:?}", w.labels());
+    assert_eq!(w.sim().p().key(0x14, ACT), 1200);
+    assert_eq!(w.sim().sets(0x23).len(), 0, "nothing written");
+}
+
 /// An apply finishing while another page is shown is only read by this
 /// page later; by then the keyboard may be on another profile, whose
 /// snapshot must not get the old profile's values.

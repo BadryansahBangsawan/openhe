@@ -395,6 +395,9 @@ pub struct Page {
     pending: Option<Pending<ApplyOutcome>>,
     /// Profile and connection count when the pending job was submitted.
     sent_on: Option<SentOn>,
+    /// Profile the form and its edits belong to. Kept while disconnected,
+    /// so a switch through a reconnect is seen too.
+    profile: Option<u8>,
     /// The last change sent, for "Coba lagi".
     last_sent: Option<Vec<Batch>>,
     error: Option<String>,
@@ -416,6 +419,7 @@ impl Default for Page {
             loaded_from: None,
             pending: None,
             sent_on: None,
+            profile: None,
             last_sent: None,
             error: None,
             error_technical: None,
@@ -533,6 +537,18 @@ impl Page {
         let Some(snap) = ctx.snapshot else {
             return;
         };
+        if self.profile.is_some_and(|p| p != snap.profile) {
+            // Edits (and a retry) made for another profile are dropped,
+            // never written to this one; the form reloads below.
+            self.touched = Touched::default();
+            self.applied = false;
+            self.clamped = false;
+            self.error = None;
+            self.error_technical = None;
+            self.last_sent = None;
+            self.loaded_from = None;
+        }
+        self.profile = Some(snap.profile);
         self.selection.retain_present(&snap.matrix);
         let sel = self.selection.as_set().clone();
         let generation = ctx.worker.generation();
