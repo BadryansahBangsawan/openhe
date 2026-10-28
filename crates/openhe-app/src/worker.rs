@@ -13,6 +13,11 @@
 //!   (debounced) full reload, key-data changes schedule a reload, lighting
 //!   changes bump [`Worker::lighting_generation`], and anything else is
 //!   ignored.
+//! - The keyboard sends no event when Fn+A / Fn+S switches Win/Mac, so the
+//!   idle worker also re-reads the profile and the OS mode every
+//!   [`WorkerConfig::state_poll`] (2 s), only when no job is queued, no
+//!   reload is pending and calibration is not running. A change is handled
+//!   like the matching event: snapshot patched at once, debounced reload.
 //! - Pages talk to the keyboard only through [`Worker::submit`]: a closure
 //!   that runs on the worker thread with `&mut Keyboard`, and a [`Pending`]
 //!   handle the UI polls each frame without blocking.
@@ -227,6 +232,11 @@ pub struct WorkerConfig {
     pub retry_interval: Duration,
     /// How long the idle worker waits for a job before polling for events.
     pub idle_poll: Duration,
+    /// How often the idle worker re-reads the active profile and the
+    /// Win/Mac mode. The keyboard sends no event when Fn+A / Fn+S switches
+    /// the OS mode (hardware finding 15), so this check is how such a
+    /// change is noticed.
+    pub state_poll: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -234,9 +244,13 @@ impl Default for WorkerConfig {
         WorkerConfig {
             retry_interval: Duration::from_secs(1),
             idle_poll: Duration::from_millis(50),
+            state_poll: STATE_POLL,
         }
     }
 }
+
+/// Default [`WorkerConfig::state_poll`].
+pub const STATE_POLL: Duration = Duration::from_secs(2);
 
 /// Longest wait between retries of a failed background reload.
 const MAX_RELOAD_BACKOFF: Duration = Duration::from_secs(30);
@@ -948,6 +962,8 @@ fn run<T: Transport>(
     let mut event_retry = Retry::new(cfg.retry_interval);
     let mut debounce = Debounce::new(debounce_window(&cfg));
     let mut last_idle = Instant::now();
+    // Last time profile and OS mode were read (by a load or the state poll).
+    let mut last_state = Instant::now();
     // When to try to connect next (a requested reconnect pauses first).
     let mut connect_at = Instant::now();
     loop {
@@ -992,6 +1008,7 @@ fn run<T: Transport>(
                                 ctl.set_status(ConnectionStatus::Connected(snap));
                                 kb = Some(k);
                                 last_idle = Instant::now();
+                                last_state = Instant::now();
                                 continue;
                             }
                             Err(e) => ctl.set_status(load_error_status(&e)),
@@ -1109,6 +1126,47 @@ fn run<T: Transport>(
         if ctl.calibrating.load(Ordering::SeqCst) {
             continue;
         }
+        // The keyboard reports no event for a Win/Mac switch (Fn+A / Fn+S),
+        // so re-read profile and OS mode now and then. Only when nothing
+        // else is going on: no job queued, no reload asked for or pending.
+        if last_state.elapsed() >= cfg.state_poll
+            && ctl.outstanding.load(Ordering::SeqCst) == 0
+            && !ctl.reload.load(Ordering::SeqCst)
+            && !debounce.is_pending()
+            && !retry.is_due()
+        {
+            last_state = Instant::now();
+            let (state, panicked) = guarded(|| Ok((k.profile()?, k.system_mode()?)));
+            match state {
+                Ok((profile, mode)) => {
+                    let shown = match &ctl.lock().status {
+                        ConnectionStatus::Connected(s) => Some((s.profile, s.system_mode)),
+                        _ => None,
+                    };
+                    if shown.is_some_and(|shown| shown != (profile, mode)) {
+                        // Same path as a keyboard event: show it at once,
+                        // then a debounced full reload.
+                        ctl.patch_snapshot(|s| {
+                            s.profile = profile;
+                            s.system_mode = mode;
+                        });
+                        debounce.bump(Instant::now());
+                    }
+                }
+                Err(_) if panicked => {
+                    kb = None;
+                    ctl.set_status(ConnectionStatus::Searching);
+                    continue;
+                }
+                Err(Error::Disconnected) => {
+                    kb = None;
+                    ctl.set_status(ConnectionStatus::Searching);
+                    continue;
+                }
+                // A missed check is tried again after `state_poll`.
+                Err(_) => {}
+            }
+        }
         let asked = ctl.reload.swap(false, Ordering::SeqCst);
         let settled = debounce.take_due(Instant::now());
         let events_retry = event_retry.take_due();
@@ -1120,6 +1178,7 @@ fn run<T: Transport>(
             match loaded {
                 Ok((snap, skipped)) => {
                     retry.reset();
+                    last_state = Instant::now();
                     ctl.notices(|n| n.loaded(skipped));
                     ctl.set_status_reloaded(ConnectionStatus::Connected(snap));
                 }
@@ -1200,7 +1259,18 @@ pub(crate) mod tests {
     }
 
     fn push_snapshot_rest_with_mode(m: &mut MockTransport, profile: u8, mode: u16) {
-        m.push_reply(order_reply(0x21, 1));
+        push_snapshot_rest_full(m, profile, mode, 1);
+    }
+
+    /// Every reply of a load with `os` as the QueryWinMode value (1
+    /// Windows, 0 Mac).
+    pub(crate) fn push_snapshot_os(m: &mut MockTransport, profile: u8, os: u8) {
+        push_handshake(m);
+        push_snapshot_rest_full(m, profile, 0, os);
+    }
+
+    fn push_snapshot_rest_full(m: &mut MockTransport, profile: u8, mode: u16, os: u8) {
+        m.push_reply(order_reply(0x21, os));
         m.push_reply(order_reply(0x70, profile));
         m.push_reply(order_reply(0x50, 0));
         m.push_reply(reply(0x2B, &[(1, &[0]), (23, &[1]), (24, &KEYS)]));
@@ -1225,6 +1295,7 @@ pub(crate) mod tests {
         WorkerConfig {
             retry_interval: Duration::from_millis(5),
             idle_poll: Duration::from_millis(2),
+            state_poll: Duration::from_secs(3600),
         }
     }
 
@@ -1869,6 +1940,123 @@ pub(crate) mod tests {
         assert_eq!(w.notice(), None);
     }
 
+    fn polling_state(every: Duration) -> WorkerConfig {
+        WorkerConfig {
+            state_poll: every,
+            ..fast()
+        }
+    }
+
+    /// Writes the transport saw so far (read on the worker thread).
+    fn writes(w: &Worker<MockTransport>) -> usize {
+        let mut p = w.submit_quiet("count", |kb| {
+            Ok(kb.session_mut().transport().written().len())
+        });
+        wait_result(&mut p).unwrap()
+    }
+
+    #[test]
+    fn a_win_mac_switch_on_the_keyboard_is_found_by_the_state_poll() {
+        // The keyboard sends no event for Fn+A / Fn+S (hardware finding
+        // 15): the idle worker re-reads profile and OS mode, patches the
+        // snapshot and reloads.
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0); // Windows
+                m.push_reply(order_reply(0x70, 0)); // state poll: profile
+                m.push_reply(order_reply(0x21, 0)); // state poll: Mac
+                push_snapshot_os(&mut m, 0, 0); // the reload
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            polling_state(Duration::from_millis(20)),
+        );
+        wait_for("connect", || w.is_connected());
+        assert_eq!(w.snapshot().unwrap().system_mode, Some(SystemMode::Windows));
+        wait_for("mode", || {
+            w.snapshot()
+                .is_some_and(|s| s.system_mode == Some(SystemMode::Mac))
+        });
+        wait_for("reload", || !w.is_busy());
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(w.notice(), None, "the reload read the queued snapshot");
+        assert_eq!(w.snapshot().unwrap().system_mode, Some(SystemMode::Mac));
+    }
+
+    #[test]
+    fn a_profile_switch_found_by_the_state_poll_patches_then_reloads() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                m.push_reply(order_reply(0x70, 3));
+                m.push_reply(order_reply(0x21, 1));
+                push_snapshot(&mut m, 3);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            polling_state(Duration::from_millis(20)),
+        );
+        wait_for("connect", || w.is_connected());
+        let g = w.generation();
+        wait_for("profile", || w.snapshot().is_some_and(|s| s.profile == 3));
+        assert!(w.generation() > g);
+        wait_for("reload", || !w.is_busy());
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(w.notice(), None);
+    }
+
+    #[test]
+    fn an_unchanged_state_poll_does_not_reload() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                // Plenty of unchanged answers. A reload would start with a
+                // handshake, find only order replies, time out and raise
+                // a ReloadFailed notice.
+                for _ in 0..100 {
+                    m.push_reply(order_reply(0x70, 0));
+                    m.push_reply(order_reply(0x21, 1));
+                }
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            polling_state(Duration::from_millis(10)),
+        );
+        wait_for("connect", || w.is_connected());
+        let g = w.generation();
+        let before = writes(&w);
+        wait_for("state polls", || writes(&w) >= before + 4);
+        assert_eq!(w.generation(), g, "nothing changed, nothing patched");
+        assert_eq!(w.notice(), None, "no reload");
+        assert_eq!(w.snapshot().unwrap().profile, 0);
+    }
+
+    #[test]
+    fn the_state_poll_waits_while_calibrating() {
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            polling_state(Duration::from_millis(5)),
+        );
+        wait_for("connect", || w.is_connected());
+        w.set_calibration_guard(true);
+        let before = writes(&w);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(writes(&w), before, "no queries while calibrating");
+        let mut p = w.submit_quiet("answers", |kb| {
+            let m = kb.session_mut().transport_mut();
+            m.push_reply(order_reply(0x70, 0));
+            m.push_reply(order_reply(0x21, 1));
+            Ok(())
+        });
+        assert_eq!(wait_result(&mut p), Ok(()));
+        w.set_calibration_guard(false);
+        wait_for("state poll", || writes(&w) >= before + 2);
+    }
+
     #[test]
     fn a_burst_of_key_data_events_reloads_once() {
         let w = Worker::spawn_with(
@@ -1933,6 +2121,7 @@ pub(crate) mod tests {
             WorkerConfig {
                 retry_interval: Duration::from_millis(5),
                 idle_poll: Duration::from_millis(20),
+                state_poll: Duration::from_secs(3600),
             },
         );
         wait_for("connect", || w.is_connected());

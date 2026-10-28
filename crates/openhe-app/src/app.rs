@@ -930,6 +930,7 @@ pub(crate) mod test_support {
             WorkerConfig {
                 retry_interval: Duration::from_secs(3600),
                 idle_poll: Duration::from_millis(5),
+                state_poll: Duration::from_secs(3600),
             },
         );
         let deadline = Instant::now() + Duration::from_secs(5);
