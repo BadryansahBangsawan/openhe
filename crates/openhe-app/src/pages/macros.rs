@@ -141,7 +141,8 @@ mod strings {
 // ------------------------------------------------------------ key mapping
 
 /// The HID key code (PROTOCOL 4.3) of an egui key, `None` for keys the
-/// recorder cannot map (clipboard pseudo-keys, F25..F35, browser keys).
+/// recorder cannot map (the Copy/Cut/Paste pseudo-keys, F25..F35, browser
+/// keys). Clipboard shortcuts arrive as events instead: see [`Clip`].
 pub fn hid_code(key: Key) -> Option<u16> {
     use Key::*;
     Some(match key {
@@ -250,6 +251,58 @@ pub fn mods_of(m: &Modifiers) -> Mods {
 
 // --------------------------------------------------------------- recorder
 
+/// A clipboard shortcut. egui-winit turns its key press into
+/// `Event::Copy`, `Event::Cut` or `Event::Paste` and sends no key event for
+/// it (Ctrl/Cmd + C, X, V; on Windows also Ctrl+Insert, Shift+Delete and
+/// Shift+Insert). Only the release arrives as a key event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clip {
+    Copy,
+    Cut,
+    Paste,
+}
+
+const HID_C: u16 = 0x06;
+const HID_X: u16 = 0x1B;
+const HID_V: u16 = 0x19;
+const HID_INSERT: u16 = 0x49;
+const HID_DELETE: u16 = 0x4C;
+
+impl Clip {
+    /// The keys that can make this shortcut.
+    fn keys(self) -> [u16; 2] {
+        match self {
+            Clip::Copy => [HID_C, HID_INSERT],
+            Clip::Cut => [HID_X, HID_DELETE],
+            Clip::Paste => [HID_V, HID_INSERT],
+        }
+    }
+
+    /// The most likely key under `m`; the release corrects it.
+    fn guess(self, m: &Modifiers) -> u16 {
+        let k = self.keys();
+        // Shift without Ctrl/Cmd is Windows' Shift+Delete / Shift+Insert.
+        if self != Clip::Copy && m.shift && !m.command {
+            k[1]
+        } else {
+            k[0]
+        }
+    }
+
+    /// The shortcut a key `code` makes under `m`, if any.
+    fn of(code: u16, m: &Modifiers) -> Option<Clip> {
+        match code {
+            HID_C if m.command => Some(Clip::Copy),
+            HID_X if m.command => Some(Clip::Cut),
+            HID_V if m.command => Some(Clip::Paste),
+            HID_INSERT if m.ctrl => Some(Clip::Copy),
+            HID_INSERT if m.shift => Some(Clip::Paste),
+            HID_DELETE if m.shift => Some(Clip::Cut),
+            _ => None,
+        }
+    }
+}
+
 /// What a finished recording holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recording {
@@ -271,6 +324,9 @@ pub struct Recorder {
     /// Most actions this recording may hold, releases of held keys
     /// included.
     room: usize,
+    /// Presses recorded from a clipboard event: the action index, the
+    /// shortcut, and the guessed key that its release may correct.
+    clips: Vec<(usize, Clip, u16)>,
 }
 
 impl Default for Recorder {
@@ -282,6 +338,7 @@ impl Default for Recorder {
             mods: Mods::default(),
             skipped: Vec::new(),
             room: MAX_ACTIONS,
+            clips: Vec::new(),
         }
     }
 }
@@ -401,8 +458,39 @@ impl Recorder {
                 return;
             }
             self.press(code, t);
-        } else if let Some(p) = self.held.iter().position(|c| *c == code) {
+            return;
+        }
+        // The release of a clipboard shortcut names the real key.
+        if !self.held.contains(&code) {
+            if let Some(i) = self.clips.iter().position(|c| c.1.keys().contains(&code)) {
+                let (at, _, guess) = self.clips[i];
+                if let Some(h) = self.held.iter_mut().find(|h| **h == guess) {
+                    *h = code;
+                    self.actions[at].code = code;
+                }
+            } else if Clip::of(code, modifiers).is_some() {
+                // A paste with an empty clipboard sends no event at all for
+                // the press: record it now.
+                self.press(code, t);
+            }
+        }
+        self.clips.retain(|c| self.actions[c.0].code != code);
+        if let Some(p) = self.held.iter().position(|c| *c == code) {
             self.release(p, t);
+        }
+    }
+
+    /// A clipboard event (the press of its shortcut key); `modifiers` are
+    /// the ones down in that frame.
+    pub fn clipboard(&mut self, clip: Clip, modifiers: &Modifiers, t: f64) {
+        self.modifiers(mods_of(modifiers), t);
+        let code = clip.guess(modifiers);
+        let held = clip.keys().iter().any(|k| self.held.contains(k));
+        if held {
+            return; // OS key repeat
+        }
+        if self.press(code, t) {
+            self.clips.push((self.actions.len() - 1, clip, code));
         }
     }
 
@@ -988,6 +1076,15 @@ impl Page {
             } = e
             {
                 rec.key(*key, *physical_key, *pressed, *repeat, modifiers, time);
+            }
+            let clip = match e {
+                Event::Copy => Some(Clip::Copy),
+                Event::Cut => Some(Clip::Cut),
+                Event::Paste(_) => Some(Clip::Paste),
+                _ => None,
+            };
+            if let Some(clip) = clip {
+                rec.clipboard(clip, &modifiers, time);
             }
         }
         rec.modifiers(mods_of(&modifiers), time);
@@ -2189,6 +2286,77 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_shortcuts_are_recorded_as_the_key() {
+        // egui sends Copy instead of the C press; the release is a key event.
+        let mut r = Recorder::new();
+        r.modifiers(mods_of(&ctrl()), 1.0);
+        r.clipboard(Clip::Copy, &ctrl(), 1.02);
+        r.clipboard(Clip::Copy, &ctrl(), 1.05); // OS key repeat
+        r.key(Key::C, Some(Key::C), false, false, &ctrl(), 1.10);
+        r.modifiers(mods_of(&NONE), 1.15);
+        assert_eq!(
+            r.finish(1.15).actions,
+            vec![
+                mac(0xE0, true, 20),
+                mac(0x06, true, 80),
+                mac(0x06, false, 50),
+                mac(0xE0, false, 0),
+            ]
+        );
+        // Windows Ctrl+Insert also arrives as Copy: the release names the key.
+        let mut r = Recorder::new();
+        r.clipboard(Clip::Copy, &ctrl(), 0.0);
+        r.key(Key::Insert, Some(Key::Insert), false, false, &ctrl(), 0.1);
+        let codes: Vec<(u16, bool)> = r
+            .finish(0.2)
+            .actions
+            .iter()
+            .map(|a| (a.code, a.down))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![(0xE0, true), (0x49, true), (0x49, false), (0xE0, false)]
+        );
+        // Shift+Delete (Windows cut) is guessed as Delete straight away.
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        };
+        let mut r = Recorder::new();
+        r.clipboard(Clip::Cut, &shift, 0.0);
+        assert_eq!(r.actions()[1], mac(0x4C, true, 0));
+        // A layout without Latin letters: the release carries the physical key.
+        let mut r = Recorder::new();
+        r.clipboard(Clip::Paste, &ctrl(), 0.0);
+        r.key(Key::V, Some(Key::V), false, false, &ctrl(), 0.1);
+        assert_eq!(r.actions()[1], mac(0x19, true, 100));
+        assert_eq!(r.actions()[2], mac(0x19, false, 0));
+    }
+
+    #[test]
+    fn a_paste_with_an_empty_clipboard_is_still_recorded() {
+        // egui sends nothing for the press then; only the release arrives.
+        let mut r = Recorder::new();
+        r.modifiers(mods_of(&ctrl()), 0.0);
+        r.key(Key::V, Some(Key::V), false, false, &ctrl(), 0.1);
+        r.modifiers(mods_of(&NONE), 0.2);
+        let codes: Vec<(u16, bool)> = r
+            .finish(0.2)
+            .actions
+            .iter()
+            .map(|a| (a.code, a.down))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![(0xE0, true), (0x19, true), (0x19, false), (0xE0, false)]
+        );
+        // A stray release without the shortcut modifier is still ignored.
+        let mut r = Recorder::new();
+        r.key(Key::V, Some(Key::V), false, false, &NONE, 0.1);
+        assert!(r.is_empty());
+    }
+
+    #[test]
     fn modifiers_on_a_key_event_come_before_the_key() {
         // Ctrl went down in the same frame as the key: Ctrl first.
         let mut r = Recorder::new();
@@ -2864,7 +3032,8 @@ mod tests {
             modifiers: mods,
         };
         let frames = [
-            (1.00, vec![key(Key::C, true, ctrl())], ctrl()),
+            // egui-winit turns the Ctrl+C press into Event::Copy.
+            (1.00, vec![Event::Copy], ctrl()),
             (1.10, vec![key(Key::C, false, ctrl())], ctrl()),
             (1.15, vec![], Modifiers::NONE),
         ];
