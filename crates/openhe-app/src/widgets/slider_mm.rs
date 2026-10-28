@@ -11,7 +11,7 @@ pub fn mm3(um: u16) -> String {
 
 /// "0.40" when the value is a whole hundredth, else "0.405".
 pub fn mm_short(um: u16) -> String {
-    if um % 10 == 0 {
+    if um.is_multiple_of(10) {
         format!("{:.2}", f64::from(um) / 1000.0)
     } else {
         mm3(um)

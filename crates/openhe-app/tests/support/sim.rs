@@ -574,7 +574,7 @@ impl SimTransport {
                     b.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x00]);
                     self.out.push_back(reply(cmd, &b));
                 } else {
-                    for e in pl[1..].chunks_exact(4) {
+                    for e in pl[1..].as_chunks::<4>().0 {
                         p.keys.insert((e[0], e[1]), le(e, 2));
                     }
                     self.out
