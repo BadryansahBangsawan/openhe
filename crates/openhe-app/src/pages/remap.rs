@@ -115,7 +115,7 @@ mod strings {
 use strings as t;
 
 /// The Fn key's own default code. Locked on the Base layer.
-pub const FN_KEY: u8 = 0x01;
+pub use openhe_device::FN_KEY;
 
 pub const LAYERS: [(Layer, &str); 4] = [
     (Layer::Base, "Base"),

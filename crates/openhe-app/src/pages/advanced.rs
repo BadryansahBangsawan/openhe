@@ -224,19 +224,6 @@ impl Func {
     }
 }
 
-fn nibble_of(c: &AdvancedConfig) -> Advanced {
-    match c {
-        AdvancedConfig::None => Advanced::None,
-        AdvancedConfig::Dks(_) => Advanced::Dks,
-        AdvancedConfig::Mt(_) => Advanced::Mt,
-        AdvancedConfig::Tgl(_) => Advanced::Tgl,
-        AdvancedConfig::Mpt(_) => Advanced::Mpt,
-        AdvancedConfig::End(_) => Advanced::End,
-        AdvancedConfig::Socd(_) => Advanced::Socd,
-        AdvancedConfig::Macro => Advanced::Macro,
-    }
-}
-
 // ----------------------------------------------------------- editor state
 
 const DEFAULT_DELAY_MS: u16 = 200;
@@ -1178,11 +1165,11 @@ impl Page {
                 || snap
                     .keys
                     .get(k)
-                    .is_some_and(|s| s.mode.advanced == nibble_of(c))
+                    .is_some_and(|s| s.mode.advanced == c.advanced())
         });
         let nibble = |k: u8| snap.keys.get(&k).map(|s| s.mode.advanced);
         if let (Some(k), Some(e), false) = (self.key, self.editor.as_ref(), settle) {
-            if nibble(k).is_some_and(|n| n != nibble_of(&e.loaded)) {
+            if nibble(k).is_some_and(|n| n != e.loaded.advanced()) {
                 self.editor = None;
             }
         }

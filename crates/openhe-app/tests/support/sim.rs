@@ -797,9 +797,9 @@ impl SimTransport {
         };
         let rows = if part == 1 { 0..3 } else { 3..6 };
         let mut all = vec![0x5C, 0x3C, 0x92, 0x00, 0x00, sub];
-        for r in rows {
-            for c in 0..21 {
-                all.extend_from_slice(&src[r][c].to_le_bytes());
+        for row in &src[rows] {
+            for v in row {
+                all.extend_from_slice(&v.to_le_bytes());
             }
         }
         all.resize(192, 0);

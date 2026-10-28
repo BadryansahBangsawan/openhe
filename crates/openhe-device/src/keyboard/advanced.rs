@@ -24,8 +24,8 @@ pub enum AdvancedConfig {
 
 const SLOTS: [Slot; 4] = [Slot::S1, Slot::S2, Slot::S3, Slot::S4];
 
-/// The Fn key's own default code.
-const FN_KEY: u8 = 0x01;
+/// The Fn key's own default code (its key id in every per-key command).
+pub const FN_KEY: u8 = 0x01;
 /// Layer code 0x0001: transparent ("follow Base") on the Fn layers.
 const TRANSPARENT: u16 = 0x0001;
 
@@ -37,16 +37,19 @@ fn bad_reply(e: AdvancedError) -> Error {
     Error::Io(format!("unexpected advanced-key reply: {e}"))
 }
 
-fn nibble(cfg: &AdvancedConfig) -> Advanced {
-    match cfg {
-        AdvancedConfig::None => Advanced::None,
-        AdvancedConfig::Dks(_) => Advanced::Dks,
-        AdvancedConfig::Mt(_) => Advanced::Mt,
-        AdvancedConfig::Tgl(_) => Advanced::Tgl,
-        AdvancedConfig::Mpt(_) => Advanced::Mpt,
-        AdvancedConfig::End(_) => Advanced::End,
-        AdvancedConfig::Socd(_) => Advanced::Socd,
-        AdvancedConfig::Macro => Advanced::Macro,
+impl AdvancedConfig {
+    /// The advanced-mode nibble of the key's Mode for this function.
+    pub fn advanced(&self) -> Advanced {
+        match self {
+            AdvancedConfig::None => Advanced::None,
+            AdvancedConfig::Dks(_) => Advanced::Dks,
+            AdvancedConfig::Mt(_) => Advanced::Mt,
+            AdvancedConfig::Tgl(_) => Advanced::Tgl,
+            AdvancedConfig::Mpt(_) => Advanced::Mpt,
+            AdvancedConfig::End(_) => Advanced::End,
+            AdvancedConfig::Socd(_) => Advanced::Socd,
+            AdvancedConfig::Macro => Advanced::Macro,
+        }
     }
 }
 
@@ -78,7 +81,8 @@ fn function_packet(key: u8, cfg: &AdvancedConfig) -> Result<Option<Request>, Err
 }
 
 impl<T: Transport> Keyboard<T> {
-    fn read_mode(&mut self, key: u8) -> Result<KeyMode, Error> {
+    /// The Mode of `key`; an unknown value is an `Error::Io`.
+    pub(crate) fn read_mode(&mut self, key: u8) -> Result<KeyMode, Error> {
         let raw = self.key_param(key, KeyParam::Mode)?;
         KeyMode::from_u16(raw)
             .ok_or_else(|| Error::Io(format!("unknown key mode 0x{raw:04X} for key 0x{key:02X}")))
@@ -179,7 +183,7 @@ impl<T: Transport> Keyboard<T> {
     /// last state.
     pub fn set_advanced(&mut self, key: u8, cfg: &AdvancedConfig) -> Result<(), Error> {
         let packet = function_packet(key, cfg)?;
-        let target = nibble(cfg);
+        let target = cfg.advanced();
         let mode_keys = match cfg {
             AdvancedConfig::Socd(s) if s.pos1 != s.pos2 => vec![s.pos1, s.pos2],
             _ => vec![key],

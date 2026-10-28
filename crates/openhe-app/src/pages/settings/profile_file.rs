@@ -30,7 +30,7 @@ pub const VERSION: u32 = 1;
 
 const LAYERS: [Layer; 4] = [Layer::Base, Layer::Fn1, Layer::Fn2, Layer::Fn3];
 /// The Fn key: its own base-layer code is never written.
-const FN_KEY: u8 = 0x01;
+use openhe_device::FN_KEY;
 /// Layer code 0x0001: transparent on the Fn layers, a dead key on Base.
 const TRANSPARENT: u16 = 0x0001;
 
@@ -350,19 +350,6 @@ impl AdvancedEntry {
     }
 }
 
-fn nibble(c: &AdvancedConfig) -> Advanced {
-    match c {
-        AdvancedConfig::None => Advanced::None,
-        AdvancedConfig::Dks(_) => Advanced::Dks,
-        AdvancedConfig::Mt(_) => Advanced::Mt,
-        AdvancedConfig::Tgl(_) => Advanced::Tgl,
-        AdvancedConfig::Mpt(_) => Advanced::Mpt,
-        AdvancedConfig::End(_) => Advanced::End,
-        AdvancedConfig::Socd(_) => Advanced::Socd,
-        AdvancedConfig::Macro => Advanced::Macro,
-    }
-}
-
 impl ProfileFile {
     pub fn from_data(d: &ProfileData) -> ProfileFile {
         ProfileFile {
@@ -427,7 +414,7 @@ impl ProfileFile {
                 settings: KeySettings {
                     mode: KeyMode {
                         touch,
-                        advanced: nibble(&advanced),
+                        advanced: advanced.advanced(),
                         high: 0,
                     },
                     actuation: um(k.actuation_um),
@@ -838,7 +825,7 @@ mod tests {
     fn key(code: u8, touch: TouchMode, advanced: AdvancedConfig) -> KeyData {
         KeyData {
             code,
-            settings: settings(touch, nibble(&advanced)),
+            settings: settings(touch, advanced.advanced()),
             layers: [u16::from(code), 0x3A, 0, 0x01],
             advanced,
         }
