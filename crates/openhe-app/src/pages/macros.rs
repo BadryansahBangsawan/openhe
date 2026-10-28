@@ -122,6 +122,8 @@ mod strings {
     pub const BINDING_FAILED: &str = "Gagal membaca macro di tombol ini";
     pub const WARN_REPLACE: &str =
         "Peringatan: memasang macro baru bisa menggantikan macro di tombol lain. Perilaku ini belum diuji di keyboard sungguhan.";
+    pub const WARN_SHORT: &str =
+        "Belum diuji di keyboard sungguhan: macro lain bisa tergantikan, dan arti jeda belum pasti.";
     pub const WARN_DELAY: &str =
         "Arti jeda (sebelum atau sesudah langkah) belum diuji di keyboard sungguhan.";
 
@@ -1343,59 +1345,86 @@ impl Page {
         });
     }
 
+    /// "Rekam"/"Berhenti" and "+ Tambah langkah", in a right-to-left
+    /// layout.
+    fn record_buttons(&mut self, ctx: &AppCtx, ui: &mut Ui, m: &mut SavedMacro, recording: bool) {
+        let (label, fill, stroke) = if recording {
+            (strings::STOP, color::DANGER, color::DANGER)
+        } else {
+            (strings::RECORD, color::DANGER_SOFT, color::DANGER)
+        };
+        let text_color = if recording {
+            color::ON_ACCENT
+        } else {
+            color::DANGER
+        };
+        let rec = egui::Button::new(
+            RichText::new(format!("● {label}"))
+                .color(text_color)
+                .strong(),
+        )
+        .fill(fill)
+        .stroke(line(1.0, stroke))
+        .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
+        .min_size(egui::vec2(0.0, 36.0));
+        if ui.add(rec).clicked() {
+            let time = ui.input(|i| i.time);
+            if recording {
+                self.stop_recording(ctx, time, false);
+                // `m` was read before the recording was stored.
+                if let Some(fresh) = self.current(ctx) {
+                    *m = fresh;
+                }
+            } else {
+                self.start_recording(time, m.actions.len());
+            }
+        }
+        let add = egui::Button::new(strings::ADD_STEP)
+            .fill(color::BG)
+            .stroke(line(1.0, color::BORDER_STRONG))
+            .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
+            .min_size(egui::vec2(0.0, 36.0));
+        if ui.add_enabled(!recording, add).clicked() {
+            self.adding = !self.adding;
+        }
+    }
+
     fn editor_header(&mut self, ctx: &AppCtx, ui: &mut Ui, m: &mut SavedMacro) {
         let recording = self.recording();
-        ui.horizontal(|ui| {
+        // Name and buttons share a row only when both fit; in a narrow
+        // window the buttons get a row of their own.
+        let wide = ui.available_width() >= 620.0;
+        if wide {
+            ui.horizontal(|ui| {
+                ui.add_enabled(
+                    !recording,
+                    egui::TextEdit::singleline(&mut m.name)
+                        .hint_text(strings::NAME_HINT)
+                        .font(font::heading())
+                        .desired_width(ui.available_width() - 300.0),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.record_buttons(ctx, ui, m, recording);
+                });
+            });
+        } else {
             ui.add_enabled(
                 !recording,
                 egui::TextEdit::singleline(&mut m.name)
                     .hint_text(strings::NAME_HINT)
                     .font(font::heading())
-                    .desired_width(ui.available_width() - 270.0),
+                    .desired_width(ui.available_width() - 12.0),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (label, fill, stroke) = if recording {
-                    (strings::STOP, color::DANGER, color::DANGER)
-                } else {
-                    (strings::RECORD, color::DANGER_SOFT, color::DANGER)
-                };
-                let text_color = if recording {
-                    color::ON_ACCENT
-                } else {
-                    color::DANGER
-                };
-                let rec = egui::Button::new(
-                    RichText::new(format!("● {label}"))
-                        .color(text_color)
-                        .strong(),
-                )
-                .fill(fill)
-                .stroke(line(1.0, stroke))
-                .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
-                .min_size(egui::vec2(0.0, 36.0));
-                if ui.add(rec).clicked() {
-                    let time = ui.input(|i| i.time);
-                    if recording {
-                        self.stop_recording(ctx, time, false);
-                        // `m` was read before the recording was stored.
-                        if let Some(fresh) = self.current(ctx) {
-                            *m = fresh;
-                        }
-                    } else {
-                        self.start_recording(time, m.actions.len());
-                    }
-                }
-                let add = egui::Button::new(strings::ADD_STEP)
-                    .fill(color::BG)
-                    .stroke(line(1.0, color::BORDER_STRONG))
-                    .corner_radius(CornerRadius::same(size::CONTROL_RADIUS))
-                    .min_size(egui::vec2(0.0, 36.0));
-                if ui.add_enabled(!recording, add).clicked() {
-                    self.adding = !self.adding;
-                }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.record_buttons(ctx, ui, m, recording);
+                });
             });
-        });
-        ui.horizontal(|ui| {
+        }
+        // The totals, then the library actions; they wrap instead of
+        // drawing over each other.
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!(
                     "{} {} {} · {} {}",
@@ -1408,40 +1437,39 @@ impl Page {
                 .font(font::small())
                 .color(color::MUTED),
             );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let idle = !recording;
-                if text_button(
-                    ui,
-                    self.confirm_delete,
-                    strings::DELETE,
-                    strings::DELETE_CONFIRM,
-                    idle,
-                ) {
-                    if self.confirm_delete {
-                        let mut lib = ctx.data.borrow_mut();
-                        if let Some(i) = self.selected {
-                            self.selected = library_delete(&mut lib.macros, i);
-                        }
-                        drop(lib);
-                        self.confirm_delete = false;
-                        self.persist(ctx);
-                    } else {
-                        self.confirm_delete = true;
-                    }
+            ui.add_space(12.0);
+            let idle = !recording;
+            if text_button(ui, false, strings::CLEAR, "", idle && !m.actions.is_empty()) {
+                m.actions.clear();
+                self.step_sel = None;
+            }
+            if text_button(ui, false, strings::DUPLICATE, "", idle) {
+                if let Some(i) = self.selected {
+                    let new = library_duplicate(&mut ctx.data.borrow_mut().macros, i);
+                    self.selected = new.or(self.selected);
+                    self.confirm_delete = false;
+                    self.persist(ctx);
                 }
-                if text_button(ui, false, strings::DUPLICATE, "", idle) {
+            }
+            if text_button(
+                ui,
+                self.confirm_delete,
+                strings::DELETE,
+                strings::DELETE_CONFIRM,
+                idle,
+            ) {
+                if self.confirm_delete {
+                    let mut lib = ctx.data.borrow_mut();
                     if let Some(i) = self.selected {
-                        let new = library_duplicate(&mut ctx.data.borrow_mut().macros, i);
-                        self.selected = new.or(self.selected);
-                        self.confirm_delete = false;
-                        self.persist(ctx);
+                        self.selected = library_delete(&mut lib.macros, i);
                     }
+                    drop(lib);
+                    self.confirm_delete = false;
+                    self.persist(ctx);
+                } else {
+                    self.confirm_delete = true;
                 }
-                if text_button(ui, false, strings::CLEAR, "", idle && !m.actions.is_empty()) {
-                    m.actions.clear();
-                    self.step_sel = None;
-                }
-            });
+            }
         });
         if recording {
             ui.add_space(6.0);
@@ -1604,10 +1632,12 @@ impl Page {
                             key_chip(ui, &code_label(m.actions[i].code));
                             delay_box(ui, &mut m.actions[i].delay_ms, editable);
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
+                                ui.spacing_mut().item_spacing.x = 8.0;
                                 let small = |t: &str| {
-                                    egui::Button::new(RichText::new(t).color(color::MUTED))
-                                        .frame(false)
+                                    egui::Button::new(
+                                        RichText::new(t).font(font::bold(14.0)).color(color::MUTED),
+                                    )
+                                    .frame(false)
                                 };
                                 if ui
                                     .add_enabled(editable && i > 0, small("↑"))
@@ -1744,9 +1774,6 @@ impl Page {
         self.target_row(ctx, ui);
         ui.add_space(6.0);
         self.binding_row(ctx, ui);
-        ui.add_space(12.0);
-        card::hint(ui, strings::WARN_REPLACE);
-        card::hint(ui, strings::WARN_DELAY);
     }
 
     fn target_row(&mut self, ctx: &AppCtx, ui: &mut Ui) {
@@ -1830,6 +1857,22 @@ impl Page {
     }
 
     fn apply_area(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        // Both "untested" warnings, short, right above the button (the full
+        // text on hover), so the scroll area never cuts them off.
+        ui.add(
+            egui::Label::new(
+                RichText::new(strings::WARN_SHORT)
+                    .font(font::small())
+                    .color(color::MUTED),
+            )
+            .sense(Sense::hover()),
+        )
+        .on_hover_text(format!(
+            "{}\n\n{}",
+            strings::WARN_REPLACE,
+            strings::WARN_DELAY
+        ));
+        ui.add_space(8.0);
         let idle = ctx.can_write() && !self.job_pending() && !self.recording();
         if let Some(f) = self.failure.clone() {
             let retry = (idle && self.last_bind.is_some()).then_some(i18n::common::RETRY);
