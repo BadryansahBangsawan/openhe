@@ -92,6 +92,29 @@ impl World {
         self.frames(2);
     }
 
+    /// Opens the n-th code button labelled `button` (a remap code field),
+    /// searches `search` and picks the chip labelled `chip`.
+    pub fn pick_code(&mut self, button: &str, n: usize, search: &str, chip: &str) {
+        self.click_nth(button, n);
+        let fields = self.h.query_all_by_role(Role::TextInput).count();
+        assert!(fields > 0, "no search field; on screen: {:?}", self.labels());
+        // The picker's search field is the newest text field.
+        self.click_role(Role::TextInput, fields - 1);
+        // The picker keeps its last search: replace it.
+        self.h.input_mut().events.push(Event::Key {
+            key: Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        });
+        self.type_text(search);
+        // The chip, not the code button (the last node with that label).
+        let n = self.h.query_all_by_label(chip).count();
+        assert!(n > 0, "no chip {chip:?}; on screen: {:?}", self.labels());
+        self.click_nth(chip, n - 1);
+    }
+
     /// Whether the n-th node with `role` is checked.
     pub fn role_checked(&self, role: Role, n: usize) -> bool {
         self.h

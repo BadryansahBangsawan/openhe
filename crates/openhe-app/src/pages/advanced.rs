@@ -560,13 +560,26 @@ fn round_delay(ms: u16) -> Result<u16, String> {
 
 /// Keys whose Mode may change when `new` replaces `loaded` on `key`: the key
 /// itself and both SOCD pairs (the old partner is cleared too).
-pub fn affected_keys(key: u8, loaded: &AdvancedConfig, new: &AdvancedConfig) -> Vec<u8> {
+///
+/// When `new` is a SOCD pair, the partner the *other* key of the pair had
+/// before is cleared by the keyboard as well (`set_advanced`), and this
+/// page may not know it, so every key in SOCD mode now (`in_socd`, from
+/// the snapshot) is re-read too.
+pub fn affected_keys(
+    key: u8,
+    loaded: &AdvancedConfig,
+    new: &AdvancedConfig,
+    in_socd: &[u8],
+) -> Vec<u8> {
     let mut keys = BTreeSet::from([key]);
     for c in [loaded, new] {
         if let AdvancedConfig::Socd(s) = c {
             keys.insert(s.pos1);
             keys.insert(s.pos2);
         }
+    }
+    if matches!(new, AdvancedConfig::Socd(_)) {
+        keys.extend(in_socd.iter().copied());
     }
     keys.into_iter().collect()
 }
@@ -1216,7 +1229,14 @@ impl Page {
             .editor
             .as_ref()
             .map_or(AdvancedConfig::None, |e| e.loaded);
-        let affected = affected_keys(key, &loaded, &cfg);
+        let in_socd: Vec<u8> = ctx.snapshot.map_or_else(Vec::new, |s| {
+            s.keys
+                .iter()
+                .filter(|(_, v)| v.mode.advanced == Advanced::Socd)
+                .map(|(&k, _)| k)
+                .collect()
+        });
+        let affected = affected_keys(key, &loaded, &cfg, &in_socd);
         self.error = None;
         self.error_technical = None;
         self.applied = false;
@@ -1959,6 +1979,21 @@ fn dks_track(ui: &mut Ui, row: usize, flags: &mut [bool; 7], width: f32, c: Colo
             flags[2 * i + 1] = !flags[2 * i + 1];
         }
         let on = flags[2 * i + 1];
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Checkbox,
+                enabled,
+                on,
+                format!(
+                    "DKS {} · {} {}–{}",
+                    row + 1,
+                    t::D_HOLD,
+                    t::DKS_PHASES[i].replace('\n', " "),
+                    t::DKS_PHASES[i + 1].replace('\n', " ")
+                ),
+            )
+        });
+        let on = flags[2 * i + 1];
         let bar = Rect::from_center_size(
             link.center(),
             egui::vec2(link.width(), if on { 6.0 } else { 2.0 }),
@@ -1981,6 +2016,15 @@ fn dks_track(ui: &mut Ui, row: usize, flags: &mut [bool; 7], width: f32, c: Colo
         if resp.clicked() {
             flags[2 * i] = !flags[2 * i];
         }
+        let on = flags[2 * i];
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Checkbox,
+                enabled,
+                on,
+                format!("DKS {} · {}", row + 1, t::DKS_PHASES[i].replace('\n', " ")),
+            )
+        });
         let p = ui.painter();
         let ctr = egui::pos2(x(i), cy);
         if flags[2 * i] {
@@ -2278,13 +2322,22 @@ mod tests {
             mode: SocdMode::LastInput,
             delay: 0,
         });
-        assert_eq!(affected_keys(0x04, &old, &new), vec![0x04, 0x07, 0x16]);
+        assert_eq!(affected_keys(0x04, &old, &new, &[]), vec![0x04, 0x07, 0x16]);
         assert_eq!(
-            affected_keys(0x04, &old, &AdvancedConfig::None),
+            affected_keys(0x04, &old, &AdvancedConfig::None, &[0x04, 0x07]),
             vec![0x04, 0x07]
         );
         let mt = AdvancedConfig::End(End { code: 5 });
-        assert_eq!(affected_keys(0x0A, &AdvancedConfig::None, &mt), vec![0x0A]);
+        assert_eq!(
+            affected_keys(0x0A, &AdvancedConfig::None, &mt, &[0x04, 0x07]),
+            vec![0x0A]
+        );
+        // S (0x16) was paired with Z (0x1D): binding A+S clears Z too, so Z
+        // is re-read although this page never read S's old pair.
+        assert_eq!(
+            affected_keys(0x04, &AdvancedConfig::None, &new, &[0x16, 0x1D]),
+            vec![0x04, 0x16, 0x1D]
+        );
     }
 
     // ---- descriptions, selection, decoration
