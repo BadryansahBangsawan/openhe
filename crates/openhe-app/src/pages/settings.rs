@@ -25,7 +25,7 @@ use crate::worker::{Debounce, DeviceSnapshot, Pending, WorkerHandle};
 use eframe::egui::{self, Align, Align2, CornerRadius, Layout, Rect, RichText, Sense, Ui};
 use openhe_device::{Error, Keyboard, Transport, WriteOutcome};
 use openhe_proto::{PollingRate, SystemMode};
-use os::{set_launch_at_login, ForegroundWatcher};
+use os::{launch_at_login_enabled, set_launch_at_login, ForegroundWatcher};
 use profile_file::{
     export_job, import_job, plan_import, Exported, FileError, ImportPlan, ImportReport, ImportStep,
     ProfileData, ProfileFile,
@@ -786,6 +786,9 @@ pub struct Page {
     /// The saved "per-app switching on" was looked at (once per run).
     auto_restored: bool,
     app_error: Option<String>,
+    /// Launch at login as the OS has it (read once, and after a change);
+    /// the outer `None` is "not read yet", the inner one "unreadable".
+    login_os: Option<Option<bool>>,
     new_rule: (String, u8),
     reset_open: bool,
     reset_text: String,
@@ -806,6 +809,7 @@ impl Default for Page {
             auto: Arc::default(),
             auto_restored: false,
             app_error: None,
+            login_os: None,
             new_rule: (String::new(), 0),
             reset_open: false,
             reset_text: String::new(),
@@ -1460,9 +1464,14 @@ impl Page {
                 self.rules_editor(ctx, ui);
             }
             setting_row(ui, t::LOGIN, None, true, |ui| {
-                let mut on = ctx.data.borrow().launch_at_login;
+                // The OS entry is the truth (the saved flag can be stale
+                // after a recovered data file); the flag is the fallback.
+                let os = *self.login_os.get_or_insert_with(launch_at_login_enabled);
+                let mut on = os.unwrap_or(ctx.data.borrow().launch_at_login);
                 if toggle(ui, &mut on, true).changed() {
-                    match set_launch_at_login(on) {
+                    let r = set_launch_at_login(on);
+                    self.login_os = None; // read again
+                    match r {
                         Ok(()) => {
                             ctx.data.borrow_mut().launch_at_login = on;
                             if ctx.save_data().is_err() {

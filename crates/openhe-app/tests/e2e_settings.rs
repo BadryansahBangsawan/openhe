@@ -231,3 +231,21 @@ fn import_refuses_0x0001_on_base() {
     assert!(text.contains("0x0001"), "{text}");
     assert_eq!(w.sim().set_count(), 0);
 }
+
+#[test]
+fn launch_at_login_shows_the_os_state_not_the_saved_flag() {
+    // The data file says "on", but the (test) home has no autostart entry,
+    // e.g. after a recovered data file or a moved app.
+    let mut data = openhe_app::storage::AppData::default();
+    data.launch_at_login = true;
+    let mut w = World::with(Sim::new(), data, fast_config());
+    w.page("Pengaturan");
+    // Checkboxes: per-app switching, then launch at login.
+    assert_eq!(
+        w.role_count(eframe::egui::accesskit::Role::CheckBox),
+        2,
+        "{:?}",
+        w.labels()
+    );
+    assert!(!w.role_checked(eframe::egui::accesskit::Role::CheckBox, 1));
+}
