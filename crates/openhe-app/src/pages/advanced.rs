@@ -2761,6 +2761,56 @@ mod tests {
     // ---- page, headless
 
     #[test]
+    fn an_import_that_only_changes_dks_params_drops_the_cached_config() {
+        use crate::worker::tests::push_snapshot_with_mode;
+        use crate::worker::{Worker, WorkerConfig};
+        use std::time::{Duration, Instant};
+        // W and A are DKS keys before and after the import: the snapshot
+        // the reload reads is equal to the old one.
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot_with_mode(&mut m, 0, 0x0001);
+                push_snapshot_with_mode(&mut m, 0, 0x0001);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            WorkerConfig {
+                retry_interval: Duration::from_millis(5),
+                idle_poll: Duration::from_millis(2),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !w.is_connected() {
+            assert!(Instant::now() < deadline, "never connected");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let snap = w.snapshot().unwrap();
+        let old = AdvancedConfig::Dks(Dks {
+            bindings: [0x1A, 0, 0, 0],
+            trps: [0x01, 0, 0, 0],
+            first_actuation: um(1500),
+            bottom: um(3400),
+        });
+        let mut page = Page::default();
+        page.cache.insert(0x1A, old);
+        page.cache.insert(0x04, old);
+        page.follow_generation(w.generation(), false);
+        // The import finished: Pengaturan asks the worker for a reload.
+        let g = w.generation();
+        w.request_reload();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.generation() == g {
+            assert!(Instant::now() < deadline, "the reload never showed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        page.follow_generation(w.generation(), false);
+        assert!(page.cache.is_empty(), "stale DKS parameters dropped");
+        // ... and read again.
+        let plan = plan_read(&snap, &page.cache, &page.read_failed, None, true);
+        assert_eq!(plan.map(|(keys, _)| keys.len()), Some(2));
+    }
+
+    #[test]
     fn any_reload_drops_cached_configs_except_the_pages_own_apply() {
         let mut page = Page::default();
         let fill = |page: &mut Page| {

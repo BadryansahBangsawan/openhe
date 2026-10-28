@@ -319,6 +319,20 @@ impl Control {
         self.repaint();
     }
 
+    /// A background reload read `s`: the generation always moves, also
+    /// when `s` equals the shown snapshot. The snapshot does not hold
+    /// function parameters (DKS, MT, TGL, MPT, END), so an import or write
+    /// that changed only those reads an equal snapshot, and pages caching
+    /// them must still see the reload.
+    fn set_status_reloaded(&self, s: ConnectionStatus) {
+        let before = self.generation.load(Ordering::SeqCst);
+        self.set_status(s);
+        if self.generation.load(Ordering::SeqCst) == before {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.repaint();
+        }
+    }
+
     fn set_current(&self, label: Option<&'static str>) {
         self.lock().current = label;
         self.repaint();
@@ -564,7 +578,10 @@ impl<T: Transport + 'static> Worker<T> {
         self.ctl.patch_snapshot(f);
     }
 
-    /// Bumped whenever the status or the snapshot changes.
+    /// Bumped whenever the status or the snapshot changes, and after every
+    /// background reload (requested, after keyboard events, or a retry),
+    /// even when it read an equal snapshot: function parameters are not
+    /// part of the snapshot, so a page caching them re-reads on any move.
     pub fn generation(&self) -> u64 {
         self.ctl.generation.load(Ordering::SeqCst)
     }
@@ -1104,7 +1121,7 @@ fn run<T: Transport>(
                 Ok((snap, skipped)) => {
                     retry.reset();
                     ctl.notices(|n| n.loaded(skipped));
-                    ctl.set_status(ConnectionStatus::Connected(snap));
+                    ctl.set_status_reloaded(ConnectionStatus::Connected(snap));
                 }
                 Err(_) if panicked => {
                     kb = None;
@@ -1172,6 +1189,17 @@ pub(crate) mod tests {
 
     /// The replies of a load after its handshake.
     pub(crate) fn push_snapshot_rest(m: &mut MockTransport, profile: u8) {
+        push_snapshot_rest_with_mode(m, profile, 0);
+    }
+
+    /// Every reply of a load, with `mode` as the Mode of both keys (e.g.
+    /// `0x0001`: a DKS key).
+    pub(crate) fn push_snapshot_with_mode(m: &mut MockTransport, profile: u8, mode: u16) {
+        push_handshake(m);
+        push_snapshot_rest_with_mode(m, profile, mode);
+    }
+
+    fn push_snapshot_rest_with_mode(m: &mut MockTransport, profile: u8, mode: u16) {
         m.push_reply(order_reply(0x21, 1));
         m.push_reply(order_reply(0x70, profile));
         m.push_reply(order_reply(0x50, 0));
@@ -1180,7 +1208,7 @@ pub(crate) mod tests {
         m.push_reply(reply(0x2B, &[(1, &[4]), (23, &[5])]));
         for key in KEYS {
             for (layout, v) in [
-                (8, 0),
+                (8, mode),
                 (4, 2000),
                 (20, 20),
                 (21, 20),
@@ -1471,6 +1499,27 @@ pub(crate) mod tests {
         wait_for("event reload", || {
             w.snapshot().is_some_and(|s| s.profile == 3)
         });
+    }
+
+    #[test]
+    fn a_requested_reload_moves_the_generation_even_when_nothing_changed() {
+        // Function parameters (DKS, MT, ...) are not in the snapshot, so a
+        // reload after an import that changed only them reads an equal
+        // snapshot. Pages caching such parameters still have to see it.
+        let w = Worker::spawn_with(
+            Box::new(|| {
+                let mut m = MockTransport::new();
+                push_snapshot(&mut m, 0);
+                push_snapshot(&mut m, 0);
+                Ok(Keyboard::new(m, Model::Win68HeMax))
+            }),
+            fast(),
+        );
+        wait_for("connect", || w.is_connected());
+        let g = w.generation();
+        w.request_reload();
+        wait_for("generation moved", || w.generation() != g);
+        assert_eq!(w.notice(), None, "the reload itself worked");
     }
 
     #[test]
