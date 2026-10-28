@@ -235,6 +235,12 @@ impl OpenHeApp {
         self.performance.preview_live(depths, select);
     }
 
+    /// Screenshot hook: see `pages::settings::Page::preview`.
+    #[cfg(feature = "preview")]
+    pub fn preview_settings(&mut self, state: u8) {
+        self.settings.preview(state);
+    }
+
     /// Polls the top-bar switch job and starts a new one if asked.
     fn run_topbar(&mut self, action: TopbarAction) {
         if let Some(sw) = self.switch.as_mut() {
@@ -411,6 +417,11 @@ impl OpenHeApp {
             theme: &self.theme,
             data: &self.data,
         };
+        // Per-app profile switching and Pengaturan's restart flows run
+        // whichever page is shown.
+        if let Some(e) = self.settings.background(&app_ctx, calibrating, ctx) {
+            self.shell_error = Some((e, None));
+        }
         egui::CentralPanel::default()
             .frame(Frame::new().fill(color::BG))
             .show(ctx, |ui| match self.page {

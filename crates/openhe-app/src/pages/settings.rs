@@ -1,13 +1,34 @@
-//! Pengaturan page (polling, Win/Mac, profiles, reset). Track F, Wave 2.
+//! Pengaturan (mockup `docs/design/mockups/07-pengaturan.png`): polling
+//! rate, Win/Mac, the four onboard profiles (switch, local names,
+//! import/export to JSON), per-app automatic profile switching, launch at
+//! login, device info and factory reset.
 //!
 //! Also home of the profile and Win/Mac switch jobs, which the top bar
-//! shares.
+//! shares, and of the restart flow ([`Restart`]) for writes after which the
+//! keyboard re-enumerates (polling rate, factory reset): the page shows
+//! "Menyambung ulang…", never an error, while the worker reconnects.
 
-use crate::app::AppCtx;
+pub mod os;
+pub mod profile_file;
+
+use crate::app::{firmware_label, page_with_right_panel, AppCtx};
 use crate::i18n;
-use eframe::egui;
-use openhe_device::{Error, Keyboard, Transport};
-use openhe_proto::SystemMode;
+use crate::theme::{color, font, line, size};
+use crate::widgets::card::{self, Card};
+use crate::widgets::keyboard::legend_list;
+use crate::widgets::segmented::Segmented;
+use crate::widgets::toggle::toggle;
+use crate::worker::{DeviceSnapshot, Pending};
+use eframe::egui::{self, Align, Align2, CornerRadius, Layout, Rect, RichText, Sense, Ui};
+use openhe_device::{Error, Keyboard, Transport, WriteOutcome};
+use openhe_proto::{PollingRate, SystemMode};
+use os::{set_launch_at_login, ForegroundWatcher};
+use profile_file::{
+    export_job, import_job, plan_import, Exported, FileError, ImportPlan, ImportReport, ImportStep,
+    ProfileFile,
+};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 // ------------------------------------------------------- switch jobs
 
@@ -131,15 +152,1270 @@ pub fn apply_switch_effects(
     fx.error.map(|e| (e, fx.technical))
 }
 
+// ------------------------------------------------------ restart flows
+
+/// Pause before reconnecting after a write that restarts the keyboard.
+pub const RECONNECT_PAUSE: Duration = Duration::from_millis(1500);
+/// Give up waiting for the keyboard to come back after this long.
+pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A write after which the keyboard re-enumerates on USB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartKind {
+    Polling(PollingRate),
+    FactoryReset,
+}
+
+/// The polling-rate / factory-reset flow (Review Focus 4): the write, then
+/// "Menyambung ulang…" (never an error) while the worker reconnects, then a
+/// check of what the keyboard reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restart {
+    Idle,
+    /// The write is queued or running; `connects` is
+    /// [`Worker::connects`] when it was sent.
+    Sending {
+        kind: RestartKind,
+        connects: u64,
+    },
+    Reconnecting {
+        kind: RestartKind,
+        connects: u64,
+        since: Instant,
+    },
+    Done(String),
+    Failed(String, Option<String>),
+}
+
+/// What the page must do after [`Restart::job_done`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartAction {
+    None,
+    /// Ask the worker to drop the keyboard and reconnect after a pause.
+    Reconnect,
+    /// The write failed outright: re-read the state.
+    Reload,
+}
+
+impl Restart {
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Restart::Sending { .. } | Restart::Reconnecting { .. })
+    }
+
+    /// The write was sent.
+    pub fn begin(kind: RestartKind, connects: u64) -> Restart {
+        Restart::Sending { kind, connects }
+    }
+
+    /// The write job finished. `Done`, `Reenumerating` and `Disconnected`
+    /// all mean "the keyboard restarts": wait for it to come back.
+    pub fn job_done(&mut self, r: Result<WriteOutcome, Error>, now: Instant) -> RestartAction {
+        let Restart::Sending { kind, connects } = *self else {
+            return RestartAction::None;
+        };
+        match r {
+            Ok(_) => {
+                *self = Restart::Reconnecting {
+                    kind,
+                    connects,
+                    since: now,
+                };
+                RestartAction::Reconnect
+            }
+            // The worker has dropped the keyboard already.
+            Err(Error::Disconnected) => {
+                *self = Restart::Reconnecting {
+                    kind,
+                    connects,
+                    since: now,
+                };
+                RestartAction::None
+            }
+            Err(e) => {
+                *self = Restart::Failed(
+                    format!("{} {}", t::WRITE_FAILED, i18n::device_error(&e)),
+                    Some(i18n::technical(&e)),
+                );
+                RestartAction::Reload
+            }
+        }
+    }
+
+    /// Watches the worker while reconnecting: done once a new connection
+    /// has loaded a snapshot; the polling rate is checked against it.
+    pub fn observe(&mut self, connects: u64, snapshot: Option<&DeviceSnapshot>, now: Instant) {
+        let Restart::Reconnecting {
+            kind,
+            connects: before,
+            since,
+        } = *self
+        else {
+            return;
+        };
+        match snapshot {
+            Some(s) if connects > before => {
+                *self = match kind {
+                    RestartKind::Polling(r) if s.polling == r => {
+                        Restart::Done(format!("{} {} Hz.", t::POLLING_DONE, r.hz()))
+                    }
+                    RestartKind::Polling(_) => Restart::Failed(
+                        format!("{} {} Hz.", t::POLLING_MISMATCH, s.polling.hz()),
+                        None,
+                    ),
+                    RestartKind::FactoryReset => Restart::Done(t::RESET_DONE.to_string()),
+                };
+            }
+            _ if now.duration_since(since) >= RECONNECT_TIMEOUT => {
+                *self = Restart::Failed(t::NOT_BACK.to_string(), None);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Sets the polling rate (one attempt; see `Keyboard::set_polling_rate`).
+pub fn polling_job<T: Transport>(
+    kb: &mut Keyboard<T>,
+    rate: PollingRate,
+) -> Result<WriteOutcome, Error> {
+    kb.set_polling_rate(rate)
+}
+
+/// Factory reset (one attempt). The board restarts, so no reply
+/// (`Timeout`) means "restarting", like a disconnect.
+pub fn reset_job<T: Transport>(kb: &mut Keyboard<T>) -> Result<WriteOutcome, Error> {
+    match kb.factory_reset() {
+        Ok(()) => Ok(WriteOutcome::Done),
+        Err(Error::Timeout) => Ok(WriteOutcome::Reenumerating),
+        Err(e) => Err(e),
+    }
+}
+
+/// The typed confirmation for a factory reset.
+pub fn reset_confirmed(typed: &str) -> bool {
+    typed.trim() == RESET_WORD
+}
+
+pub const RESET_WORD: &str = "RESET";
+
+// ------------------------------------------------- per-app switching
+
+/// The profile for `app` from `rules`: the first rule whose app name
+/// matches (trimmed, case-insensitive). Empty names and profiles outside
+/// 0..=3 never match.
+pub fn match_rule(app: &str, rules: &[(String, u8)]) -> Option<u8> {
+    let app = app.trim();
+    if app.is_empty() {
+        return None;
+    }
+    rules
+        .iter()
+        .find(|(name, p)| {
+            *p <= 3 && !name.trim().is_empty() && name.trim().eq_ignore_ascii_case(app)
+        })
+        .map(|(_, p)| *p)
+}
+
+/// Decides when the foreground app should switch the profile: only when a
+/// rule matches and the keyboard is on another profile, and at most once
+/// per (app, profile) while that app stays in front, so a failing or
+/// overridden switch is not retried in a loop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoSwitch {
+    attempted: Option<(String, u8)>,
+}
+
+impl AutoSwitch {
+    pub fn decide(&mut self, app: Option<&str>, rules: &[(String, u8)], current: u8) -> Option<u8> {
+        let Some(app) = app else {
+            self.attempted = None;
+            return None;
+        };
+        let Some(target) = match_rule(app, rules) else {
+            self.attempted = None;
+            return None;
+        };
+        let key = (app.trim().to_lowercase(), target);
+        if target == current || self.attempted.as_ref() == Some(&key) {
+            self.attempted = Some(key);
+            return None;
+        }
+        self.attempted = Some(key);
+        Some(target)
+    }
+}
+
 // --------------------------------------------------------------- page
 
-#[derive(Default)]
-pub struct Page;
+mod strings {
+    pub const KEYBOARD: &str = "Keyboard";
+    pub const POLLING: &str = "Polling rate";
+    pub const POLLING_HINT: &str = "Makin tinggi makin responsif, tapi makin berat untuk CPU";
+    pub const POLLING_RESTART: &str = "Keyboard tersambung ulang sebentar setelah diganti.";
+    pub const SYSTEM: &str = "Mode sistem";
+    pub const SYSTEM_HINT: &str = "Menukar posisi Win/Alt dan tombol media sesuai OS";
+    pub const WIN_LINUX: &str = "Windows / Linux";
+    pub const MACOS: &str = "macOS";
+    pub const PROFILES: &str = "Profil di keyboard";
+    pub const PROFILE: &str = "Profil";
+    pub const ACTIVE: &str = "aktif";
+    pub const UNNAMED: &str = "Tanpa nama";
+    pub const NAME_HINT: &str =
+        "Nama disimpan di komputer ini. Klik kartu untuk mengaktifkan profil.";
+    pub const IMPORT: &str = "Impor…";
+    pub const EXPORT: &str = "Ekspor…";
+    pub const EXPORTING: &str = "Membaca profil dari keyboard…";
+    pub const EXPORTED: &str = "Profil diekspor ke";
+    pub const EXPORTED_NO_LIGHT: &str = "Lampu tidak terbaca, jadi tidak ikut diekspor.";
+    pub const EXPORT_FAILED: &str = "Gagal mengekspor profil.";
+    pub const WRITE_FILE_FAILED: &str = "File tidak bisa disimpan.";
+    pub const READ_FILE_FAILED: &str = "File tidak bisa dibaca.";
+    pub const IMPORT_TITLE: &str = "Impor ke profil";
+    pub const IMPORT_KEYS: &str = "tombol";
+    pub const IMPORT_FUNCS: &str = "fungsi lanjutan";
+    pub const IMPORT_LIGHT: &str = "lampu";
+    pub const IMPORT_OVERWRITE: &str = "Pengaturan profil ini di keyboard akan ditimpa.";
+    pub const IMPORT_MACROS: &str = "Isi macro tidak ikut diimpor; tombol macro dilewati:";
+    pub const IMPORT_APPLY: &str = "Terapkan";
+    pub const CANCEL: &str = "Batal";
+    pub const IMPORTING: &str = "Mengimpor ke keyboard…";
+    pub const IMPORTED: &str = "Profil diimpor dan dibaca ulang dari keyboard.";
+    pub const IMPORT_PARTIAL: &str = "Sebagian impor gagal; nilai sudah dibaca ulang:";
+    pub const IMPORT_DISCONNECTED: &str =
+        "Keyboard terputus saat impor. Sebagian pengaturan mungkin sudah tertulis; nilai dibaca ulang saat tersambung.";
+    pub const PART_PERF: &str = "performa";
+    pub const PART_ADV: &str = "fungsi lanjutan";
+    pub const PART_LAYERS: &str = "remap";
+    pub const PART_LIGHT: &str = "lampu";
+    pub const PART_COLORS: &str = "warna per tombol";
+    pub const FILE_NOT_JSON: &str = "File ini bukan JSON yang valid.";
+    pub const FILE_NOT_PROFILE: &str = "File ini bukan profil OpenHE.";
+    pub const FILE_NEWER: &str = "File ini dibuat oleh OpenHE yang lebih baru.";
+    pub const FILE_MODEL: &str = "Model keyboard di file tidak dikenal.";
+    pub const FILE_WRONG_MODEL: &str = "Profil ini untuk keyboard lain:";
+    pub const FILE_BAD_VALUE: &str = "File berisi nilai yang tidak valid.";
+
+    pub const APP: &str = "Aplikasi";
+    pub const AUTO: &str = "Ganti profil otomatis per aplikasi";
+    pub const AUTO_HINT: &str = "Contoh: buka Valorant → Profil 2. Butuh OpenHE tetap berjalan.";
+    pub const AUTO_FRONT: &str = "Aplikasi di depan:";
+    pub const AUTO_NONE: &str = "belum terbaca";
+    pub const AUTO_ADD: &str = "Tambah";
+    pub const AUTO_APP_HINT: &str = "Nama aplikasi";
+    pub const AUTO_REMOVE: &str = "Hapus";
+    pub const AUTO_NO_RULES: &str = "Belum ada aturan. Tambahkan aplikasi dan profilnya.";
+    pub const AUTO_FAILED: &str = "Pemantau aplikasi tidak bisa dijalankan.";
+    pub const AUTO_SESSION: &str =
+        "Aturan disimpan; sakelar ini perlu dinyalakan lagi setiap OpenHE dibuka.";
+    pub const LOGIN: &str = "Jalankan saat komputer menyala";
+    pub const LOGIN_FAILED: &str = "Pengaturan jalan otomatis gagal diubah.";
+    pub const LANGUAGE: &str = "Bahasa";
+    pub const LANGUAGE_ID: &str = "Bahasa Indonesia";
+    pub const THEME: &str = "Tema";
+    pub const THEME_LIGHT: &str = "Terang";
+    pub const THEME_DARK: &str = "Gelap";
+    pub const THEME_SYSTEM: &str = "Ikut sistem";
+    pub const THEME_ONLY_DARK: &str = "Saat ini hanya tema gelap.";
+    pub const SAVE_FAILED: &str = "Pengaturan lokal tidak bisa disimpan.";
+
+    pub const DEVICE: &str = "Perangkat";
+    pub const MODEL: &str = "Model";
+    pub const FIRMWARE: &str = "Firmware";
+    pub const SERIAL: &str = "Nomor seri";
+    pub const USB: &str = "USB";
+    pub const FIRMWARE_NOTE: &str =
+        "Update firmware tidak tersedia di OpenHE. Gunakan updater resmi Aula di Windows.";
+    pub const RESET: &str = "Reset pabrik";
+    pub const RESET_BODY: &str =
+        "Menghapus semua profil, remap, macro, dan lampu di keyboard. Tidak bisa dibatalkan.";
+    pub const RESET_OPEN: &str = "Reset keyboard…";
+    pub const RESET_TYPE: &str = "Ketik RESET untuk melanjutkan.";
+    pub const RESET_NOW: &str = "Reset sekarang";
+
+    pub const RECONNECTING: &str = "Menyambung ulang…";
+    pub const RESTARTING: &str = "Keyboard memulai ulang — membaca ulang…";
+    pub const POLLING_DONE: &str = "Polling rate sekarang";
+    pub const POLLING_MISMATCH: &str = "Keyboard tersambung lagi, tapi melaporkan";
+    pub const RESET_DONE: &str = "Keyboard sudah direset ke bawaan pabrik dan dibaca ulang.";
+    pub const NOT_BACK: &str = "Keyboard belum tersambung lagi. Cabut lalu colokkan kembali.";
+    pub const WRITE_FAILED: &str = "Perintah tidak terkirim.";
+    pub const SWITCH_FAILED: &str = "Gagal mengganti profil.";
+    pub const MODE_FAILED: &str = "Gagal mengganti mode sistem.";
+}
+use strings as t;
+
+/// Indonesian text for a profile file problem.
+pub fn file_error_text(e: &FileError) -> String {
+    match e {
+        FileError::NotJson(_) => t::FILE_NOT_JSON.to_string(),
+        FileError::NotAProfile => t::FILE_NOT_PROFILE.to_string(),
+        FileError::NewerVersion(_) => t::FILE_NEWER.to_string(),
+        FileError::UnknownModel(_) => t::FILE_MODEL.to_string(),
+        FileError::WrongModel { file, keyboard } => {
+            format!("{} {file} (keyboard ini {keyboard}).", t::FILE_WRONG_MODEL)
+        }
+        FileError::BadValue(_) => t::FILE_BAD_VALUE.to_string(),
+    }
+}
+
+/// The import/export flow.
+enum Transfer {
+    Idle,
+    Exporting {
+        path: PathBuf,
+        pending: Pending<Exported>,
+    },
+    /// A file was read and planned; waiting for "Terapkan".
+    Planned {
+        file: String,
+        plan: Box<ImportPlan>,
+    },
+    Importing(Pending<ImportReport>),
+    Done(String),
+    Failed(String, Option<String>),
+}
+
+impl Transfer {
+    fn is_busy(&self) -> bool {
+        matches!(self, Transfer::Exporting { .. } | Transfer::Importing(_))
+    }
+}
+
+/// Indonesian summary of a finished import.
+pub fn import_result_text(r: &Result<ImportReport, Error>) -> (bool, String) {
+    match r {
+        Ok(rep) if rep.failed.is_empty() => (true, t::IMPORTED.to_string()),
+        Ok(rep) => {
+            let mut parts: Vec<&str> = Vec::new();
+            for (step, _) in &rep.failed {
+                let p = match step {
+                    ImportStep::Performance => t::PART_PERF,
+                    ImportStep::Advanced(_) => t::PART_ADV,
+                    ImportStep::Layers => t::PART_LAYERS,
+                    ImportStep::Lighting => t::PART_LIGHT,
+                    ImportStep::KeyColors => t::PART_COLORS,
+                };
+                if !parts.contains(&p) {
+                    parts.push(p);
+                }
+            }
+            (
+                false,
+                format!("{} {}.", t::IMPORT_PARTIAL, parts.join(", ")),
+            )
+        }
+        Err(Error::Disconnected) => (false, t::IMPORT_DISCONNECTED.to_string()),
+        Err(e) => (false, i18n::device_error(e)),
+    }
+}
+
+pub struct Page {
+    switch: Option<(Pending<SwitchOutcome>, &'static str)>,
+    switch_error: Option<(String, Option<String>)>,
+    restart: Restart,
+    restart_job: Option<Pending<WriteOutcome>>,
+    /// What the last restart flow was for (its status shows there).
+    last_restart: Option<RestartKind>,
+    /// Polling segment shown while a change is under way.
+    polling_target: Option<PollingRate>,
+    transfer: Transfer,
+    auto_enabled: bool,
+    watcher: Option<ForegroundWatcher>,
+    auto: AutoSwitch,
+    auto_pending: Option<Pending<SwitchOutcome>>,
+    app_error: Option<String>,
+    new_rule: (String, u8),
+    reset_open: bool,
+    reset_text: String,
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Page {
+            switch: None,
+            switch_error: None,
+            restart: Restart::Idle,
+            restart_job: None,
+            last_restart: None,
+            polling_target: None,
+            transfer: Transfer::Idle,
+            auto_enabled: false,
+            watcher: None,
+            auto: AutoSwitch::default(),
+            auto_pending: None,
+            app_error: None,
+            new_rule: (String::new(), 0),
+            reset_open: false,
+            reset_text: String::new(),
+        }
+    }
+}
 
 impl Page {
-    pub fn ui(&mut self, ctx: &AppCtx, ui: &mut egui::Ui) {
-        super::coming_soon(ctx, ui, i18n::nav::SETTINGS);
+    /// Runs every frame, whichever page is shown: finishes jobs, follows a
+    /// keyboard restart, and runs per-app switching. `locked` (e.g. while
+    /// calibrating) holds automatic switches back. Returns an error for the
+    /// shell to show (a failed automatic switch).
+    pub fn background(
+        &mut self,
+        ctx: &AppCtx,
+        locked: bool,
+        egui_ctx: &egui::Context,
+    ) -> Option<String> {
+        let now = Instant::now();
+        if let Some((p, failed)) = self.switch.as_mut() {
+            if let Some(r) = p.poll() {
+                let failed = *failed;
+                self.switch = None;
+                self.switch_error = apply_switch_effects(ctx.worker, switch_effects(r, failed));
+            }
+        }
+        if let Some(r) = self.restart_job.as_mut().and_then(Pending::poll) {
+            self.restart_job = None;
+            match self.restart.job_done(r, now) {
+                RestartAction::Reconnect => ctx.worker.reconnect(RECONNECT_PAUSE),
+                RestartAction::Reload => ctx.worker.request_reload(),
+                RestartAction::None => {}
+            }
+        }
+        self.restart
+            .observe(ctx.worker.connects(), ctx.snapshot, now);
+        if !self.restart.is_busy() {
+            self.polling_target = None;
+        } else {
+            egui_ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        self.poll_transfer(ctx);
+
+        let mut shell = None;
+        if let Some(r) = self.auto_pending.as_mut().and_then(Pending::poll) {
+            self.auto_pending = None;
+            if let Some((e, _)) = apply_switch_effects(
+                ctx.worker,
+                switch_effects(r, i18n::events::AUTO_SWITCH_FAILED),
+            ) {
+                shell = Some(e);
+            }
+        }
+        if self.auto_enabled {
+            if let (Some(w), Some(snap)) = (&self.watcher, ctx.snapshot) {
+                let seen = w.seen();
+                let idle = ctx.can_write()
+                    && !locked
+                    && self.auto_pending.is_none()
+                    && self.switch.is_none()
+                    && !self.restart.is_busy()
+                    && !self.transfer.is_busy();
+                if idle {
+                    let rules = ctx.data.borrow().app_profile_rules.clone();
+                    if let Some(p) = self
+                        .auto
+                        .decide(seen.current.as_deref(), &rules, snap.profile)
+                    {
+                        self.auto_pending = Some(
+                            ctx.worker
+                                .submit("auto-profile", move |kb| profile_job(kb, p)),
+                        );
+                    }
+                }
+            }
+        }
+        shell
     }
+
+    fn poll_transfer(&mut self, ctx: &AppCtx) {
+        match &mut self.transfer {
+            Transfer::Exporting { path, pending } => {
+                let Some(r) = pending.poll() else { return };
+                let path = path.clone();
+                self.transfer = match r {
+                    Ok(out) => {
+                        let json = ProfileFile::from_data(&out.data).to_json();
+                        match std::fs::write(&path, json) {
+                            Ok(()) => {
+                                let name = path.file_name().map_or_else(
+                                    || path.display().to_string(),
+                                    |f| f.to_string_lossy().into_owned(),
+                                );
+                                let mut msg = format!("{} {name}.", t::EXPORTED);
+                                if out.data.lighting.is_none() {
+                                    msg = format!("{msg} {}", t::EXPORTED_NO_LIGHT);
+                                }
+                                Transfer::Done(msg)
+                            }
+                            Err(e) => Transfer::Failed(
+                                t::WRITE_FILE_FAILED.to_string(),
+                                Some(e.to_string()),
+                            ),
+                        }
+                    }
+                    Err(e) => Transfer::Failed(
+                        format!("{} {}", t::EXPORT_FAILED, i18n::device_error(&e)),
+                        Some(i18n::technical(&e)),
+                    ),
+                };
+            }
+            Transfer::Importing(pending) => {
+                let Some(r) = pending.poll() else { return };
+                // Whatever happened, the keyboard is the truth: re-read it
+                // (after a disconnect the worker reloads on reconnect).
+                if r != Err(Error::Disconnected) {
+                    ctx.worker.request_reload();
+                }
+                let tech = r.as_ref().err().map(i18n::technical).or_else(|| {
+                    r.as_ref()
+                        .ok()
+                        .and_then(|rep| rep.failed.first())
+                        .map(|(_, e)| i18n::technical(e))
+                });
+                let (ok, text) = import_result_text(&r);
+                self.transfer = if ok {
+                    Transfer::Done(text)
+                } else {
+                    Transfer::Failed(text, tech)
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// Screenshot hook: 1 = polling change reconnecting, 2 = reset
+    /// confirmation typed, 3 = import planned with a rule list. Sends
+    /// nothing.
+    #[cfg(feature = "preview")]
+    pub fn preview(&mut self, state: u8) {
+        match state {
+            1 => {
+                let kind = RestartKind::Polling(PollingRate::Hz1000);
+                self.polling_target = Some(PollingRate::Hz1000);
+                self.last_restart = Some(kind);
+                self.restart = Restart::Reconnecting {
+                    kind,
+                    connects: u64::MAX,
+                    since: Instant::now() + Duration::from_secs(3600),
+                };
+            }
+            2 => {
+                self.reset_open = true;
+                self.reset_text = RESET_WORD.into();
+            }
+            _ => {
+                self.transfer = Transfer::Planned {
+                    file: "openhe-profil-2-Gaming.json".into(),
+                    plan: Box::new(ImportPlan {
+                        performance: vec![((0x04..0x1E).collect(), Default::default())],
+                        skipped_macros: vec![0x10],
+                        ..Default::default()
+                    }),
+                };
+                self.auto_enabled = true;
+            }
+        }
+    }
+
+    /// Nothing of this page is running on the keyboard.
+    fn idle(&self) -> bool {
+        self.switch.is_none() && !self.restart.is_busy() && !self.transfer.is_busy()
+    }
+
+    fn can_write(&self, ctx: &AppCtx) -> bool {
+        ctx.can_write() && self.idle()
+    }
+
+    pub fn ui(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        page_with_right_panel(
+            ui,
+            "settings-right",
+            self,
+            |page, ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin {
+                                right: 10,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                page.keyboard_section(ctx, ui);
+                                ui.add_space(20.0);
+                                page.app_section(ctx, ui);
+                            });
+                    });
+            },
+            |page, ui| page.right(ctx, ui),
+        );
+    }
+
+    // --------------------------------------------------------- keyboard
+
+    fn keyboard_section(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        let snap = ctx.snapshot;
+        let can = self.can_write(ctx);
+        section_card(ui, t::KEYBOARD, |ui| {
+            // Polling rate.
+            setting_row(ui, t::POLLING, Some(t::POLLING_HINT), true, |ui| {
+                let rates = [
+                    (PollingRate::Hz125, "125"),
+                    (PollingRate::Hz250, "250"),
+                    (PollingRate::Hz500, "500"),
+                    (PollingRate::Hz1000, "1K"),
+                    (PollingRate::Hz2000, "2K"),
+                    (PollingRate::Hz4000, "4K"),
+                    (PollingRate::Hz8000, "8K Hz"),
+                ];
+                let current = snap.map(|s| s.polling);
+                let mut shown = self
+                    .polling_target
+                    .or(current)
+                    .unwrap_or(PollingRate::Hz8000);
+                let r = Segmented::new(&rates)
+                    .enabled(snap.is_some())
+                    .read_only(!can)
+                    .hover_text(t::POLLING_RESTART)
+                    .show(ui, &mut shown);
+                if r.changed() && Some(shown) != current {
+                    self.change_polling(ctx, shown);
+                }
+            });
+            self.restart_status(ui, |k| matches!(k, RestartKind::Polling(_)));
+
+            // Win/Mac.
+            setting_row(ui, t::SYSTEM, Some(t::SYSTEM_HINT), true, |ui| {
+                let modes = [
+                    (Some(SystemMode::Windows), t::WIN_LINUX),
+                    (Some(SystemMode::Mac), t::MACOS),
+                ];
+                let current = snap.and_then(|s| s.system_mode);
+                let mut mode = current;
+                let r = Segmented::new(&modes)
+                    .enabled(snap.is_some())
+                    .read_only(!can)
+                    .show(ui, &mut mode);
+                if let (true, Some(m)) = (r.changed() && mode != current, mode) {
+                    self.switch_error = None;
+                    self.switch = Some((
+                        ctx.worker
+                            .submit("set-system-mode", move |kb| system_mode_job(kb, m)),
+                        t::MODE_FAILED,
+                    ));
+                }
+            });
+
+            // Profiles.
+            setting_row(ui, t::PROFILES, None, false, |ui| {
+                let busy = !self.idle() || !ctx.can_write();
+                if ui
+                    .add_enabled(snap.is_some() && !busy, egui::Button::new(t::EXPORT))
+                    .clicked()
+                {
+                    self.start_export(ctx);
+                }
+                if ui
+                    .add_enabled(snap.is_some() && !busy, egui::Button::new(t::IMPORT))
+                    .clicked()
+                {
+                    self.pick_import(ctx);
+                }
+            });
+            self.profile_cards(ctx, ui, can);
+            ui.add_space(4.0);
+            card::hint(ui, t::NAME_HINT);
+            if let Some((e, tech)) = &self.switch_error {
+                ui.add_space(8.0);
+                card::error_box(ui, e, "", None, tech.as_deref());
+            }
+            self.transfer_status(ctx, ui);
+        });
+    }
+
+    fn change_polling(&mut self, ctx: &AppCtx, rate: PollingRate) {
+        self.polling_target = Some(rate);
+        self.last_restart = Some(RestartKind::Polling(rate));
+        self.restart = Restart::begin(RestartKind::Polling(rate), ctx.worker.connects());
+        self.restart_job = Some(
+            ctx.worker
+                .submit("set-polling", move |kb| polling_job(kb, rate)),
+        );
+    }
+
+    fn start_reset(&mut self, ctx: &AppCtx) {
+        self.reset_open = false;
+        self.reset_text.clear();
+        self.last_restart = Some(RestartKind::FactoryReset);
+        self.restart = Restart::begin(RestartKind::FactoryReset, ctx.worker.connects());
+        self.restart_job = Some(ctx.worker.submit("factory-reset", reset_job));
+    }
+
+    /// The status line of the last restart flow, under the control that
+    /// started it (`mine` picks the kind).
+    fn restart_status(&self, ui: &mut Ui, mine: impl Fn(RestartKind) -> bool) {
+        let Some(kind) = self.last_restart.filter(|k| mine(*k)) else {
+            return;
+        };
+        match &self.restart {
+            Restart::Sending { .. } | Restart::Reconnecting { .. } => {
+                let text = match kind {
+                    RestartKind::FactoryReset => t::RESTARTING,
+                    RestartKind::Polling(_) => t::RECONNECTING,
+                };
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(text).color(color::ACCENT));
+                });
+            }
+            Restart::Done(msg) => {
+                ui.label(RichText::new(format!("✔ {msg}")).color(color::SUCCESS));
+            }
+            Restart::Failed(msg, tech) => {
+                card::error_box(ui, msg, "", None, tech.as_deref());
+            }
+            Restart::Idle => {}
+        }
+    }
+
+    fn profile_cards(&mut self, ctx: &AppCtx, ui: &mut Ui, can: bool) {
+        let active = ctx.snapshot.map(|s| s.profile);
+        let gap = 10.0;
+        let w = ((ui.available_width() - 3.0 * gap) / 4.0).max(80.0);
+        let mut switch_to = None;
+        let mut save = false;
+        // One row allocated up front; cards and name fields are placed in
+        // it by hand so the text fields never move the layout cursor.
+        let (row, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 72.0), Sense::hover());
+        {
+            for i in 0..4u8 {
+                let is_active = active == Some(i);
+                let rect = Rect::from_min_size(
+                    row.min + egui::vec2(f32::from(i) * (w + gap), 0.0),
+                    egui::vec2(w, 72.0),
+                );
+                let resp = ui.interact(rect, ui.id().with(("profile-card", i)), Sense::click());
+                let (fill, stroke) = if is_active {
+                    (color::ACCENT_SOFT, color::ACCENT)
+                } else if resp.hovered() && can {
+                    (color::KEY_HOVER, color::BORDER_STRONG)
+                } else {
+                    (color::BG, color::BORDER_STRONG)
+                };
+                ui.painter().rect(
+                    rect,
+                    CornerRadius::same(size::CONTROL_RADIUS + 2),
+                    fill,
+                    line(1.0, stroke),
+                    egui::StrokeKind::Inside,
+                );
+                let label = if is_active {
+                    format!("{} {} · {}", t::PROFILE, i + 1, t::ACTIVE)
+                } else {
+                    format!("{} {}", t::PROFILE, i + 1)
+                };
+                ui.painter().text(
+                    rect.min + egui::vec2(16.0, 14.0),
+                    Align2::LEFT_TOP,
+                    label,
+                    font::small(),
+                    if is_active {
+                        color::ACCENT
+                    } else {
+                        color::MUTED
+                    },
+                );
+                let edit_rect = Rect::from_min_size(
+                    rect.min + egui::vec2(12.0, 34.0),
+                    egui::vec2(w - 24.0, 26.0),
+                );
+                let mut data = ctx.data.borrow_mut();
+                let name = &mut data.profile_names[usize::from(i)];
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(edit_rect));
+                let edit = child.add(
+                    egui::TextEdit::singleline(name)
+                        .hint_text(t::UNNAMED)
+                        .desired_width(f32::INFINITY)
+                        .frame(false)
+                        .font(font::bold(15.0))
+                        .text_color(color::TEXT)
+                        .char_limit(24),
+                );
+                if edit.lost_focus() || (edit.changed() && !edit.has_focus()) {
+                    save = true;
+                }
+                drop(data);
+                if resp.clicked() && can && !is_active && ctx.snapshot.is_some() {
+                    switch_to = Some(i);
+                }
+            }
+        }
+        if save && ctx.save_data().is_err() {
+            self.app_error = Some(t::SAVE_FAILED.to_string());
+        }
+        if let Some(i) = switch_to {
+            self.switch_error = None;
+            self.switch = Some((
+                ctx.worker
+                    .submit("set-profile", move |kb| profile_job(kb, i)),
+                t::SWITCH_FAILED,
+            ));
+        }
+    }
+
+    // ---------------------------------------------------- import/export
+
+    fn start_export(&mut self, ctx: &AppCtx) {
+        let Some(snap) = ctx.snapshot else { return };
+        let default_name = format!(
+            "openhe-profil-{}.json",
+            ctx.data
+                .borrow()
+                .profile_label(snap.profile)
+                .replace(" · ", "-")
+        );
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        let keys: Vec<u8> = snap.matrix.keys().map(|(_, _, c)| c).collect();
+        self.transfer = Transfer::Exporting {
+            path,
+            pending: ctx
+                .worker
+                .submit("profile-export", move |kb| export_job(kb, &keys)),
+        };
+    }
+
+    fn pick_import(&mut self, ctx: &AppCtx) {
+        let Some(snap) = ctx.snapshot else { return };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.transfer = match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let file = path
+                    .file_name()
+                    .map_or_else(String::new, |f| f.to_string_lossy().into_owned());
+                match prepare_import(&text, snap) {
+                    Ok(plan) => Transfer::Planned {
+                        file,
+                        plan: Box::new(plan),
+                    },
+                    Err(e) => Transfer::Failed(file_error_text(&e), Some(format!("{e:?}"))),
+                }
+            }
+            Err(e) => Transfer::Failed(t::READ_FILE_FAILED.to_string(), Some(e.to_string())),
+        };
+    }
+
+    fn transfer_status(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        let mut next = None;
+        match &self.transfer {
+            Transfer::Idle => {}
+            Transfer::Exporting { .. } | Transfer::Importing(_) => {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let text = if matches!(self.transfer, Transfer::Exporting { .. }) {
+                        t::EXPORTING
+                    } else {
+                        t::IMPORTING
+                    };
+                    ui.label(RichText::new(text).color(color::ACCENT));
+                });
+            }
+            Transfer::Planned { file, plan } => {
+                ui.add_space(10.0);
+                let profile = ctx.snapshot.map_or(0, |s| s.profile) + 1;
+                Card::new()
+                    .fill(color::ACCENT_SOFT)
+                    .stroke(color::ACCENT.gamma_multiply(0.5))
+                    .padding(14)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(format!("{} {profile}: {file}", t::IMPORT_TITLE))
+                                .color(color::TEXT)
+                                .strong(),
+                        );
+                        let mut summary = format!(
+                            "{} {}, {} {}",
+                            plan.key_count(),
+                            t::IMPORT_KEYS,
+                            plan.advanced.len(),
+                            t::IMPORT_FUNCS
+                        );
+                        if plan.lighting.is_some() {
+                            summary = format!("{summary}, {}", t::IMPORT_LIGHT);
+                        }
+                        ui.label(
+                            RichText::new(format!("{summary}. {}", t::IMPORT_OVERWRITE))
+                                .color(color::MUTED),
+                        );
+                        if !plan.skipped_macros.is_empty() {
+                            card::hint(
+                                ui,
+                                format!(
+                                    "{} {}",
+                                    t::IMPORT_MACROS,
+                                    legend_list(&plan.skipped_macros, 8)
+                                ),
+                            );
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(ctx.can_write(), egui::Button::new(t::IMPORT_APPLY))
+                                .clicked()
+                            {
+                                next = Some(true);
+                            }
+                            if ui.button(t::CANCEL).clicked() {
+                                next = Some(false);
+                            }
+                        });
+                    });
+            }
+            Transfer::Done(msg) => {
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("✔ {msg}")).color(color::SUCCESS));
+            }
+            Transfer::Failed(msg, tech) => {
+                ui.add_space(8.0);
+                card::error_box(ui, msg, "", None, tech.as_deref());
+            }
+        }
+        match next {
+            Some(true) => {
+                if let Transfer::Planned { plan, .. } =
+                    std::mem::replace(&mut self.transfer, Transfer::Idle)
+                {
+                    self.transfer = Transfer::Importing(
+                        ctx.worker
+                            .submit("profile-import", move |kb| import_job(kb, &plan)),
+                    );
+                }
+            }
+            Some(false) => self.transfer = Transfer::Idle,
+            None => {}
+        }
+    }
+
+    // ------------------------------------------------------------- app
+
+    fn app_section(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        section_card(ui, t::APP, |ui| {
+            setting_row(ui, t::AUTO, Some(t::AUTO_HINT), true, |ui| {
+                let mut on = self.auto_enabled;
+                if toggle(ui, &mut on, true).changed() {
+                    self.set_auto(on, ui.ctx());
+                }
+            });
+            if self.auto_enabled {
+                self.rules_editor(ctx, ui);
+            }
+            setting_row(ui, t::LOGIN, None, true, |ui| {
+                let mut on = ctx.data.borrow().launch_at_login;
+                if toggle(ui, &mut on, true).changed() {
+                    match set_launch_at_login(on) {
+                        Ok(()) => {
+                            ctx.data.borrow_mut().launch_at_login = on;
+                            if ctx.save_data().is_err() {
+                                self.app_error = Some(t::SAVE_FAILED.to_string());
+                            }
+                        }
+                        Err(e) => {
+                            self.app_error = Some(format!("{} ({e})", t::LOGIN_FAILED));
+                        }
+                    }
+                }
+            });
+            setting_row(ui, t::LANGUAGE, None, true, |ui| {
+                ui.add_enabled(false, egui::Button::new(t::LANGUAGE_ID));
+            });
+            setting_row(ui, t::THEME, None, false, |ui| {
+                let themes = [
+                    (0u8, t::THEME_LIGHT),
+                    (1, t::THEME_DARK),
+                    (2, t::THEME_SYSTEM),
+                ];
+                let mut theme = 1u8;
+                Segmented::new(&themes)
+                    .disable(0)
+                    .disable(2)
+                    .hover_text(t::THEME_ONLY_DARK)
+                    .show(ui, &mut theme);
+            });
+            if let Some(e) = &self.app_error {
+                ui.add_space(8.0);
+                card::error_box(ui, e, "", None, None);
+            }
+        });
+    }
+
+    fn set_auto(&mut self, on: bool, egui_ctx: &egui::Context) {
+        self.app_error = None;
+        self.auto = AutoSwitch::default();
+        if !on {
+            self.auto_enabled = false;
+            self.watcher = None;
+            return;
+        }
+        let c = egui_ctx.clone();
+        match ForegroundWatcher::spawn(move || c.request_repaint()) {
+            Ok(w) => {
+                self.watcher = Some(w);
+                self.auto_enabled = true;
+            }
+            Err(e) => self.app_error = Some(format!("{} ({e})", t::AUTO_FAILED)),
+        }
+    }
+
+    fn rules_editor(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        let seen = self
+            .watcher
+            .as_ref()
+            .map(ForegroundWatcher::seen)
+            .unwrap_or_default();
+        let mut changed = false;
+        let mut remove = None;
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 0,
+                right: 0,
+                top: 4,
+                bottom: 12,
+            })
+            .show(ui, |ui| {
+                card::hint(
+                    ui,
+                    format!(
+                        "{} {}",
+                        t::AUTO_FRONT,
+                        seen.last_other.as_deref().unwrap_or(t::AUTO_NONE)
+                    ),
+                );
+                ui.add_space(6.0);
+                let profiles: Vec<(u8, String)> = (0..4u8)
+                    .map(|i| (i, ctx.data.borrow().profile_label(i)))
+                    .collect();
+                let opts: Vec<(u8, &str)> =
+                    profiles.iter().map(|(i, l)| (*i, l.as_str())).collect();
+                {
+                    let mut data = ctx.data.borrow_mut();
+                    if data.app_profile_rules.is_empty() {
+                        card::hint(ui, t::AUTO_NO_RULES);
+                    }
+                    for (idx, (name, profile)) in data.app_profile_rules.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(name)
+                                    .desired_width(200.0)
+                                    .hint_text(t::AUTO_APP_HINT),
+                            );
+                            changed |= r.lost_focus();
+                            let mut p = (*profile).min(3);
+                            if Segmented::new(&opts)
+                                .height(30.0)
+                                .show(ui, &mut p)
+                                .changed()
+                            {
+                                *profile = p;
+                                changed = true;
+                            }
+                            if ui.button(t::AUTO_REMOVE).clicked() {
+                                remove = Some(idx);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        data.app_profile_rules.remove(i);
+                        changed = true;
+                    }
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if self.new_rule.0.is_empty() {
+                        if let Some(app) = &seen.last_other {
+                            self.new_rule.0.clone_from(app);
+                        }
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_rule.0)
+                            .desired_width(200.0)
+                            .hint_text(t::AUTO_APP_HINT),
+                    );
+                    Segmented::new(&opts)
+                        .height(30.0)
+                        .show(ui, &mut self.new_rule.1);
+                    let ok = !self.new_rule.0.trim().is_empty();
+                    if ui.add_enabled(ok, egui::Button::new(t::AUTO_ADD)).clicked() {
+                        let rule = (self.new_rule.0.trim().to_string(), self.new_rule.1);
+                        ctx.data.borrow_mut().app_profile_rules.push(rule);
+                        self.new_rule.0.clear();
+                        changed = true;
+                    }
+                });
+                card::hint(ui, t::AUTO_SESSION);
+            });
+        if changed {
+            self.auto = AutoSwitch::default();
+            if ctx.save_data().is_err() {
+                self.app_error = Some(t::SAVE_FAILED.to_string());
+            }
+        }
+    }
+
+    // ---------------------------------------------------- right panel
+
+    fn right(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        egui::TopBottomPanel::bottom("settings-reset")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                top: 12,
+                ..Default::default()
+            }))
+            .show_inside(ui, |ui| self.reset_card(ctx, ui));
+
+        ui.label(
+            RichText::new(t::DEVICE)
+                .font(font::heading())
+                .color(color::TEXT)
+                .strong(),
+        );
+        ui.add_space(16.0);
+        Card::new().padding(16).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let dash = "—".to_string();
+            let (model, fw, serial, usb) = match ctx.snapshot {
+                Some(s) => (
+                    s.model.name().to_string(),
+                    firmware_label(&s.info.firmware),
+                    s.info.serial.clone(),
+                    format!("{:04X}:{:04X}", openhe_proto::model::VID, s.model.pid()),
+                ),
+                None => (dash.clone(), dash.clone(), dash.clone(), dash),
+            };
+            for (k, v) in [
+                (t::MODEL, model),
+                (t::FIRMWARE, fw),
+                (t::SERIAL, serial),
+                (t::USB, usb),
+            ] {
+                card::kv_row(ui, k, &v);
+                ui.add_space(6.0);
+            }
+        });
+        ui.add_space(16.0);
+        Card::new().padding(14).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            card::hint(ui, t::FIRMWARE_NOTE);
+        });
+    }
+
+    fn reset_card(&mut self, ctx: &AppCtx, ui: &mut Ui) {
+        Card::new()
+            .fill(color::DANGER_SOFT)
+            .stroke(color::DANGER.gamma_multiply(0.45))
+            .padding(16)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(t::RESET).color(color::DANGER).strong());
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(t::RESET_BODY).color(color::TEXT)).wrap());
+                ui.add_space(10.0);
+                self.restart_status(ui, |k| k == RestartKind::FactoryReset);
+                let can = self.can_write(ctx);
+                if !self.reset_open {
+                    if danger_button(ui, t::RESET_OPEN, can).clicked() {
+                        self.reset_open = true;
+                        self.reset_text.clear();
+                    }
+                    return;
+                }
+                card::hint(ui, t::RESET_TYPE);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.reset_text)
+                        .hint_text(RESET_WORD)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+                let ok = reset_confirmed(&self.reset_text) && can;
+                ui.horizontal(|ui| {
+                    if ui.button(t::CANCEL).clicked() {
+                        self.reset_open = false;
+                        self.reset_text.clear();
+                    }
+                    if danger_button(ui, t::RESET_NOW, ok).clicked() {
+                        self.start_reset(ctx);
+                    }
+                });
+            });
+    }
+}
+
+/// Reads and plans an import file (pure apart from the parse).
+pub fn prepare_import(text: &str, snap: &DeviceSnapshot) -> Result<ImportPlan, FileError> {
+    let file = ProfileFile::from_json(text)?;
+    let data = file.to_data()?;
+    plan_import(&data, snap)
+}
+
+/// A card with a title and rows separated by rules.
+fn section_card(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
+    Card::new().padding(20).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(title)
+                .font(font::bold(15.0))
+                .color(color::TEXT),
+        );
+        ui.add_space(12.0);
+        body(ui);
+    });
+}
+
+/// "Title / hint ........ control", with a rule underneath when `rule`.
+fn setting_row(
+    ui: &mut Ui,
+    title: &str,
+    hint: Option<&str>,
+    rule: bool,
+    right: impl FnOnce(&mut Ui),
+) {
+    let r = ui
+        .horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).color(color::TEXT));
+                if let Some(h) = hint {
+                    ui.label(RichText::new(h).font(font::small()).color(color::MUTED));
+                }
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), right);
+        })
+        .response;
+    if rule {
+        let y = r.rect.bottom() + 6.0;
+        ui.painter()
+            .hline(r.rect.x_range(), y, line(1.0, color::BORDER));
+        ui.add_space(12.0);
+    } else {
+        ui.add_space(6.0);
+    }
+}
+
+fn danger_button(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(text).color(color::DANGER).strong())
+            .fill(color::BG)
+            .stroke(line(1.0, color::DANGER.gamma_multiply(0.7)))
+            .corner_radius(CornerRadius::same(size::CONTROL_RADIUS + 2))
+            .min_size(egui::vec2(ui.available_width(), 40.0)),
+    )
 }
 
 #[cfg(test)]
@@ -226,5 +1502,256 @@ mod tests {
         let out = system_mode_job(&mut kb(m), SystemMode::Mac).unwrap();
         assert_eq!(out.write, Ok(()));
         assert_eq!(out.system_mode, Some(Some(SystemMode::Mac)));
+    }
+
+    // ------------------------------------------------- restart flows
+
+    fn snap_with(polling: PollingRate) -> DeviceSnapshot {
+        let mut s = crate::app::test_support::snapshot68();
+        s.polling = polling;
+        s
+    }
+
+    #[test]
+    fn polling_change_reconnects_without_an_error() {
+        // Review Focus 4.
+        let t0 = Instant::now();
+        for outcome in [
+            Ok(WriteOutcome::Done),
+            Ok(WriteOutcome::Reenumerating),
+            Err(Error::Disconnected),
+        ] {
+            let mut f = Restart::begin(RestartKind::Polling(PollingRate::Hz1000), 1);
+            assert!(f.is_busy());
+            let action = f.job_done(outcome.clone(), t0);
+            let want = if outcome.is_ok() {
+                RestartAction::Reconnect
+            } else {
+                RestartAction::None // the worker already dropped it
+            };
+            assert_eq!(action, want);
+            assert!(matches!(f, Restart::Reconnecting { .. }), "{f:?}");
+            // Still on the old connection (or none): keep waiting, no error.
+            f.observe(1, Some(&snap_with(PollingRate::Hz8000)), t0);
+            f.observe(1, None, t0 + Duration::from_secs(5));
+            assert!(matches!(f, Restart::Reconnecting { .. }));
+            // Back with the new rate.
+            f.observe(
+                2,
+                Some(&snap_with(PollingRate::Hz1000)),
+                t0 + Duration::from_secs(6),
+            );
+            assert_eq!(f, Restart::Done(format!("{} 1000 Hz.", t::POLLING_DONE)));
+        }
+    }
+
+    #[test]
+    fn polling_change_reports_a_rate_that_did_not_stick() {
+        let t0 = Instant::now();
+        let mut f = Restart::begin(RestartKind::Polling(PollingRate::Hz500), 3);
+        f.job_done(Ok(WriteOutcome::Reenumerating), t0);
+        f.observe(4, Some(&snap_with(PollingRate::Hz8000)), t0);
+        match f {
+            Restart::Failed(msg, _) => assert!(msg.contains("8000 Hz"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_keyboard_that_never_comes_back_times_out() {
+        let t0 = Instant::now();
+        let mut f = Restart::begin(RestartKind::Polling(PollingRate::Hz500), 0);
+        f.job_done(Ok(WriteOutcome::Reenumerating), t0);
+        f.observe(0, None, t0 + RECONNECT_TIMEOUT - Duration::from_millis(1));
+        assert!(f.is_busy());
+        f.observe(0, None, t0 + RECONNECT_TIMEOUT);
+        assert_eq!(f, Restart::Failed(t::NOT_BACK.to_string(), None));
+    }
+
+    #[test]
+    fn a_write_that_fails_before_restarting_is_an_error_and_reloads() {
+        let mut f = Restart::begin(RestartKind::Polling(PollingRate::Hz500), 0);
+        let a = f.job_done(Err(Error::Io("x".into())), Instant::now());
+        assert_eq!(a, RestartAction::Reload);
+        assert!(matches!(f, Restart::Failed(..)));
+        assert!(!f.is_busy());
+        // Late observations change nothing.
+        f.observe(5, Some(&snap_with(PollingRate::Hz500)), Instant::now());
+        assert!(matches!(f, Restart::Failed(..)));
+    }
+
+    #[test]
+    fn factory_reset_treats_silence_as_restarting() {
+        // No reply at all: exactly one write, then "restarting".
+        let mut kb = kb(MockTransport::new());
+        assert_eq!(reset_job(&mut kb), Ok(WriteOutcome::Reenumerating));
+        assert_eq!(kb.session_mut().transport().written().len(), 1);
+        let mut m = MockTransport::new();
+        m.push_reply(order_reply(0x11, 0));
+        assert_eq!(
+            reset_job(&mut Keyboard::new(m, Model::Win68HeMax)),
+            Ok(WriteOutcome::Done)
+        );
+        let mut m = MockTransport::new();
+        m.fail_with(Error::Disconnected);
+        assert_eq!(
+            reset_job(&mut Keyboard::new(m, Model::Win68HeMax)),
+            Err(Error::Disconnected)
+        );
+
+        let t0 = Instant::now();
+        let mut f = Restart::begin(RestartKind::FactoryReset, 1);
+        assert_eq!(
+            f.job_done(Ok(WriteOutcome::Reenumerating), t0),
+            RestartAction::Reconnect
+        );
+        f.observe(2, Some(&snap_with(PollingRate::Hz8000)), t0);
+        assert_eq!(f, Restart::Done(t::RESET_DONE.to_string()));
+    }
+
+    #[test]
+    fn polling_job_sends_one_frame() {
+        let mut kb = kb(MockTransport::new());
+        assert_eq!(
+            polling_job(&mut kb, PollingRate::Hz1000),
+            Ok(WriteOutcome::Reenumerating)
+        );
+        assert_eq!(kb.session_mut().transport().written().len(), 1);
+    }
+
+    #[test]
+    fn reset_needs_the_exact_word() {
+        assert!(reset_confirmed("RESET"));
+        assert!(reset_confirmed("  RESET "));
+        assert!(!reset_confirmed("reset"));
+        assert!(!reset_confirmed("RESE"));
+        assert!(!reset_confirmed(""));
+    }
+
+    // --------------------------------------------- per-app switching
+
+    fn rules() -> Vec<(String, u8)> {
+        vec![
+            ("Valorant".into(), 1),
+            ("  ".into(), 2),
+            ("Figma".into(), 9), // invalid profile
+            ("valorant".into(), 3),
+            ("Code".into(), 0),
+        ]
+    }
+
+    #[test]
+    fn rules_match_by_name_ignoring_case_first_wins() {
+        assert_eq!(match_rule("VALORANT", &rules()), Some(1));
+        assert_eq!(match_rule(" Code ", &rules()), Some(0));
+        assert_eq!(match_rule("Figma", &rules()), None);
+        assert_eq!(match_rule("", &rules()), None);
+        assert_eq!(match_rule("Safari", &rules()), None);
+    }
+
+    #[test]
+    fn auto_switch_only_when_the_profile_differs_and_once_per_app() {
+        let mut a = AutoSwitch::default();
+        // Already on the rule's profile: nothing.
+        assert_eq!(a.decide(Some("Valorant"), &rules(), 1), None);
+        // On another profile: switch once.
+        let mut a = AutoSwitch::default();
+        assert_eq!(a.decide(Some("Valorant"), &rules(), 0), Some(1));
+        // Still in front and the switch failed or was undone: no loop.
+        assert_eq!(a.decide(Some("Valorant"), &rules(), 0), None);
+        // Another app without a rule, then back: switch again.
+        assert_eq!(a.decide(Some("Safari"), &rules(), 0), None);
+        assert_eq!(a.decide(Some("Valorant"), &rules(), 0), Some(1));
+        // OpenHE itself in front (None): nothing, and it resets.
+        assert_eq!(a.decide(None, &rules(), 1), None);
+        assert_eq!(a.decide(Some("Code"), &rules(), 1), Some(0));
+    }
+
+    // ----------------------------------------------------- import
+
+    #[test]
+    fn import_files_are_checked_before_anything_is_written() {
+        let snap = crate::app::test_support::snapshot68();
+        assert!(matches!(
+            prepare_import("nope", &snap),
+            Err(FileError::NotJson(_))
+        ));
+        let text = file_error_text(&FileError::WrongModel {
+            file: "WIN 60 HE MAX".into(),
+            keyboard: "WIN 68 HE MAX".into(),
+        });
+        assert!(text.starts_with(t::FILE_WRONG_MODEL), "{text}");
+        assert!(
+            !file_error_text(&FileError::NotJson("expected value".into())).contains("expected")
+        );
+    }
+
+    #[test]
+    fn import_results_read_in_indonesian() {
+        assert_eq!(
+            import_result_text(&Ok(ImportReport::default())),
+            (true, t::IMPORTED.to_string())
+        );
+        let rep = ImportReport {
+            failed: vec![
+                (ImportStep::Lighting, Error::Timeout),
+                (ImportStep::Advanced(4), Error::Io("verify failed".into())),
+                (ImportStep::Advanced(7), Error::Timeout),
+            ],
+        };
+        let (ok, text) = import_result_text(&Ok(rep));
+        assert!(!ok);
+        assert_eq!(
+            text,
+            format!("{} {}, {}.", t::IMPORT_PARTIAL, t::PART_LIGHT, t::PART_ADV)
+        );
+        let (_, text) = import_result_text(&Err(Error::Disconnected));
+        assert_eq!(text, t::IMPORT_DISCONNECTED);
+    }
+
+    #[test]
+    fn the_page_renders_in_every_state() {
+        use crate::app::test_support::{offline_worker, run_frames, snapshot68};
+        use crate::storage::AppData;
+        use std::cell::RefCell;
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let w = offline_worker();
+        let data = RefCell::new(AppData::default());
+        data.borrow_mut()
+            .app_profile_rules
+            .push(("Valorant".into(), 1));
+        let theme = crate::theme::Theme::default();
+        let snap = snapshot68();
+        let status = crate::worker::ConnectionStatus::Connected(snap.clone());
+        let mut page = Page {
+            reset_open: true,
+            reset_text: "RESET".into(),
+            last_restart: Some(RestartKind::Polling(PollingRate::Hz1000)),
+            restart: Restart::Reconnecting {
+                kind: RestartKind::Polling(PollingRate::Hz1000),
+                connects: 0,
+                since: Instant::now(),
+            },
+            transfer: Transfer::Planned {
+                file: "x.json".into(),
+                plan: Box::default(),
+            },
+            auto_enabled: true, // rules editor without a watcher
+            ..Page::default()
+        };
+        for snapshot in [Some(&snap), None] {
+            let app_ctx = AppCtx {
+                worker: &w,
+                snapshot,
+                status: &status,
+                busy: false,
+                theme: &theme,
+                data: &data,
+            };
+            run_frames(&ctx, 2, |c| {
+                egui::CentralPanel::default().show(c, |ui| page.ui(&app_ctx, ui));
+            });
+        }
     }
 }
