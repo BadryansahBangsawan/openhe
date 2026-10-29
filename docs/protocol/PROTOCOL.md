@@ -116,6 +116,7 @@ rest     0x00 padding to 64 bytes
 
   So **response CMD = request CMD | 0x80**. [C for these five; I for the rest]
 - **Header stripping** [C]. The queue removes the first 4 bytes before parsing: `deviceUsagePage===65456 ? data : data.slice(4)`. Our usage page is 0xFFA0, so the header is stripped. Bytes 0 to 3 are `[?, LEN, CMD|0x80, CHK]`, and byte 0's value is [?].
+  Observed on hardware: byte 0 is 0x5C, the same magic as requests (see 7.x, finding 1).
 - **Response payload layout** after stripping 4 bytes. [I, but consistent with every parser in the SDK]
 
   ```
@@ -133,7 +134,9 @@ Anchors: `MAX_RETRIES",3`, `waitForResponse`, `flushQueue`.
 - **One command in flight at a time.** There is a global FIFO queue per device.
 - **No matching.** Responses are matched **purely by arrival order**. The command byte is not checked, and input reports received before the command was enqueued are discarded.
   - An unsolicited event report (for example the user pressing Fn+profile) that arrives between send and reply **will be consumed as the reply**. Your Rust app should match on `CMD|0x80` and queue the rest as events.
+  - OpenHE does this: a reply must match `CMD|0x80` and the fields it echoes (order TYPE at R[1]; KEY key and layout at R[1..3], first entry for a SET; DEFKEY first row at R[1]; KRGB key at R[1] except for the commit; MACRO_MODE GET key at R[1]). MPT, TGL and END replies (R[1] = key inferred from the vendor parsers, not yet seen on hardware) are checked after the call instead, and a SOCD read must name the key in its pair; a mismatch is an error, never another key's data. PRGB replies carry no key: after a PRGB SET OpenHE waits 50 ms and drains before the read-back GET, so a late 0x98 cannot answer it. Input already waiting before a write is drained into the event queue, and reports without the 0x5C magic or the 0x80 bit are ignored.
 - **Timeout and retries.** 1000 ms per attempt, up to 3 attempts when nothing arrives. The facade swaps the `timeout` and `sendTime` arguments twice, and the two swaps cancel out.
+  - OpenHE and late replies: an attempt that timed out is remembered for 2 s. A reply it explains is dropped instead of being queued as a keyboard event (so a slow keyboard cannot start reload after reload), one 0xFF per such attempt of an earlier call is absorbed instead of failing the current call, and a call that needed a retry waits 100 ms and drains before returning, so the second reply cannot answer the next request.
 - **Failure path.** When all attempts fail, the app's queue throws and leaves the promise hanging (an app bug). Do not copy this.
 - **Multiple-response commands.** `RM6X21` (live travel and calibration) uses `sendDataAndWaitMultiple(pkt, 3)`. It collects 3 input reports, concatenates them, and strips only the first 4 bytes.
 - **Delays.** The SDK uses no inter-command delay in normal operation. Polling loops run every 10 ms (travel test) or 60 ms (calibration). Firmware update has explicit delays (section 5).
@@ -342,10 +345,10 @@ Request payload is `[SUB, PART, FF, FF]` with no flag. Each request expects **3 
 
 | SUB, PART | Meaning | Data (after the strip) |
 |---|---|---|
-| 3,1 | per-key status | R[1]==3; then 21-byte rows until `FF FF` [?] |
+| 3,1 | per-key status | R[1]==3; then 21-byte rows until `FF FF` [?]. All zero on hardware (7.x finding 21) |
 | 2,1 | **travel**, matrix rows 0..2 | R[1]==2; then 3×21 u16le µm, row-major |
 | 2,2 | **travel**, matrix rows 3..5 | same |
-| 6,1 / 6,2 | **calibration values**, rows 0..2 / 3..5 | same format; the UI shows `value*1000` as "keyADC" |
+| 6,1 / 6,2 | **calibration values**, rows 0..2 / 3..5 | same format; the UI shows `value*1000` as "keyADC". About 2200–2400 per key on hardware (7.x finding 20) |
 
 - **Live travel readout** = `2,1` then `2,2`, giving a 6×21 matrix of mm. The UI calls this the "Travel Test".
 - **Mapping matrix cells to keys.** The (row, col) is the same matrix position used by DEFKEY (section 4).
@@ -364,6 +367,7 @@ Request payload is `[SUB, PART, FF, FF]` with no flag. Each request expects **3 
 - **Remap.** KEY SET `[01, KEY, layer, code_lo, code_hi]`. The UI sends all selected keys in one packet.
 - **Read layer.** KEY GET per key `[00, KEY, layer, 0, 0]` returns the value.
 - **Reset keys.** Write `value = KEY` (its own default code) on layer 0. The Fn key (code 0x01) is skipped.
+- **Layer semantics on hardware** (7.x finding 16). On Fn1..Fn3, code 0x0001 is **transparent** (the key does what it does on Base); most keys hold it. The Fn key's Base code is 0xF001 (Fn1 while held) and RCtrl's Fn1 code is 0xF002 (Fn2 while held). LAlt/LWin Base codes are swapped (0xE3/0xE2) in Mac mode.
 - **Assignable codes.** See table 4.3: keyboard, media/consumer, mouse, profile, Win/Mac, Win-lock, WASD swap, calibrate, lighting controls.
 
 ### 3.6 Advanced keys [C] (`high-CLmP8232.js`; builders in `info` L7780 `Go`)
@@ -458,6 +462,9 @@ To delete any advanced function: KEY SET LAYOUT 8 = 0.
   [5..32]  7 colours × (B, G, R, 0xFF)       <- note BGR order
   [33..36] 00 00 00 00
   [37]     flags: bit0 on/off, bit1 direction(reverse), bit4 "superResponse" (UI always 1)
+           other bits unknown; a real keyboard reported 0xC1 (bits 6, 7 set, bit4 clear).
+           OpenHE keeps every bit except 0 and 1 as read and writes them back, but does not
+           verify them (the keyboard may set its own) (7.x finding 22)
   [38]     brightness 0..4   (UI levels 1..5)
   [39]     mode: 0 static, 1..20 dynamic effects, 21 custom per-key
   [40]     speed 0..4        (UI 1..5; forced 0 for static/custom)
@@ -468,7 +475,7 @@ To delete any advanced function: KEY SET LAYOUT 8 = 0.
 
   - The SDK pads fewer than 7 colours by shortening the array, which shifts the later offsets. **Always send 7.**
   - **Off** = same packet with bit0 cleared (`closedLighting`).
-  - **GET** = the same command with flag 00. The response uses the same offsets: R[5..32] colours, R[37] flags, R[38] brightness, ... R[43]. The device also pushes this as 0x98.
+  - **GET** = flag 00 followed by 14 zero bytes, **LEN 15**: `5C 0F 18 B8 00 00 …` (checksum 0x91+0x0F+0x18+0x00 = 0xB8). This is AULA HUB's first read (`getLighting` with version "1.0.7" and its empty initial state: pad(4), no colours, pad(4), flags, brightness, mode, speed, sleep, static colour). **The keyboard rejects a LEN-44 GET** (reply CMD 0xFF) and may stop sensing keys afterwards: see 7.x finding 14. The response still uses the full SET layout: R[5..32] colours, R[37] flags, R[38] brightness, ... R[43]. The device also pushes this as 0x98.
   - Response type: mode 0 = static, 1..20 = dynamic, other = custom.
 - **Effect names** (UI value → wire mode):
 
@@ -574,15 +581,23 @@ The matrix is **6 rows × 21 columns** (the name "RM6X21" says the same). A 0 me
 | WIN 68 | export `b` (const `o`) | 68 | 15 / 15 / 14 / 14 / 10 |
 | WIN 60 | export `a` (const `l`) | 61 | 14 / 14 / 13 / 12 / 8 |
 
-The legends are not stored in the app; they come from the device's default codes. A conventional 68% layout is [I], so read DEFKEY once to be certain:
+The legends are not stored in the app; they come from the device's default codes. Real WIN 68 HE MAX matrix, read from hardware (FW App V1.1.3; see 7.x). Matrix row 0 is empty, so the drawn rows map to matrix rows 1..5, and the right-hand column is Ins / Del / PgUp / PgDn (not an "extra key" per row):
 
 ```
-R0: Esc 1 2 3 4 5 6 7 8 9 0 - = Backspace(2u) [extra key]
-R1: Tab(1.5u) Q W E R T Y U I O P [ ] \(1.5u) [extra key]
-R2: Caps(1.75u) A S D F G H J K L ; ' Enter(2.25u) [extra key]
-R3: LShift(2.25u) Z X C V B N M , . / RShift(1.75u) Up [extra key]
-R4: LCtrl LWin LAlt Space(6.25u) [RAlt] [Fn] [RCtrl?] Left Down Right
+matrix row 0: (all 00, no keys)
+row 1: 29 1E 1F 20 21 22 23 24 25 26 27 2D 2E 2A 49
+       Esc 1 2 3 4 5 6 7 8 9 0 - = Backspace Insert
+row 2: 2B 14 1A 08 15 17 1C 18 0C 12 13 2F 30 31 4C
+       Tab Q W E R T Y U I O P [ ] \ Delete
+row 3: 39 04 16 07 09 0A 0B 0D 0E 0F 33 34 00 28 4B
+       Caps A S D F G H J K L ; ' (col 12 empty) Enter PgUp
+row 4: E1 00 1D 1B 06 19 05 11 10 36 37 38 E5 52 4E
+       LShift (col 1 empty) Z X C V B N M , . / RShift Up PgDn
+row 5: E0 E3 E2 00 00 00 2C 00 00 E6 01 E4 50 51 4F
+       LCtrl LWin LAlt (3 empty) Space (2 empty) RAlt Fn RCtrl Left Down Right
 ```
+
+Fn = 0x01, RAlt = 0xE6, RCtrl = 0xE4. Columns are unfiltered matrix columns; empty cells are 00.
 
 ### 4.2 Switch (axis) tables [C]
 
@@ -608,7 +623,7 @@ Full dump: [`keycodes.txt`](keycodes.txt) (from `SparkLinkV1` export `D`).
 | Range | Meaning |
 |---|---|
 | 0x0004–0x00E7 | Standard HID keyboard usages (A = 0x04 … F24 = 0x73, numpad, 0xE0–0xE7 modifiers) |
-| 0x0001 | Fn |
+| 0x0001 | "Fn" in the vendor table; on hardware it is the **transparent** code of the Fn layers (7.x finding 16). A key that holds a Fn layer uses 0xF001..0xF003 |
 | 0x0000 | none |
 
 **Consumer and system keys (type 0)**
@@ -757,21 +772,69 @@ The consumer keys are "0x1000 + consumer usage" [I].
 
 ## 7. Open questions (need a live, read-only capture)
 
-Suggested safe probes are GETs only: SYNC, DEFKEY, KEY GET, PRGB GET, 0x00 queries 0x21/0x50/0x70/0x25/0x01/0x26. Avoid SET, 0x0C/0x0D, 0x11 and every BL_* command until verified.
+Suggested safe probes are GETs only: SYNC, DEFKEY, KEY GET, PRGB GET (the LEN-15 form only; see 7.x finding 14), 0x00 queries 0x21/0x50/0x70/0x25/0x01/0x26. Avoid SET, 0x0C/0x0D, 0x11 and every BL_* command until verified.
 
 1. **Response header byte 0, and the status-byte semantics.** What is R[0] on success, and what is the 0xFF FAIL format?
+   - RESOLVED: R[0] is 0x00 on every reply seen (7.x finding 4). A failure is a reply whose CMD byte is 0xFF (seen for the rejected LEN-44 PRGB GET, finding 14).
 2. **Do all responses use CMD|0x80?** It is confirmed only for five commands.
+   - RESOLVED for the commands probed: SYNC replies 0x81, order (0x00) replies 0x80, KEY 0xA3, DEFKEY 0xAB (finding 2).
 3. **Response layout of CMD 0x00 sub-commands.** `mn()` assumes R[1]=TYPE and R[2]=value. Verify this against a real reply.
+   - RESOLVED: LEN 4, body = [00, TYPE, value, FF] (finding 5).
 4. **RM6X21 multi-report framing.** Do continuation reports really carry no header? Which matrix rows are covered by PART 1 vs 2? What do SUB 3 status bytes mean? Units of SUB 6 calibration data.
+   - PARTLY RESOLVED: travel in µm at the real matrix positions with PART 1 = rows 0..2 and PART 2 = rows 3..5 (finding 19); SUB 6 values are about 2200–2400 raw (finding 20); SUB 3 read all zeros (finding 21), meaning unknown.
 5. **The actual DEFKEY matrix** (key legends per (row, col)) and the code used for the Fn key, for both MAX models.
+   - RESOLVED for WIN 68 HE MAX: see 4.1 and finding 8. The WIN 60 matrix is still unread.
 6. **Firmware precision.** What does PRECISION_STROKE report? Is 0.001 mm actuation and RT resolution honoured (the UI allows it), or is 0.01 effective?
 7. **Win vs Mac tables.** Are the Fn0–Fn3 tables separate per Win/Mac mode? Why does the perf page send SET_MAC/WIN without an argument while `switchSystemMode` sends `[1]`?
 8. **Macro storage.** Can several keys hold different macros, given that the app always writes at addr 256 with id 0? What is the maximum macro length?
 9. **Advanced-key semantics.** MT binding order (hold vs tap). The meaning of the TGL delay. SOCD delay units. DKS phase semantics.
 10. **Polling rate change.** Does it re-enumerate, and how long until the device is usable again?
 11. **Firmware version string format** returned by SYNC. It affects the SOCD packet format choice.
+   - RESOLVED: firmware string is `App V1.1.3` (finding 6), so the new SOCD format (>= 1.0.7) applies.
 12. **RGBNACK (0x47).** Its exact meaning, and whether it is needed before PRGB GET.
+   - Note: with RGBNACK sent first, a LEN-44 PRGB GET was still rejected (finding 14). RGBNACK itself is rejected (0xFF) on FW App V1.1.3, and the LEN-15 GET works without it (finding 22).
 13. **Logo/side light.** Does the WIN 68 HE MAX hardware have a light that LOGORGB 0x19 controls?
 14. **Persistence.** Are settings saved to flash immediately, given that SAVING_PARAMETER 0x02 is never used? KRGB needs the explicit 0xFE commit.
 15. **Bootloader re-enumeration.** Does the bootloader appear with the same VID/PID/usage page? The official updater exe flow is not in this app.
 16. **macOS permissions.** Whether macOS needs Input Monitoring permission to open the 0xFFA0 interface with hidapi. It probably does not, since this is a vendor usage page.
+   - RESOLVED: no permission prompt was needed; the open is exclusive, so a second program gets 0xE00002C5 "device busy" (finding 18).
+17. **Multi-entry KEY SET echo.** Only single-entry SETs have been seen on hardware (7.x finding 11). OpenHE matches a SET reply on the key and layout of the packet's **first** entry (`Request::expects`). Before Phase 4 sends batched remaps, check on hardware what a multi-entry SET echoes (first entry, last entry, or all of them) and adjust the matching if needed.
+   - Still open. Batched SETs are already sent by `set_performance`, `set_advanced` (SOCD pairs, orphan clears) and `set_layer_codes` (14 entries per packet). Mitigation without knowing the answer: after a batch with more than one entry, OpenHE waits 50 ms and drains before the read-back GETs, so an echo per entry (byte-identical to a GET reply, finding 11) cannot answer a read-back unless it comes later than that. Echoes that arrive while a later packet of the batch is awaited are queued as keyboard events (a debounced reload). If the firmware echoes only the **last** entry, every multi-entry SET times out after three sends and reports failure although the values were written; the read-back would then be the only proof. Needs a capture of one 2-entry SET.
+
+### 7.x Hardware findings (WIN 68 HE MAX, FW App V1.1.3)
+
+Findings 1 to 10 come from a read-only capture over USB on macOS with `openhe --trace info` and `openhe --trace dump --json` (exit 0, 68 keys, 0 read errors). Raw files are in `docs/protocol/captures/` (serial redacted; the redacted SYNC reply still matches its checksum, which covers only the last payload byte, 0xFF).
+
+Findings 11 to 13 come from the first write on the same keyboard: `openhe --trace set-actuation G 1.50`, then a restore to 2.000 mm, with independent `dump --json` runs before, between and after. Raw files: `docs/protocol/captures/win68-set-actuation.txt`.
+
+Findings 14 to 21 come from the first OpenHE hardware test session on the same keyboard (macOS, a read-mostly test harness: a full backup dump, a 20 s event watch, live depth and calibration reads). The raw logs hold the keyboard's serial and are not in the repository.
+
+1. Reply byte 0 is 0x5C, the same magic as requests.
+2. Replies use CMD|0x80: SYNC 0x81, order 0x80, KEY 0xA3, DEFKEY 0xAB.
+3. The reply checksum uses the same formula with the reply's own CMD byte. Example `5C 04 80 14 00 21 01 FF`: (0x35+0x5C+4+0x80+0xFF)&0xFF = 0x14.
+4. R[0] (status) is 0x00 on every reply seen.
+5. Order replies: LEN 4, body = [00, TYPE, value, FF]. QueryWinMode = 1 (Windows mode), Profile = 0, Polling = 0 (8000 Hz).
+6. SYNC reply LEN 0x3C. Body is length-prefixed slots: R[8]=0x10 then the serial R[9..25] (16 ASCII digits); R[25]=0x10 then R[26..42] = "App V1.1.3", NUL NUL, "16:0"; R[42]=0x10 then R[43..] = "Nov 14 5025" followed by binary. The build date looks garbled or truncated (the string probably runs past the 64-byte report); do not rely on it. OpenHE reads each slot as `min(length byte, 16, rest of body)` bytes up to the first NUL or other control byte, instead of the app's fixed windows (R[26..35] would cut a firmware string such as "App V1.1.13"); on this keyboard that gives "App V1.1.3" and the build date "Nov 14 50258".
+7. KEY GET reply: LEN 0x39, body = [00, key, layout, lo, hi, then filler entries FF FF FF 00 ...].
+8. DEFKEY matrix is 6x21 with row 0 empty; the real keys are in rows 1..5 (see 4.1). Right-hand column is Insert 49 / Delete 4C / PgUp 4B / PgDn 4E; arrows 52/50/51/4F; Fn 01; RAlt E6; RCtrl E4.
+9. Factory defaults for all 68 keys: touch Global, advanced None, actuation 2.000 mm, RT press 0.020 mm, RT release 0.020 mm, top deadzone 0.200 mm, bottom deadzone 0.200 mm, switch 0 (Wing Chun).
+10. Two HID entries on usage page 0xFFA0 share one path (usages 1 and 2); selecting usage 1 opens the right one.
+11. KEY SET `5C 05 23 BE 01 0A 04 DC 05` (key 0x0A, LAYOUT 4, 1500 µm = 0x05DC) gets exactly one reply, `5C 39 A3 6D 00 0A 04 DC 05 FF FF FF 00 ...`. It is an echo of the written key, layout and value with status 00, and it is indistinguishable from a KEY GET reply (finding 7): the read-back GET that followed returned the same 64 bytes. The bytes alone do not show whether it echoes the request or reports the stored value, so a write is confirmed only by a separate read-back. The restore SET `5C 05 23 C0 01 0A 04 D0 07` (2000 µm) behaved the same.
+12. Writing LAYOUT 4 on a Global-mode key changes only DB0. An independent `dump` after the write differed from the pre-write dump in exactly one field, (row 3, col 5) code 0x0A actuation 2.000 → 1.500 mm. The key's Mode (LAYOUT 8) stayed 0x0000 (touch Global, advanced None), so the Mode byte is not touched as a side effect; its RT, deadzone and switch values, the other 67 keys and profile 0 did not change either. After the restore the full dump was identical to the pre-write dump.
+13. [?] Whether DB0 has a physical effect while the key is in Global mode is still unverified. The read-back proves the stored value (1500 µm), not where the switch actually triggers; the key stayed in touch mode Global throughout and no physical trigger test was done.
+14. **PRGB GET must be LEN 15.** The LEN-44 GET (flag 00 plus 43 zero bytes, `5C 2C 18 D5 …`, sent right after RGBNACK `0x47`) was answered with CMD 0xFF (DeviceFail). AULA HUB's first GET is flag 00 + 14 zero bytes (`5C 0F 18 B8 …`, see 3.8); OpenHE now sends only that. **Hazard [?, strong suspicion]:** right after the rejected LEN-44 GET the keyboard stopped sensing keys (no typing, live travel all 0) until it was replugged. OpenHE's session refuses any PRGB request that is neither a SET (flag 01) nor exactly the LEN-15 GET before it reaches USB.
+15. **No event for an on-keyboard Win/Mac switch.** During 20 s of draining input (event watch) the user switched OS mode with Fn+A / Fn+S: 0 reports arrived, yet afterwards QueryWinMode read Mac (it was Windows before). The user was also asked to switch profiles on the keyboard and back; no report arrived for that either, but whether a profile switch was actually made is not recorded [?]. OpenHE therefore re-reads profile (0x70) and QueryWinMode (0x21) about every 2 s while idle, besides draining events.
+16. **Factory layer map** (untouched WIN 68 HE MAX, profile 0, read with KEY GET LAYOUT 0..3):
+    - Base: every key's own code, except Fn = **0xF001** (Fn1 while held). In Mac mode LAlt (0xE2) reads 0xE3 and LWin (0xE3) reads 0xE2: the Win/Alt pair swaps with the OS mode, so a Base reset must not rewrite them.
+    - Fn1 (all other keys 0x0001): A → 0xF101 (Win mode), S → 0xF102 (Mac mode), P → 0x0047 (ScrLk), 1..0 → 0x003A..0x0043 (F1..F10), - → 0x0045 (F12), Esc → 0x0035 (`` ` ``), Space → 0xF100 (restore defaults), [ → 0x004A (Home), ] → 0x004D (End), ; → 0x0046 (PrtSc), ' → 0x0048 (Pause), Caps → 0xF344 (unknown), Ins → 0xF317 (light on/off), PgUp → 0xF310 (effect +), Del → 0xF311 (effect direction), → → 0xF314, ← → 0xF315 (speed +/−), ↓ → 0xF313, ↑ → 0xF312 (brightness −/+), RCtrl → **0xF002** (Fn2 while held).
+    - Fn2 (all other keys 0x0001): 1 → 0x1070, 2 → 0x106F (screen brightness −/+), 3 → 0x6152 (unknown), 4 → 0x681B (unknown), 7 → 0x10B6 (previous track), 8 → 0x10CD (play/pause), 9 → 0x10B5 (next track), 0 → 0x10E2 (mute), - → 0x10EA, = → 0x10E9 (volume −/+).
+    - Fn3: every key 0x0001.
+    - So 0x0001 on a Fn layer means "transparent / follow Base", not "Fn". OpenHE names it "Ikut Base", never writes it on Base, and uses 0xF001 when a Base key should act as Fn.
+17. **Unknown codes are real.** 0x6152, 0x681B and 0xF344 are in the factory map but not in the vendor keycode table (4.3). Tools must accept and preserve codes they cannot name (OpenHE's profile import does; the UI shows them as "Kode 0x…").
+18. **Exclusive open on macOS.** hidapi opens the 0xFFA0 interface exclusively. While another program holds it (a second OpenHE, the CLI, AULA HUB), opening fails with `(0xE00002C5) (iokit/common) exclusive access and device already open` (kIOReturnExclusiveAccess). That is "device busy", not a permission problem; no Input Monitoring permission was needed (open question 16).
+19. **Live depth verified.** RM6X21 (2,1) + (2,2) every 100 ms returned per-key travel in µm (0 at rest, up to 3400 bottomed out) at the matrix positions of the pressed keys (e.g. Space (5,6), RAlt (5,9), Fn (5,10), W (2,2), E (2,3)); keys at rest read 0. This is consistent with the row split of 3.4: PART 1 is rows 0..2, PART 2 rows 3..5.
+20. **Calibration values** (6,1) + (6,2) outside calibration: exactly the 68 key cells are non-zero, about 2220–2400 each (raw u16; e.g. Esc 2284, G 2397, LCtrl 2223), and stable between reads.
+21. **Status (3,1)** read once a second for 16 s: the body was `00 03` followed by zeros only, with and without keys pressed. Its meaning stays unknown; OpenHE does not read it.
+22. **Lighting read on FW App V1.1.3.** RGBNACK (`5C 04 00 94 47 01 FF FF`) is **rejected** with CMD 0xFF (DeviceFail); OpenHE sends it only once per connection with a single attempt, treats it as best effort (a rejection, a timeout or any error other than a disconnect is ignored), and sends the GET regardless. The LEN-15 PRGB GET `5C 0F 18 B8 00 …` **works**. Reply raw[0..48]: `5C 2D 98 55 00 00 00 00 00 00 00 FF FF 00 FF 00 FF 00 7F 7F FF FF 00 00 FF 7F 00 7F FF 7F 7F 00 FF 7F 7F 7F FF 00 00 00 00 C1 03 03 03 02 06 07`. Decoded with the SET offsets: LEN 0x2D, CMD 0x98; colours (B,G,R,FF) = red, green, (7F,7F,00), blue, (7F,00,7F), (00,7F,7F), (7F,7F,7F); R[37] flags 0xC1 = on, not reversed, bit4 clear, **bits 6 and 7 set (meaning unknown; parsers must ignore them)**; R[38] brightness 3, R[39] mode 3 (Ripple Light), R[40] speed 3, R[41] sleep 2 min, R[42] static colour 6, R[43] dynamic colour 7. The checksum covers raw[48], which was not captured.
+23. **A profile switch re-enumerates USB, and Win/Mac is stored per profile.** After the profile SET (`0x70`, `[70 idx FF FF]`) the keyboard drops off USB and comes back, like after a polling-rate change (3.9): the call ends in Disconnected and the handle is dead. OpenHE sends the profile SET once (no retry, no read-back on the old handle), reconnects, and checks `profile()` on the new connection. QueryWinMode differed between profiles (profile 0 read Mac, profile 3 read Windows), so the OS mode belongs to the profile: after a switch it must be read from the reconnected keyboard, never carried over.
+24. **MACRO_MODE GET does not echo len.** After a macro bind (MACRO data, Mode, MACRO_MODE SET with len 2), the MACRO_MODE GET read-back reports **len 0**, while play mode, repeat and interval read back as written. The firmware does not report the action count there, so a verify must compare mode, repeat and interval only (OpenHE's `bind_macro` does), and a UI must not show the read len as a step count.

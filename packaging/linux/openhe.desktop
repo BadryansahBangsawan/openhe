@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=OpenHE
+GenericName=Keyboard configurator
+Comment=Configure AULA WIN 68 HE MAX and WIN 60 HE MAX keyboards
+Comment[id]=Atur keyboard AULA WIN 68 HE MAX dan WIN 60 HE MAX
+Exec=openhe-app
+Icon=openhe
+Terminal=false
+Categories=Settings;HardwareSettings;Utility;
+Keywords=keyboard;aula;hall;rapid trigger;actuation;
+StartupWMClass=dev.openhe.OpenHE

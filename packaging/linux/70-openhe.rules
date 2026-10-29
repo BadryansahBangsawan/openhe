@@ -1,0 +1,3 @@
+# OpenHE: install with `sudo cp 70-openhe.rules /etc/udev/rules.d/` then `sudo udevadm control --reload-rules && sudo udevadm trigger`
+# Numbered below 73 so that systemd's 73-seat-late.rules turns the uaccess tag into an ACL for the logged-in user.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1ca2", ATTRS{idProduct}=="1901|1902", TAG+="uaccess"

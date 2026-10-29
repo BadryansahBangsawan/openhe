@@ -1,0 +1,11 @@
+[package]
+name = "openhe-device"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+openhe-proto = { path = "../openhe-proto" }
+hidapi = "2"
+thiserror = "1"
