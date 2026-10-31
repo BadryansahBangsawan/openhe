@@ -179,7 +179,7 @@ fn plan_actuation<T: Transport>(
 
 fn exit_code(e: &Error) -> u8 {
     match e {
-        Error::Unsupported(_) => 2,
+        Error::Unsupported(_) | Error::NoConfigInterface(_) => 2,
         Error::Permission(_) | Error::Busy(_) => 3,
         _ => 1,
     }
@@ -194,6 +194,7 @@ fn is_fatal(e: &Error) -> bool {
             | Error::Permission(_)
             | Error::Busy(_)
             | Error::Unsupported(_)
+            | Error::NoConfigInterface(_)
     )
 }
 
@@ -368,6 +369,7 @@ mod tests {
         assert!(is_fatal(&E::Permission("x".into())));
         assert!(is_fatal(&E::Busy("x".into())));
         assert!(is_fatal(&E::Unsupported("x".into())));
+        assert!(is_fatal(&E::NoConfigInterface("x".into())));
         assert!(!is_fatal(&E::Io("x".into())));
         assert!(!is_fatal(&E::Frame(
             openhe_proto::frame::FrameError::ShortReport

@@ -1,7 +1,7 @@
 //! Pengaturan (mockup `docs/design/mockups/07-pengaturan.png`): polling
 //! rate, Win/Mac, the four onboard profiles (switch, local names,
 //! import/export to JSON), per-app automatic profile switching, launch at
-//! login, device info and factory reset.
+//! login, updates ([`updates`]), device info and factory reset.
 //!
 //! Also home of the profile and Win/Mac switch jobs, which the top bar
 //! shares, and of the restart flow ([`Restart`], [`RestartRun`]) for writes
@@ -13,6 +13,7 @@
 
 pub mod os;
 pub mod profile_file;
+pub mod updates;
 
 use crate::app::{firmware_label, page_with_right_panel, AppCtx};
 use crate::i18n;
@@ -570,6 +571,7 @@ mod strings {
     pub const EXPORTING: &str = "Membaca profil dari keyboard…";
     pub const EXPORTED: &str = "Profil diekspor ke";
     pub const EXPORTED_NO_LIGHT: &str = "Lampu tidak terbaca, jadi tidak ikut diekspor.";
+    pub const EXPORTED_NO_KEYS: &str = "Tombol ini tidak terbaca, jadi tidak ikut diekspor:";
     pub const EXPORT_FAILED: &str = "Gagal mengekspor profil.";
     pub const WRITE_FILE_FAILED: &str = "File tidak bisa disimpan.";
     pub const READ_FILE_FAILED: &str = "File tidak bisa dibaca.";
@@ -671,6 +673,19 @@ pub fn file_error_text(e: &FileError) -> String {
             t::FILE_TRANSPARENT_BASE_TAIL
         ),
     }
+}
+
+/// The suggested name of a profile export: "openhe-profil-1-kerja.json"
+/// for profile label "1 · Kerja". The label holds the user's own profile
+/// name, so it goes through [`store::slug`] like a template export:
+/// `/`, `:` and the like would break the save dialog.
+///
+/// [`store::slug`]: crate::templates::store::slug
+pub fn export_file_name(profile_label: &str) -> String {
+    format!(
+        "openhe-profil-{}.json",
+        crate::templates::store::slug(profile_label)
+    )
 }
 
 /// The import/export flow.
@@ -798,6 +813,11 @@ pub struct Page {
     reset_text: String,
     /// The custom colour editor, while open.
     custom: Option<CustomEditor>,
+    /// Update checks and installs (the "Pembaruan" card, the sidebar
+    /// notice); runs whichever page is shown.
+    updates: crate::update::Updater,
+    /// The browser could not be opened for a link (shows the address).
+    link_error: Option<String>,
 }
 
 impl Default for Page {
@@ -821,6 +841,8 @@ impl Default for Page {
             reset_open: false,
             reset_text: String::new(),
             custom: None,
+            updates: Default::default(),
+            link_error: None,
         }
     }
 }
@@ -853,6 +875,7 @@ impl Page {
             egui_ctx.request_repaint_after(Duration::from_millis(250));
         }
         self.poll_transfer(ctx);
+        self.pump_updates(ctx, egui_ctx);
 
         let saved_on = ctx.data.borrow().auto_profile_enabled;
         if self.restore_auto_due(saved_on) {
@@ -885,6 +908,15 @@ impl Page {
                                     |f| f.to_string_lossy().into_owned(),
                                 );
                                 let mut msg = format!("{} {name}.", t::EXPORTED);
+                                if !out.keys_skipped.is_empty() {
+                                    let keys: Vec<u8> =
+                                        out.keys_skipped.iter().map(|(k, _)| *k).collect();
+                                    msg = format!(
+                                        "{msg} {} {}.",
+                                        t::EXPORTED_NO_KEYS,
+                                        legend_list(&keys, 8)
+                                    );
+                                }
                                 if out.data.lighting.is_none() {
                                     msg = format!("{msg} {}", t::EXPORTED_NO_LIGHT);
                                 }
@@ -1059,6 +1091,8 @@ impl Page {
                                 page.keyboard_section(ctx, ui);
                                 ui.add_space(20.0);
                                 page.app_section(ctx, ui);
+                                ui.add_space(20.0);
+                                page.update_section(ctx, ui);
                             });
                     });
             },
@@ -1372,13 +1406,7 @@ impl Page {
 
     fn start_export(&mut self, ctx: &AppCtx) {
         let Some(snap) = ctx.snapshot else { return };
-        let default_name = format!(
-            "openhe-profil-{}.json",
-            ctx.data
-                .borrow()
-                .profile_label(snap.profile)
-                .replace(" · ", "-")
-        );
+        let default_name = export_file_name(&ctx.data.borrow().profile_label(snap.profile));
         let Some(path) = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
             .set_file_name(default_name)
@@ -1939,6 +1967,17 @@ mod tests {
 
     fn kb(m: MockTransport) -> Keyboard<MockTransport> {
         Keyboard::new(m, Model::Win68HeMax)
+    }
+
+    /// The user's own profile name can hold `/`, `:` and the like, which
+    /// would break the save dialog: the suggested name is a slug.
+    #[test]
+    fn the_export_file_name_is_safe_for_any_profile_name() {
+        assert_eq!(export_file_name("1 · Kerja"), "openhe-profil-1-kerja.json");
+        assert_eq!(
+            export_file_name("2 · CS2/Valorant: rank"),
+            "openhe-profil-2-cs2-valorant-rank.json"
+        );
     }
 
     /// A profile switch re-enumerates the keyboard (PROTOCOL 7.x finding

@@ -9,6 +9,7 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// Lock file name inside the config directory.
 pub const LOCK_FILE: &str = "openhe.lock";
@@ -56,14 +57,43 @@ pub fn acquire(dir: &Path) -> Acquire {
     }
 }
 
+/// How long the new version waits for the old one to close after an
+/// update restart.
+pub const AFTER_UPDATE_WAIT: Duration = Duration::from_secs(15);
+
+/// [`acquire`], retried while another instance holds the lock, for at most
+/// `wait` (after an update the old version is still closing: it releases
+/// the keyboard and the lock a moment after starting the new one).
+pub fn acquire_waiting(dir: &Path, wait: Duration) -> Acquire {
+    let deadline = Instant::now() + wait;
+    loop {
+        match acquire(dir) {
+            Acquire::AlreadyRunning if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn default_dir() -> Result<std::path::PathBuf, io::Error> {
+    crate::storage::AppData::default_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config directory"))
+}
+
 /// [`acquire`] in the app's config directory (where `openhe.json` lives).
 pub fn acquire_default() -> Acquire {
-    match crate::storage::AppData::default_dir() {
-        Some(dir) => acquire(&dir),
-        None => Acquire::Unavailable(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no config directory",
-        )),
+    match default_dir() {
+        Ok(dir) => acquire(&dir),
+        Err(e) => Acquire::Unavailable(e),
+    }
+}
+
+/// [`acquire_waiting`] in the app's config directory.
+pub fn acquire_default_waiting(wait: Duration) -> Acquire {
+    match default_dir() {
+        Ok(dir) => acquire_waiting(&dir, wait),
+        Err(e) => Acquire::Unavailable(e),
     }
 }
 
@@ -90,6 +120,36 @@ mod tests {
         assert!(matches!(acquire(&dir), Acquire::AlreadyRunning));
         drop(first);
         assert!(matches!(acquire(&dir), Acquire::Acquired(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn after_an_update_the_new_instance_waits_for_the_old_one() {
+        let dir = temp_dir("wait");
+        let first = match acquire(&dir) {
+            Acquire::Acquired(l) => l,
+            other => panic!("{other:?}"),
+        };
+        // The old version closes a moment later.
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(first);
+        });
+        let start = Instant::now();
+        assert!(matches!(
+            acquire_waiting(&dir, Duration::from_secs(10)),
+            Acquire::Acquired(_)
+        ));
+        assert!(start.elapsed() >= Duration::from_millis(200));
+        closer.join().unwrap();
+        // It does not wait forever.
+        let _held = acquire(&dir);
+        let start = Instant::now();
+        assert!(matches!(
+            acquire_waiting(&dir, Duration::from_millis(300)),
+            Acquire::AlreadyRunning
+        ));
+        assert!(start.elapsed() < Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "openhe-app"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,7 +15,8 @@ openhe-device = { path = "../openhe-device" }
 openhe-proto = { path = "../openhe-proto" }
 # eframe 0.32 (picked while the MSRV was 1.85; the app and its tests are
 # built against it). Default features only: glow renderer, no persistence,
-# no web or network features.
+# no web or network features. The only network access of the app is the
+# updater below.
 eframe = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,6 +35,18 @@ active-win-pos-rs = "0.11.0"
 # (flock / LockFileEx), released by the OS when the process ends, also after
 # a crash. rust-version 1.75; only its default `sync` feature.
 fs4 = "1.1.0"
+# Updater (src/update/): the app's only network access, to check GitHub
+# releases and download a signed update. No telemetry, nothing else.
+# HTTPS client with rustls (ring) and the bundled Mozilla roots: pure Rust
+# TLS, so Linux needs no OpenSSL. No gzip, no JSON feature (serde_json is
+# used directly). rust-version 1.85.
+ureq = { version = "3.1", default-features = false, features = ["rustls"] }
+# Ed25519 signature of the update manifest (verify_strict); rust-version 1.81.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+# SHA-256 of the downloaded asset; the same 0.10 line ed25519-dalek uses.
+sha2 = "0.10"
+# Release tags and the running version (vX.Y.Z), rust-version 1.68.
+semver = "1"
 
 [features]
 # Hooks that put pages into demo states, for offscreen screenshots only.

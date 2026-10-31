@@ -114,6 +114,8 @@ mod strings {
     pub const CAT_SPECIAL: &str = "Khusus";
 }
 use strings as t;
+/// Also warned about by the Template preview.
+pub(crate) use strings::LOSES_FN2;
 
 /// The Fn key's own default code. Locked on the Base layer.
 pub use openhe_device::FN_KEY;
@@ -124,6 +126,9 @@ pub const LAYERS: [(Layer, &str); 4] = [
     (Layer::Fn2, "Fn2"),
     (Layer::Fn3, "Fn3"),
 ];
+
+/// The four layers in order (Base first), without their names.
+pub const LAYER_ORDER: [Layer; 4] = [LAYERS[0].0, LAYERS[1].0, LAYERS[2].0, LAYERS[3].0];
 
 pub fn layer_name(l: Layer) -> &'static str {
     LAYERS[l as usize].1
@@ -142,6 +147,17 @@ pub const TRANSPARENT: u16 = 0x0001;
 /// Whether `code` may be put on `layer`: not [`TRANSPARENT`] on Base.
 pub fn allowed_on(layer: Layer, code: u16) -> bool {
     !(layer == Layer::Base && code == TRANSPARENT)
+}
+
+/// LAlt (0xE2) and LWin (0xE3): their Base codes swap with the Win/Mac mode
+/// (PROTOCOL 7.x finding 16).
+pub fn is_win_alt(key: u8) -> bool {
+    matches!(key, 0xE2 | 0xE3)
+}
+
+/// A Win or Alt code (what LAlt / LWin send in either OS mode).
+pub fn is_win_alt_code(code: u16) -> bool {
+    matches!(code, 0x00E2 | 0x00E3)
 }
 
 // ------------------------------------------------------------- key names
@@ -328,10 +344,19 @@ pub const FN2_HOLD: u16 = 0xF002;
 /// themselves, so replacing one of them counts as possibly removing it
 /// unless a known Fn2 (tahan) stays on the layer.
 pub fn loses_fn2_access(fn1: &BTreeMap<u8, u16>, changes: &Changes) -> bool {
+    writes_lose_fn2(fn1, changes.entries())
+}
+
+/// [`loses_fn2_access`] for any list of layer writes `(key, layer, code)`
+/// (the Template page plans its writes without a [`Changes`]).
+pub fn writes_lose_fn2(
+    fn1: &BTreeMap<u8, u16>,
+    writes: impl IntoIterator<Item = (u8, Layer, u16)>,
+) -> bool {
     let had = fn1.values().any(|&c| c == FN2_HOLD);
     let mut after = fn1.clone();
     let mut unread_replaced = false;
-    for (k, l, c) in changes.entries() {
+    for (k, l, c) in writes {
         if l == Layer::Fn1 {
             unread_replaced |= !fn1.contains_key(&k) && c != FN2_HOLD;
             after.insert(k, c);
@@ -528,7 +553,7 @@ pub fn factory_code(model: Model, layer: Layer, key: u8) -> Option<u16> {
     match (layer, model) {
         (Layer::Base, _) => match key {
             FN_KEY => Some(FN1_HOLD),
-            0xE2 | 0xE3 => None,
+            k if is_win_alt(k) => None,
             k => Some(u16::from(k)),
         },
         (_, Model::Win60HeMax) => None,
@@ -969,7 +994,7 @@ pub fn decoration(
     };
     let factory = factory_code(model, layer, key);
     let unchanged = match layer {
-        Layer::Base if matches!(key, 0xE2 | 0xE3) => matches!(code, 0xE2 | 0xE3),
+        Layer::Base if is_win_alt(key) => is_win_alt_code(code),
         // A Fn layer without a known factory table: transparent is the
         // neutral state.
         _ if factory.is_none() => code == TRANSPARENT,

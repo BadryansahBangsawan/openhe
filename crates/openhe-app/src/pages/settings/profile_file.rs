@@ -6,7 +6,8 @@
 //! colours. Macro contents cannot be read back from the keyboard, so a key
 //! bound to a macro is exported as `"macro"` and skipped on import.
 //!
-//! - [`export_job`] reads everything (device side, [`ProfileData`]);
+//! - [`export_job`] reads everything (device side, [`ProfileData`]); a key
+//!   that cannot be read is left out and named ([`Exported::keys_skipped`]).
 //!   [`ProfileFile`] is its serde mirror (the proto types have no serde).
 //! - [`plan_import`] turns a file into the writes for this keyboard
 //!   ([`ImportPlan`]): pure and tested; [`import_job`] runs it. Every write
@@ -28,20 +29,9 @@ use std::collections::BTreeSet;
 pub const FORMAT: &str = "openhe-profile";
 pub const VERSION: u32 = 1;
 
-const LAYERS: [Layer; 4] = [Layer::Base, Layer::Fn1, Layer::Fn2, Layer::Fn3];
+use crate::pages::remap::{is_win_alt, is_win_alt_code, LAYER_ORDER as LAYERS, TRANSPARENT};
 /// The Fn key: its own base-layer code is never written.
 use openhe_device::FN_KEY;
-/// Layer code 0x0001: transparent on the Fn layers, a dead key on Base.
-const TRANSPARENT: u16 = 0x0001;
-
-/// LAlt (0xE2) and LWin (0xE3): their Base codes swap with Win/Mac mode.
-fn is_win_alt(key: u8) -> bool {
-    matches!(key, 0xE2 | 0xE3)
-}
-
-fn is_win_alt_code(code: u16) -> bool {
-    matches!(code, 0x00E2 | 0x00E3)
-}
 
 // ------------------------------------------------------------ device side
 
@@ -74,14 +64,21 @@ pub struct Exported {
     pub data: ProfileData,
     /// Lighting or per-key colours that could not be read (left out).
     pub skipped: Vec<(&'static str, Error)>,
+    /// Keys that could not be read (left out of the file, so an import of
+    /// it leaves them as they are).
+    pub keys_skipped: Vec<(u8, Error)>,
 }
 
 /// Reads the active profile: every key (settings, layers, advanced), then
-/// lighting and per-key colours. Key errors fail the export; the lighting
-/// parts are best effort (left out and listed in `skipped`). A disconnect
-/// is always `Err(Disconnected)`.
+/// lighting and per-key colours. A key that cannot be read is left out and
+/// listed in `keys_skipped` (see [`read_keys`]); when no key at all can be
+/// read the export fails. The lighting parts are best effort (left out and
+/// listed in `skipped`). A disconnect is always `Err(Disconnected)`.
 pub fn export_job<T: Transport>(kb: &mut Keyboard<T>, keys: &[u8]) -> Result<Exported, Error> {
-    let out = read_keys(kb, keys)?;
+    let KeysRead { keys: out, failed } = read_keys(kb, keys)?;
+    if let (true, Some((_, e))) = (out.is_empty(), failed.first()) {
+        return Err(e.clone());
+    }
     let mut skipped = Vec::new();
     let lighting = match kb.lighting() {
         Ok(l) => Some(l),
@@ -108,29 +105,58 @@ pub fn export_job<T: Transport>(kb: &mut Keyboard<T>, keys: &[u8]) -> Result<Exp
             keep_lighting_flags: false,
         },
         skipped,
+        keys_skipped: failed,
     })
+}
+
+/// What [`read_keys`] read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeysRead {
+    /// The keys read in full, in the order asked.
+    pub keys: Vec<KeyData>,
+    /// Keys left out, with the first error each one gave.
+    pub failed: Vec<(u8, Error)>,
 }
 
 /// Reads every key in `keys`: settings, the four layer codes and the
 /// advanced function (the key part of [`export_job`]; templates use it for
-/// their preview and backup). Any error fails the read.
-pub fn read_keys<T: Transport>(kb: &mut Keyboard<T>, keys: &[u8]) -> Result<Vec<KeyData>, Error> {
-    let mut out = Vec::with_capacity(keys.len());
+/// their preview and backup).
+///
+/// Like the worker's snapshot load, a key whose reply cannot be used (`Io`,
+/// `Frame`, `InvalidInput`: e.g. an unknown Mode value or a rejected read)
+/// is left out and listed in `failed`, so one odd key never blocks the
+/// rest; callers must treat it as unknown. Timeouts, a disconnect and the
+/// other errors fail the whole read.
+pub fn read_keys<T: Transport>(kb: &mut Keyboard<T>, keys: &[u8]) -> Result<KeysRead, Error> {
+    let mut out = KeysRead {
+        keys: Vec::with_capacity(keys.len()),
+        failed: Vec::new(),
+    };
     for &code in keys {
-        let settings = kb.key_settings(code)?;
-        let mut layers = [0u16; 4];
-        for (slot, layer) in layers.iter_mut().zip(LAYERS) {
-            *slot = kb.layer_code(code, layer)?;
+        match read_key(kb, code) {
+            Ok(k) => out.keys.push(k),
+            Err(e @ (Error::Io(_) | Error::Frame(_) | Error::InvalidInput(_))) => {
+                out.failed.push((code, e))
+            }
+            Err(e) => return Err(e),
         }
-        let advanced = kb.advanced(code)?;
-        out.push(KeyData {
-            code,
-            settings,
-            layers,
-            advanced,
-        });
     }
     Ok(out)
+}
+
+fn read_key<T: Transport>(kb: &mut Keyboard<T>, code: u8) -> Result<KeyData, Error> {
+    let settings = kb.key_settings(code)?;
+    let mut layers = [0u16; 4];
+    for (slot, layer) in layers.iter_mut().zip(LAYERS) {
+        *slot = kb.layer_code(code, layer)?;
+    }
+    let advanced = kb.advanced(code)?;
+    Ok(KeyData {
+        code,
+        settings,
+        layers,
+        advanced,
+    })
 }
 
 // -------------------------------------------------------------- the file
@@ -564,9 +590,62 @@ fn bad(msg: String) -> FileError {
     FileError::BadValue(msg)
 }
 
+/// Why a performance value cannot be written to a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PerfProblem {
+    /// No key could take it: actuation below 0.1 mm, RT below 0.005 mm, a
+    /// deadzone above 1.0 mm.
+    Invalid(String),
+    /// Beyond this key's switch travel.
+    BeyondTravel(String),
+}
+
+impl PerfProblem {
+    pub(crate) fn text(self) -> String {
+        match self {
+            PerfProblem::Invalid(s) | PerfProblem::BeyondTravel(s) => s,
+        }
+    }
+}
+
+/// The value checks the device API makes while writing `change` to `key`
+/// (actuation 0.1 mm..=max, RT 0.005 mm..=max, deadzones 0..=1.0 mm), with
+/// `max` the key's switch travel (`None`: not known, only the limits every
+/// key has are checked). Values no key could take come first.
+pub(crate) fn perf_problem(
+    key: u8,
+    change: &PerformanceChange,
+    max: Option<Micrometers>,
+) -> Option<PerfProblem> {
+    let travel = [
+        ("actuation", change.actuation, MIN_ACTUATION_UM),
+        ("RT press", change.rt_press, MIN_RT_UM),
+        ("RT release", change.rt_release, MIN_RT_UM),
+    ];
+    let msg = |name: &str, v: Micrometers| format!("key 0x{key:02X}: {name} {} um", v.0);
+    for (name, v, min) in travel {
+        if let Some(v) = v.filter(|v| v.0 < min) {
+            return Some(PerfProblem::Invalid(msg(name, v)));
+        }
+    }
+    for (name, v) in [
+        ("top deadzone", change.top_dz),
+        ("bottom deadzone", change.bottom_dz),
+    ] {
+        if let Some(v) = v.filter(|v| v.0 > MAX_DEADZONE_UM) {
+            return Some(PerfProblem::Invalid(msg(name, v)));
+        }
+    }
+    let max = max?;
+    travel
+        .into_iter()
+        .find_map(|(name, v, _)| v.filter(|&v| v > max).map(|v| msg(name, v)))
+        .map(PerfProblem::BeyondTravel)
+}
+
 /// The checks the device API would make while writing `change` to `key`
-/// (switch id, actuation 0.1 mm..=max, RT 0.005 mm..=max, deadzones
-/// 0..=1.0 mm), done up front so a bad file writes nothing.
+/// (switch id, then [`perf_problem`] against its travel), done up front so
+/// a bad file writes nothing.
 fn check_performance(model: Model, key: u8, change: &PerformanceChange) -> Result<(), FileError> {
     let id = change.switch.unwrap_or(0);
     let sw = model
@@ -574,33 +653,10 @@ fn check_performance(model: Model, key: u8, change: &PerformanceChange) -> Resul
         .iter()
         .find(|s| s.id == id)
         .ok_or_else(|| bad(format!("key 0x{key:02X}: unknown switch id {id}")))?;
-    let max = sw.max_travel.0;
-    if let Some(a) = change.actuation {
-        if a.0 < MIN_ACTUATION_UM || a.0 > max {
-            return Err(bad(format!("key 0x{key:02X}: actuation {} um", a.0)));
-        }
+    match perf_problem(key, change, Some(sw.max_travel)) {
+        Some(p) => Err(bad(p.text())),
+        None => Ok(()),
     }
-    for (name, v) in [
-        ("RT press", change.rt_press),
-        ("RT release", change.rt_release),
-    ] {
-        if let Some(v) = v {
-            if v.0 < MIN_RT_UM || v.0 > max {
-                return Err(bad(format!("key 0x{key:02X}: {name} {} um", v.0)));
-            }
-        }
-    }
-    for (name, v) in [
-        ("top deadzone", change.top_dz),
-        ("bottom deadzone", change.bottom_dz),
-    ] {
-        if let Some(v) = v {
-            if v.0 > MAX_DEADZONE_UM {
-                return Err(bad(format!("key 0x{key:02X}: {name} {} um", v.0)));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The function checks of `set_advanced`: the proto packet builders'
@@ -640,6 +696,9 @@ pub(crate) fn check_advanced(
             advanced::socd_set(s).map_err(invalid)?;
             if key != s.pos1 && key != s.pos2 {
                 return Err(bad(format!("key 0x{key:02X} is not in its SOCD pair")));
+            }
+            if s.pos1 == s.pos2 {
+                return Err(bad(format!("SOCD pair of 0x{key:02X} with itself")));
             }
             if s.pos1 == FN_KEY || s.pos2 == FN_KEY {
                 return Err(bad("the Fn key cannot be in a SOCD pair".to_string()));
@@ -1292,5 +1351,60 @@ mod tests {
             .to_data()
             .unwrap();
         assert_eq!(back, out.data);
+    }
+
+    /// One key whose reply cannot be used (here an unknown Mode value) is
+    /// left out and named; the other keys are still read and exported.
+    /// With no key read at all, the export fails.
+    #[test]
+    fn an_unreadable_key_is_left_out_and_named() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x1B, 8, 0xFFFF));
+        for (layout, v) in [
+            (8, 0x0020),
+            (4, 1200),
+            (20, 150),
+            (21, 200),
+            (22, 100),
+            (23, 200),
+            (25, 2),
+            (0, 0x1A),
+            (1, 0x3A),
+            (2, 0),
+            (3, 0x01),
+            (8, 0x0020),
+        ] {
+            m.push_reply(key_reply(0x1A, layout, v));
+        }
+        let mut kb = Keyboard::new(m, Model::Win68HeMax);
+        let out = export_job(&mut kb, &[0x1B, 0x1A]).unwrap();
+        assert_eq!(
+            out.data.keys,
+            vec![key(0x1A, TouchMode::RapidTrigger, AdvancedConfig::None)]
+        );
+        assert_eq!(out.keys_skipped.len(), 1);
+        assert_eq!(out.keys_skipped[0].0, 0x1B);
+        assert!(matches!(out.keys_skipped[0].1, Error::Io(_)));
+
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x1B, 8, 0xFFFF));
+        let mut kb = Keyboard::new(m, Model::Win68HeMax);
+        assert!(matches!(export_job(&mut kb, &[0x1B]), Err(Error::Io(_))));
+        // A timeout is no odd key: it fails the whole read.
+        let mut kb = Keyboard::new(MockTransport::new(), Model::Win68HeMax);
+        assert_eq!(read_keys(&mut kb, &[0x1A]), Err(Error::Timeout));
+    }
+
+    #[test]
+    fn a_socd_pair_of_a_key_with_itself_is_refused() {
+        let present: BTreeSet<u8> = [0x04, 0x07].into();
+        let ok = AdvancedConfig::Socd(socd());
+        assert_eq!(check_advanced(0x04, &ok, &present), Ok(()));
+        let same = AdvancedConfig::Socd(Socd {
+            pos2: 0x04,
+            key2: 0x04,
+            ..socd()
+        });
+        assert!(check_advanced(0x04, &same, &present).is_err());
     }
 }

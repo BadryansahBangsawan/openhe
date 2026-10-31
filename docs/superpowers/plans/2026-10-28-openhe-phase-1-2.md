@@ -66,7 +66,7 @@ Keputusan yang sudah diambil:
 - Timeout dan percobaan: 1000 ms per percobaan, maksimal 3 percobaan, hanya satu perintah berjalan pada satu waktu.
 - Konversi mm ke µm memakai pembulatan, bukan pemotongan (1.13 mm → 1130 µm).
 - **Dilarang** membangun atau mengirim perintah bootloader/firmware `0x08`–`0x0E`. Perintah ini juga tidak dimasukkan ke enum `Cmd`.
-- Tidak ada akses jaringan sama sekali.
+- Tidak ada akses jaringan sama sekali. (Sejak v0.2.0: kecuali memeriksa dan mengunduh pembaruan; lihat spesifikasi desain.)
 - `#![forbid(unsafe_code)]` di semua crate. Lulus `cargo fmt --check` dan `cargo clippy --all-targets -- -D warnings`.
 - `openhe-proto` hanya bergantung pada `thiserror`.
 - Setiap tahap yang menulis ke keyboard harus diuji ke keyboard asli setelah pengguna setuju, dan nilai awal dipulihkan sesudahnya.

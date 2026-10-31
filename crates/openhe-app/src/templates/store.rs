@@ -2,22 +2,27 @@
 //! ([`crate::storage::AppData::default_dir`]):
 //!
 //! - `templates/*.openhe-template`: the user's own templates;
-//! - `backups/backup-<unix ms>.json`: the key state read before each apply
-//!   (a profile file with a small header), newest [`KEEP_BACKUPS`] kept.
+//! - `backups/backup-<unix ms>-k<keyboard>.json` (`…-2.json`, … when
+//!   taken): the key state read before each apply (a profile file with a
+//!   small header); the newest [`KEEP_BACKUPS`] of each keyboard are kept.
+//!   `<keyboard>` is a hash of the model and serial ([`keyboard_tag`]), so
+//!   pruning sorts and groups the files by name alone. Files of older
+//!   versions (`backup-<unix ms>.json`, no tag) are still read.
 //!
 //! Nothing here is sent anywhere.
 
 use super::{Template, TemplateFile, EXTENSION};
-use crate::pages::settings::profile_file::{KeyData, ProfileData, ProfileFile};
+use crate::pages::settings::profile_file::{model_from, KeyData, ProfileData, ProfileFile};
 use openhe_proto::Model;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TEMPLATES_DIR: &str = "templates";
 pub const BACKUPS_DIR: &str = "backups";
-/// Backups kept per data directory (older ones are deleted).
+/// Backups kept per keyboard (model and serial); older ones are deleted.
 pub const KEEP_BACKUPS: usize = 10;
 pub const BACKUP_FORMAT: &str = "openhe-backup";
 pub const BACKUP_VERSION: u32 = 1;
@@ -191,25 +196,156 @@ impl BackupFile {
     }
 }
 
+/// The keyboard part of a backup file name: "k" and the 64-bit FNV-1a hash
+/// of the model name and serial, in hex. Stable across versions and
+/// platforms (unlike `std`'s hasher), and safe in a file name whatever the
+/// serial holds.
+pub fn keyboard_tag(model: Model, serial: &str) -> String {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for b in model.name().bytes().chain([0]).chain(serial.bytes()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    format!("k{h:016x}")
+}
+
+/// What a backup file name says: `backup-<ms>[-k<tag>][-<n>].json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackupName {
+    ms: u64,
+    /// The [`keyboard_tag`]; `None` in the names of older versions.
+    tag: Option<String>,
+    /// The `-n` [`free_path`] added to a name taken in the same
+    /// millisecond (0 without one): later saves get higher numbers.
+    n: u32,
+}
+
+fn parse_name(path: &Path) -> Option<BackupName> {
+    let stem = path.file_stem()?.to_str()?.strip_prefix("backup-")?;
+    let mut parts = stem.split('-');
+    let ms = parts.next()?.parse().ok()?;
+    let mut name = BackupName {
+        ms,
+        tag: None,
+        n: 0,
+    };
+    let mut next = parts.next();
+    if let Some(t) = next.filter(|t| {
+        t.len() == 17 && t.starts_with('k') && t[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    }) {
+        name.tag = Some(t.to_string());
+        next = parts.next();
+    }
+    if let Some(n) = next {
+        name.n = n.parse().ok()?;
+    }
+    parts.next().is_none().then_some(name)
+}
+
+/// The keyboard of a backup file without a tag in its name (an older
+/// version's): the header fields only, the keys are skipped unparsed.
+#[derive(Deserialize)]
+struct Header {
+    format: String,
+    serial: String,
+    profile_file: HeaderModel,
+}
+
+#[derive(Deserialize)]
+struct HeaderModel {
+    model: String,
+}
+
+/// Whose backup a file is, as far as pruning can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    This,
+    Other,
+    /// Unreadable, or a name pruning cannot place: counted with the
+    /// keyboard being saved, so it is deleted once it is old enough.
+    Unknown,
+}
+
+fn owner(path: &Path, name: Option<&BackupName>, tag: &str, model: Model, serial: &str) -> Owner {
+    match name.map(|n| n.tag.as_deref()) {
+        Some(Some(t)) if t == tag => Owner::This,
+        Some(Some(_)) => Owner::Other,
+        Some(None) => {
+            let header = std::fs::read(path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Header>(&b).ok())
+                .filter(|h| h.format == BACKUP_FORMAT);
+            match header {
+                Some(h)
+                    if model_from(&h.profile_file.model) == Some(model) && h.serial == serial =>
+                {
+                    Owner::This
+                }
+                Some(_) => Owner::Other,
+                None => Owner::Unknown,
+            }
+        }
+        None => Owner::Unknown,
+    }
+}
+
+/// Milliseconds since the epoch of the file's last change (0 if unknown).
+fn mtime_ms(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Saves a backup in `base`/backups, then deletes all but the newest
-/// [`KEEP_BACKUPS`].
+/// [`KEEP_BACKUPS`] of the same keyboard (see [`prune`]).
 pub fn save_backup(base: &Path, b: &BackupFile) -> io::Result<PathBuf> {
     let dir = base.join(BACKUPS_DIR);
     std::fs::create_dir_all(&dir)?;
-    let path = free_path(&dir, &format!("backup-{:013}", b.created_ms), "json");
+    let model = model_from(&b.profile_file.model)
+        .ok_or_else(|| io::Error::other(format!("unknown model {}", b.profile_file.model)))?;
+    let tag = keyboard_tag(model, &b.serial);
+    let path = free_path(&dir, &format!("backup-{:013}-{tag}", b.created_ms), "json");
     let json = serde_json::to_string_pretty(b).map_err(io::Error::other)?;
     write_atomic(&path, &json)?;
-    let mut all = backup_files(&dir);
-    if all.len() > KEEP_BACKUPS {
-        all.sort();
-        let extra = all.len() - KEEP_BACKUPS;
-        for old in all.into_iter().take(extra) {
-            if old != path {
-                let _ = std::fs::remove_file(old);
+    prune(&dir, &path, model, &b.serial);
+    Ok(path)
+}
+
+/// Keeps the newest [`KEEP_BACKUPS`] backups of the keyboard `model` /
+/// `serial` in `dir` (`kept` always stays), newest by the time in the file
+/// name, then its `-n`. The names tell the keyboard; only files of older
+/// versions (no tag) are read, their header alone. Files that cannot be
+/// placed (unreadable, or a name without a time, ordered by when they were
+/// last changed) count as this keyboard's, so they do not stay forever.
+/// Other keyboards' backups are left alone.
+fn prune(dir: &Path, kept: &Path, model: Model, serial: &str) {
+    let tag = keyboard_tag(model, serial);
+    let mut mine: Vec<((u64, u32), PathBuf)> = backup_files(dir)
+        .into_iter()
+        .filter_map(|p| {
+            let name = parse_name(&p);
+            if owner(&p, name.as_ref(), &tag, model, serial) == Owner::Other {
+                return None;
             }
+            let order = name.map_or_else(|| (mtime_ms(&p), 0), |n| (n.ms, n.n));
+            Some((order, p))
+        })
+        .collect();
+    mine.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (_, old) in mine.into_iter().skip(KEEP_BACKUPS) {
+        if old != kept {
+            let _ = std::fs::remove_file(old);
         }
     }
-    Ok(path)
+}
+
+/// Newest first: by the time stored in the file, then by the `-n` of the
+/// name (`backup-<ms>-…-2.json` is newer than `backup-<ms>-….json`).
+fn newest_first(a: &Backup, b: &Backup) -> Ordering {
+    let n = |p: &Path| parse_name(p).map_or(0, |n| n.n);
+    (b.created_ms, n(&b.path)).cmp(&(a.created_ms, n(&a.path)))
 }
 
 fn backup_files(dir: &Path) -> Vec<PathBuf> {
@@ -233,14 +369,17 @@ pub fn read_backup(path: &Path) -> Option<Backup> {
     file.to_backup(path.to_path_buf())
 }
 
-/// The backups of the keyboard `model` / `serial`, newest first.
+/// The backups of the keyboard `model` / `serial`, newest first. Files
+/// named for another keyboard are not read.
 pub fn list_backups(base: &Path, model: Model, serial: &str) -> Vec<Backup> {
+    let tag = keyboard_tag(model, serial);
     let mut out: Vec<Backup> = backup_files(&base.join(BACKUPS_DIR))
         .iter()
+        .filter(|p| parse_name(p).is_none_or(|n| n.tag.is_none_or(|t| t == tag)))
         .filter_map(|p| read_backup(p))
         .filter(|b| b.model == model && b.serial == serial)
         .collect();
-    out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(b.path.cmp(&a.path)));
+    out.sort_by(newest_first);
     out
 }
 
@@ -323,6 +462,129 @@ mod tests {
         assert_eq!(list[0].profile, 1);
         assert!(list_backups(&dir.0, snap.model, "other").is_empty());
         assert!(list_backups(&dir.0, Model::Win60HeMax, "A68").is_empty());
+    }
+
+    /// Ten are kept per keyboard: a second keyboard's backups never push
+    /// the first one's out. Backups saved in the same millisecond keep
+    /// their save order (`-2` is newer), not the file names' byte order.
+    #[test]
+    fn backups_are_pruned_per_keyboard_in_save_order() {
+        let dir = TempDir::new("prune");
+        let snap = snapshot68();
+        let keys = factory_keys(&snap);
+        let save = |serial: &str, reason: &str, ms: u64| {
+            let b = BackupFile::new(reason, 0, serial, snap.model, &keys, ms);
+            save_backup(&dir.0, &b).unwrap()
+        };
+        for i in 0..KEEP_BACKUPS as u64 {
+            save("A68", "a", 1_000 + i);
+        }
+        for i in 0..KEEP_BACKUPS as u64 + 3 {
+            save("B68", "b", 2_000 + i);
+        }
+        assert_eq!(list_backups(&dir.0, snap.model, "A68").len(), KEEP_BACKUPS);
+        let b = list_backups(&dir.0, snap.model, "B68");
+        assert_eq!(b.len(), KEEP_BACKUPS);
+        assert_eq!(b.last().unwrap().created_ms, 2_003, "B's oldest went");
+        // Three in one millisecond: backup-…, backup-…-2, backup-…-3.
+        let p1 = save("A68", "first", 5_000);
+        let p2 = save("A68", "second", 5_000);
+        let p3 = save("A68", "third", 5_000);
+        assert!(p2.to_string_lossy().ends_with("-2.json"), "{p2:?}");
+        let a = list_backups(&dir.0, snap.model, "A68");
+        let reasons: Vec<&str> = a.iter().take(3).map(|b| b.reason.as_str()).collect();
+        assert_eq!(reasons, ["third", "second", "first"]);
+        assert_eq!(a.len(), KEEP_BACKUPS);
+        assert!(p1.exists() && p2.exists() && p3.exists(), "the newest stay");
+        assert_eq!(a.last().unwrap().created_ms, 1_003);
+        // One more in that millisecond: the oldest A goes, not "first".
+        save("A68", "fourth", 5_000);
+        let a = list_backups(&dir.0, snap.model, "A68");
+        assert_eq!(a[0].reason, "fourth");
+        assert_eq!(a.last().unwrap().created_ms, 1_004);
+        assert!(p1.exists());
+    }
+
+    #[test]
+    fn backup_names_carry_time_keyboard_and_order() {
+        let tag = keyboard_tag(Model::Win68HeMax, "A68");
+        assert_eq!(tag.len(), 17);
+        assert_eq!(tag, keyboard_tag(Model::Win68HeMax, "A68"), "stable");
+        assert_ne!(tag, keyboard_tag(Model::Win60HeMax, "A68"));
+        assert_ne!(tag, keyboard_tag(Model::Win68HeMax, "A69"));
+        let name = |s: &str| parse_name(Path::new(s));
+        let n = name(&format!("backup-0000000001000-{tag}-3.json")).unwrap();
+        assert_eq!((n.ms, n.tag.as_deref(), n.n), (1000, Some(tag.as_str()), 3));
+        let n = name(&format!("backup-0000000001000-{tag}.json")).unwrap();
+        assert_eq!((n.ms, n.n), (1000, 0));
+        // An older version's names.
+        let n = name("backup-0000000001000.json").unwrap();
+        assert_eq!((n.ms, n.tag, n.n), (1000, None, 0));
+        assert_eq!(name("backup-0000000001000-2.json").unwrap().n, 2);
+        for bad in [
+            "backup-old.json",
+            "backup-1-x.json",
+            "backup-1-2-3.json",
+            "x-1.json",
+        ] {
+            assert_eq!(name(bad), None, "{bad}");
+        }
+    }
+
+    /// Pruning goes by file names: an older version's untagged backups of
+    /// this keyboard and files that cannot be read or placed count with
+    /// this keyboard and go once older than its newest ten; other
+    /// keyboards' files (tagged, or untagged with a readable header) stay,
+    /// even when they are broken.
+    #[test]
+    fn old_and_unreadable_backups_are_pruned_too() {
+        let dir = TempDir::new("legacy");
+        let bdir = dir.0.join(BACKUPS_DIR);
+        std::fs::create_dir_all(&bdir).unwrap();
+        let snap = snapshot68();
+        let keys = factory_keys(&snap);
+        let json = |serial: &str, ms: u64| {
+            let b = BackupFile::new("old", 0, serial, snap.model, &keys, ms);
+            serde_json::to_string(&b).unwrap()
+        };
+        let write = |name: &str, text: &str| {
+            let p = bdir.join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        let legacy_a = write("backup-0000000000100.json", &json("A68", 100));
+        let legacy_a2 = write("backup-0000000000100-2.json", &json("A68", 100));
+        let legacy_b = write("backup-0000000000101.json", &json("B68", 101));
+        let broken = write("backup-0000000000102.json", "{");
+        let odd = write("backup-old.json", "{");
+        let other_tag = keyboard_tag(snap.model, "B68");
+        let broken_b = write(&format!("backup-0000000000103-{other_tag}.json"), "{");
+        // The untagged backups of A are listed with the new ones.
+        assert_eq!(list_backups(&dir.0, snap.model, "A68").len(), 2);
+        // New backups are taken after the odd file was last changed.
+        let start = now_ms() + 60_000;
+        let save = |i: u64| {
+            let b = BackupFile::new("new", 0, "A68", snap.model, &keys, start + i);
+            save_backup(&dir.0, &b).unwrap()
+        };
+        for i in 0..KEEP_BACKUPS as u64 - 1 {
+            save(i);
+        }
+        // 9 new, 2 untagged A, 2 unreadable and the odd name: the three
+        // oldest by name time go; the odd name counts by its mtime.
+        assert!(!legacy_a.exists() && !legacy_a2.exists() && !broken.exists());
+        assert!(odd.exists());
+        assert!(legacy_b.exists() && broken_b.exists(), "B's files stay");
+        assert_eq!(
+            list_backups(&dir.0, snap.model, "A68").len(),
+            KEEP_BACKUPS - 1
+        );
+        // One more: now the odd file is the oldest of eleven.
+        save(KEEP_BACKUPS as u64);
+        assert!(!odd.exists());
+        assert_eq!(list_backups(&dir.0, snap.model, "A68").len(), KEEP_BACKUPS);
+        assert!(legacy_b.exists() && broken_b.exists());
+        assert_eq!(list_backups(&dir.0, snap.model, "B68").len(), 1);
     }
 
     #[test]
