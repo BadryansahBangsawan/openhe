@@ -71,6 +71,13 @@ impl<T: Transport> Keyboard<T> {
         // A keyboard lighting report (0x98, e.g. Fn+light) can be taken as
         // the SET reply; the real one then arrives late and, being 0x98 too,
         // could answer the read-back GET. Let it arrive and drain it first.
+        //
+        // What the drain finds stays a `LightingChanged` event. Every 0x98
+        // beyond the one taken as the SET reply stands for one keyboard
+        // report: either it is that report, or it is our late SET reply
+        // because that report was taken in its place. The bytes cannot
+        // tell the two apart (both carry a lighting state), so dropping it
+        // would lose the event of a real Fn+light press.
         self.session.settle(PRGB_SETTLE)?;
         let got = self.lighting()?;
         let want = Lighting {

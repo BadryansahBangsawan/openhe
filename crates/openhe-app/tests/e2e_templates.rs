@@ -121,7 +121,11 @@ fn urungkan_restores_the_previous_values_exactly() {
     assert_eq!(touch(&w, Q), 2);
     assert_ne!(w.sim().p().keys, before);
 
-    run_until(&mut w, "Urungkan", "Urungkan Kompetitif");
+    // Urungkan previews the undo first; nothing is written until Terapkan.
+    w.click("Urungkan");
+    assert!(w.has_text("Urungkan Kompetitif"), "{:?}", w.labels());
+    assert_eq!(w.sim().p().key(Q, 4), 600, "the preview writes nothing");
+    run_until(&mut w, "Terapkan", DONE);
     assert_eq!(w.sim().p().keys, before, "every key value back as it was");
     assert_eq!(w.snapshot().keys[&W].actuation.0, 550);
     // The undo was backed up too, so it can be undone in turn.
@@ -140,7 +144,9 @@ fn urungkan_after_gaming_fps_clears_the_socd_pairs() {
     preview(&mut w, "Gaming FPS");
     run_until(&mut w, "Terapkan", DONE);
     assert_eq!(nibble(&w, A), 8);
-    run_until(&mut w, "Urungkan", "Urungkan Gaming FPS");
+    w.click("Urungkan");
+    assert!(w.has_text("Urungkan Gaming FPS"), "{:?}", w.labels());
+    run_until(&mut w, "Terapkan", DONE);
     assert_eq!(w.sim().p().keys, before);
     for k in [W, A, S, D] {
         assert_eq!(nibble(&w, k), 0);

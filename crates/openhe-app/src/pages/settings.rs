@@ -570,6 +570,7 @@ mod strings {
     pub const EXPORTING: &str = "Membaca profil dari keyboard…";
     pub const EXPORTED: &str = "Profil diekspor ke";
     pub const EXPORTED_NO_LIGHT: &str = "Lampu tidak terbaca, jadi tidak ikut diekspor.";
+    pub const EXPORTED_NO_KEYS: &str = "Tombol ini tidak terbaca, jadi tidak ikut diekspor:";
     pub const EXPORT_FAILED: &str = "Gagal mengekspor profil.";
     pub const WRITE_FILE_FAILED: &str = "File tidak bisa disimpan.";
     pub const READ_FILE_FAILED: &str = "File tidak bisa dibaca.";
@@ -671,6 +672,19 @@ pub fn file_error_text(e: &FileError) -> String {
             t::FILE_TRANSPARENT_BASE_TAIL
         ),
     }
+}
+
+/// The suggested name of a profile export: "openhe-profil-1-kerja.json"
+/// for profile label "1 · Kerja". The label holds the user's own profile
+/// name, so it goes through [`store::slug`] like a template export:
+/// `/`, `:` and the like would break the save dialog.
+///
+/// [`store::slug`]: crate::templates::store::slug
+pub fn export_file_name(profile_label: &str) -> String {
+    format!(
+        "openhe-profil-{}.json",
+        crate::templates::store::slug(profile_label)
+    )
 }
 
 /// The import/export flow.
@@ -885,6 +899,15 @@ impl Page {
                                     |f| f.to_string_lossy().into_owned(),
                                 );
                                 let mut msg = format!("{} {name}.", t::EXPORTED);
+                                if !out.keys_skipped.is_empty() {
+                                    let keys: Vec<u8> =
+                                        out.keys_skipped.iter().map(|(k, _)| *k).collect();
+                                    msg = format!(
+                                        "{msg} {} {}.",
+                                        t::EXPORTED_NO_KEYS,
+                                        legend_list(&keys, 8)
+                                    );
+                                }
                                 if out.data.lighting.is_none() {
                                     msg = format!("{msg} {}", t::EXPORTED_NO_LIGHT);
                                 }
@@ -1372,13 +1395,7 @@ impl Page {
 
     fn start_export(&mut self, ctx: &AppCtx) {
         let Some(snap) = ctx.snapshot else { return };
-        let default_name = format!(
-            "openhe-profil-{}.json",
-            ctx.data
-                .borrow()
-                .profile_label(snap.profile)
-                .replace(" · ", "-")
-        );
+        let default_name = export_file_name(&ctx.data.borrow().profile_label(snap.profile));
         let Some(path) = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
             .set_file_name(default_name)

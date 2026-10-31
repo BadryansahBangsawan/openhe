@@ -16,6 +16,7 @@
 //! is not confirmed. The UI says so.
 
 use super::advanced::Func;
+use super::performance::SentOn;
 use crate::app::{page_with_right_panel, AppCtx};
 use crate::i18n;
 use crate::storage::{SavedMacro, SavedMacroAction};
@@ -913,6 +914,9 @@ pub struct Page {
     bind_pending: Option<Pending<BindOutcome>>,
     /// The key the running bind goes to (its result belongs to it).
     bind_key: Option<u8>,
+    /// The keyboard state the running bind was sent on: its re-read is
+    /// patched into the snapshot only while that state is still current.
+    bind_sent_on: Option<SentOn>,
     /// The last bind sent, for "Coba lagi"; forgotten when the selected
     /// macro changes or is edited.
     last_bind: Option<(u8, SavedMacro)>,
@@ -947,6 +951,7 @@ impl Default for Page {
             binding_pending: None,
             bind_pending: None,
             bind_key: None,
+            bind_sent_on: None,
             last_bind: None,
             failure: None,
             bound: false,
@@ -1167,8 +1172,28 @@ impl Page {
                 let fx = bind_effects(r);
                 // The result is the bound key's, whatever is selected now.
                 let key = self.bind_key.take();
+                let sent_on = self.bind_sent_on.take();
+                if sent_on.is_none() || sent_on != SentOn::now(ctx) {
+                    // Read only now, after a profile switch or a reconnect:
+                    // the settings read back belong to the keyboard state
+                    // of back then and the snapshot was loaded afresh since.
+                    // Nothing is patched; the target's binding is read again.
+                    self.binding_for = None;
+                    self.bind_replaces = false;
+                    self.failure = fx.error.map(|text| Failure {
+                        title: strings::BIND_FAILED,
+                        text,
+                        technical: fx.technical,
+                    });
+                    self.bound = false;
+                    return;
+                }
+                let profile = sent_on.map(|s| s.profile);
                 if let (Some(key), Some(s)) = (key, fx.patch) {
                     ctx.worker.patch_snapshot(move |snap| {
+                        if Some(snap.profile) != profile {
+                            return;
+                        }
                         snap.keys.insert(key, s);
                     });
                 }
@@ -1232,6 +1257,7 @@ impl Page {
             .snapshot
             .is_some_and(|s| replaced_function(s, key).is_some());
         self.bind_key = Some(key);
+        self.bind_sent_on = SentOn::now(ctx);
         self.last_bind = Some((key, m.clone()));
         let actions = m.to_actions();
         let (mode, repeat, interval) = (m.play_mode(), m.repeat_count(), m.interval_ms);

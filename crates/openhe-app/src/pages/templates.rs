@@ -4,7 +4,8 @@
 //!
 //! 1. The user picks a template (built-in, saved, imported file or a
 //!    backup). One job reads every key of the active profile
-//!    ([`read_keys`]); the template is planned against that state
+//!    ([`read_keys`]; a key that cannot be read is left out, and the plan
+//!    skips it and says so); the template is planned against that state
 //!    ([`plan_template`]) and the preview shows what changes: a summary in
 //!    the right panel and the affected keys on the keyboard.
 //! 2. "Terapkan": if the profile, connection or snapshot moved since the
@@ -12,9 +13,12 @@
 //!    state read in step 1 is saved as a local backup first (no backup, no
 //!    write), then the plan runs ([`import_job`]: every write verified by
 //!    read-back) and the snapshot is reloaded.
-//! 3. "Tersimpan" offers "Urungkan": the backup is applied back the same
-//!    way (it is itself backed up first). Recent backups are listed and can
-//!    be restored with a preview.
+//! 3. "Tersimpan" offers "Urungkan": a preview of putting back, from the
+//!    backup, only what the apply wrote ([`Footprint`]); values changed
+//!    elsewhere since are named in the preview. Applying it is backed up
+//!    too. Recent backups are listed; "Pulihkan" previews putting back the
+//!    whole backup. A backup is only applied on the profile it was read
+//!    from.
 //!
 //! A profile switch or a reconnect drops a pending preview. While a
 //! preview or a write is under way, automatic per-app profile switches
@@ -22,14 +26,18 @@
 
 use crate::app::{page_with_right_panel, AppCtx};
 use crate::i18n;
-use crate::pages::settings::profile_file::{import_job, read_keys, ImportReport, KeyData};
+use crate::pages::settings::profile_file::{
+    import_job, read_keys, ImportReport, KeyData, KeysRead,
+};
 use crate::storage::AppData;
-use crate::templates::plan::{plan_template, summary, Summary, TemplatePlan};
+use crate::templates::plan::{plan_template, summary, Footprint, Summary, TemplatePlan};
 use crate::templates::store::{self, Backup, Saved};
 use crate::templates::{self, error_text, Builtin, Parts, Template, TemplateFile};
 use crate::theme::{color, font, line, size};
 use crate::widgets::card::{self, Card};
-use crate::widgets::keyboard::{reference_matrix, KeyDecoration, KeyboardView, Selection};
+use crate::widgets::keyboard::{
+    legend_list, reference_matrix, KeyDecoration, KeyboardView, Selection,
+};
 use crate::widgets::slider_mm::mm_short;
 use crate::worker::Pending;
 use eframe::egui::{self, CornerRadius, RichText, Sense, Ui};
@@ -58,7 +66,9 @@ mod strings {
     pub const PART_ADV: &str = "Tombol lanjutan";
     pub const SAVING: &str = "Membaca setting dari keyboard…";
     pub const SAVED: &str = "Template disimpan.";
+    pub const SAVED_WITHOUT: &str = "Tidak terbaca, jadi tidak ikut disimpan:";
     pub const SAVE_FAILED: &str = "Template tidak bisa disimpan.";
+    pub const NOTHING_READ: &str = "Tidak ada tombol yang terbaca dari keyboard.";
     pub const EXPORTED: &str = "Template diekspor ke";
     pub const DELETED: &str = "Template dihapus.";
     pub const FILE_FAILED: &str = "File tidak bisa dibaca atau ditulis.";
@@ -84,6 +94,10 @@ mod strings {
     pub const DONE_BODY: &str = "Nilai sudah dibaca ulang dari keyboard.";
     pub const UNDO: &str = "Urungkan";
     pub const UNDO_PREFIX: &str = "Urungkan";
+    pub const UNDO_SCOPE: &str =
+        "Hanya yang diubah template tadi yang dikembalikan; perubahan lain tetap.";
+    pub const UNDO_CHANGED: &str = "Sejak template diterapkan, tombol ini diubah lagi:";
+    pub const UNDO_CHANGED_TAIL: &str = "Urungkan menimpa perubahan itu dengan nilai cadangan.";
     pub const RESTORE_PREFIX: &str = "Pulihkan cadangan";
     pub const NOTHING_TO_UNDO: &str = "Tidak ada yang perlu dikembalikan.";
     pub const PARTIAL: &str =
@@ -105,6 +119,11 @@ mod strings {
     pub const PROFILE: &str = "Profil";
     pub const RESTORE: &str = "Pulihkan";
     pub const BACKUP_GONE: &str = "Cadangan ini tidak bisa dibaca lagi.";
+    pub const OTHER_PROFILE: &str = "Cadangan dari profil lain";
+    pub const OTHER_PROFILE_BODY: &str = "Cadangan ini dibaca dari";
+    pub const OTHER_PROFILE_NOW: &str = "sedangkan yang aktif";
+    pub const OTHER_PROFILE_TAIL: &str =
+        "Aktifkan profil itu dulu di Pengaturan, lalu pulihkan lagi.";
 }
 use strings as t;
 
@@ -142,14 +161,19 @@ enum Source {
     Imported(String),
     Backup(PathBuf),
     /// "Urungkan" of the last apply.
-    Undo,
+    Undo(Box<Undo>),
 }
 
-/// After the read: show the preview, or apply at once ("Urungkan").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Then {
-    Preview,
-    Apply,
+/// What "Urungkan" of the last apply puts back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Undo {
+    /// The backup saved just before the apply.
+    backup: PathBuf,
+    /// What the apply wrote: the only parts put back.
+    written: Footprint,
+    /// Every write went through, so right after the apply the keyboard
+    /// held `written`: whatever differs now was changed elsewhere since.
+    complete: bool,
 }
 
 enum Flow {
@@ -157,8 +181,7 @@ enum Flow {
     Reading {
         tpl: Box<Template>,
         source: Source,
-        then: Then,
-        pending: Pending<Vec<KeyData>>,
+        pending: Pending<KeysRead>,
         on: Stamp,
         /// Read again because the keyboard moved after a preview.
         refreshed: bool,
@@ -176,14 +199,15 @@ enum Flow {
         name: String,
         pending: Pending<ImportReport>,
         backup: PathBuf,
+        written: Box<Footprint>,
         on: Stamp,
     },
     Done {
         ok: bool,
         text: String,
         tech: Option<String>,
-        /// The backup "Urungkan" applies (none when nothing was written).
-        backup: Option<PathBuf>,
+        /// What "Urungkan" puts back (none when nothing was written).
+        undo: Option<Box<Undo>>,
         on: Stamp,
     },
     Failed {
@@ -197,7 +221,7 @@ enum Flow {
 struct SaveForm {
     name: String,
     parts: Parts,
-    pending: Option<Pending<Vec<KeyData>>>,
+    pending: Option<Pending<KeysRead>>,
 }
 
 pub struct Page {
@@ -240,7 +264,7 @@ fn keys_of(ctx: &AppCtx) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn submit_read(ctx: &AppCtx, label: &'static str) -> Pending<Vec<KeyData>> {
+fn submit_read(ctx: &AppCtx, label: &'static str) -> Pending<KeysRead> {
     let keys = keys_of(ctx);
     ctx.worker.submit(label, move |kb| read_keys(kb, &keys))
 }
@@ -314,15 +338,14 @@ impl Page {
 
     // --------------------------------------------------------- flow
 
-    /// Starts a preview (or, for `Then::Apply`, an apply) of `tpl`.
-    fn start(&mut self, ctx: &AppCtx, tpl: Template, source: Source, then: Then) {
+    /// Starts a preview of `tpl`.
+    fn start(&mut self, ctx: &AppCtx, tpl: Template, source: Source) {
         let Some(on) = Stamp::now(ctx) else { return };
         self.dropped = false;
         self.lib_note = None;
         self.flow = Flow::Reading {
             tpl: Box::new(tpl),
             source,
-            then,
             pending: submit_read(ctx, "template-read"),
             on,
             refreshed: false,
@@ -332,7 +355,7 @@ impl Page {
     fn start_builtin(&mut self, ctx: &AppCtx, b: Builtin) {
         let Some(snap) = ctx.snapshot else { return };
         let tpl = b.template(snap.model, &keys_of(ctx));
-        self.start(ctx, tpl, Source::Builtin(b), Then::Preview);
+        self.start(ctx, tpl, Source::Builtin(b));
     }
 
     /// Opens a template file (the import dialog's choice, or a test). A
@@ -344,7 +367,7 @@ impl Page {
         );
         match std::fs::read_to_string(path) {
             Ok(text) => match templates::parse(&text) {
-                Ok(tpl) => self.start(ctx, tpl, Source::Imported(name), Then::Preview),
+                Ok(tpl) => self.start(ctx, tpl, Source::Imported(name)),
                 Err(e) => {
                     self.flow = Flow::Failed {
                         title: t::CANNOT_USE,
@@ -373,16 +396,42 @@ impl Page {
         self.import_path(ctx, &path);
     }
 
-    fn restore_backup(&mut self, ctx: &AppCtx, path: &Path, then: Then, source: Source) {
+    /// Previews the backup at `path`: all of it ("Pulihkan"), or with
+    /// `undo` only what that apply wrote ("Urungkan"). A backup read from
+    /// another onboard profile is refused: switching profiles re-enumerates
+    /// the keyboard, so that is left to the user.
+    fn restore_backup(&mut self, ctx: &AppCtx, path: &Path, undo: Option<Box<Undo>>) {
+        let Some(snap) = ctx.snapshot else { return };
         match store::read_backup(path) {
-            Some(b) => {
-                let name = match then {
-                    Then::Apply => format!("{} {}", t::UNDO_PREFIX, b.reason),
-                    Then::Preview => format!("{} ({})", t::RESTORE_PREFIX, b.reason),
-                };
-                let tpl = Template::from_current(&name, b.model, &b.keys, Parts::ALL);
-                self.start(ctx, tpl, source, then);
+            Some(b) if b.profile != snap.profile => {
+                self.flow = Flow::Failed {
+                    title: t::OTHER_PROFILE,
+                    detail: format!(
+                        "{} {} {}, {} {} {}. {}",
+                        t::OTHER_PROFILE_BODY,
+                        t::PROFILE,
+                        b.profile + 1,
+                        t::OTHER_PROFILE_NOW,
+                        t::PROFILE,
+                        snap.profile + 1,
+                        t::OTHER_PROFILE_TAIL
+                    ),
+                    tech: Some(path.display().to_string()),
+                }
             }
+            Some(b) => match undo {
+                Some(u) => {
+                    let name = format!("{} {}", t::UNDO_PREFIX, b.reason);
+                    let tpl = Template::from_current(&name, b.model, &b.keys, Parts::ALL)
+                        .limited_to(&u.written);
+                    self.start(ctx, tpl, Source::Undo(u));
+                }
+                None => {
+                    let name = format!("{} ({})", t::RESTORE_PREFIX, b.reason);
+                    let tpl = Template::from_current(&name, b.model, &b.keys, Parts::ALL);
+                    self.start(ctx, tpl, Source::Backup(path.to_path_buf()));
+                }
+            },
             None => {
                 self.backups = None;
                 self.flow = Flow::Failed {
@@ -409,7 +458,7 @@ impl Page {
                 ok: true,
                 text: t::NOTHING_TO_UNDO.to_string(),
                 tech: None,
-                backup: None,
+                undo: None,
                 on,
             };
             return;
@@ -449,6 +498,7 @@ impl Page {
                 .worker
                 .submit("template-apply", move |kb| import_job(kb, &writes)),
             backup,
+            written: Box::new(plan.footprint()),
             on,
         };
     }
@@ -474,7 +524,6 @@ impl Page {
                 self.flow = Flow::Reading {
                     tpl,
                     source,
-                    then: Then::Preview,
                     pending: submit_read(ctx, "template-read"),
                     on: now,
                     refreshed: true,
@@ -507,7 +556,6 @@ impl Page {
             Flow::Reading {
                 tpl,
                 source,
-                then,
                 mut pending,
                 on,
                 refreshed,
@@ -516,7 +564,6 @@ impl Page {
                     self.flow = Flow::Reading {
                         tpl,
                         source,
-                        then,
                         pending,
                         on,
                         refreshed,
@@ -529,7 +576,7 @@ impl Page {
                         tech: Some(i18n::technical(&e)),
                     }
                 }
-                Some(Ok(current)) => {
+                Some(Ok(KeysRead { keys: current, .. })) => {
                     let Some(snap) = ctx.snapshot else { return };
                     // A reload while reading: the keys may be older than
                     // the snapshot; read again.
@@ -537,7 +584,6 @@ impl Page {
                         self.flow = Flow::Reading {
                             tpl,
                             source,
-                            then,
                             pending: submit_read(ctx, "template-read"),
                             on: Stamp::now(ctx).unwrap_or(on),
                             refreshed,
@@ -552,21 +598,32 @@ impl Page {
                                 tech: Some(format!("{e:?}")),
                             }
                         }
-                        Ok(plan) => match then {
-                            Then::Apply => self.apply(ctx, &tpl, &current, &plan, on),
-                            Then::Preview => {
-                                let summary = summary(&plan, snap.matrix.keys().count());
-                                self.flow = Flow::Preview {
-                                    tpl,
-                                    source,
-                                    current,
-                                    plan: Box::new(plan),
-                                    summary,
-                                    on,
-                                    refreshed,
-                                };
+                        Ok(plan) => {
+                            let mut summary = summary(&plan, snap.matrix.keys().count());
+                            // Keys not read now are skipped by the plan (and
+                            // named); the others must still hold what the
+                            // apply wrote, or someone changed them since.
+                            if let Source::Undo(u) = &source {
+                                let changed = u.written.changed_since(&current);
+                                if u.complete && !changed.is_empty() {
+                                    summary.warnings.push(format!(
+                                        "{} {}. {}",
+                                        t::UNDO_CHANGED,
+                                        legend_list(&changed, 8),
+                                        t::UNDO_CHANGED_TAIL
+                                    ));
+                                }
                             }
-                        },
+                            self.flow = Flow::Preview {
+                                tpl,
+                                source,
+                                current,
+                                plan: Box::new(plan),
+                                summary,
+                                on,
+                                refreshed,
+                            };
+                        }
                     }
                 }
             },
@@ -574,6 +631,7 @@ impl Page {
                 name,
                 mut pending,
                 backup,
+                written,
                 on,
             } => match pending.poll() {
                 None => {
@@ -581,6 +639,7 @@ impl Page {
                         name,
                         pending,
                         backup,
+                        written,
                         on,
                     }
                 }
@@ -607,7 +666,11 @@ impl Page {
                         ok,
                         text,
                         tech,
-                        backup: Some(backup),
+                        undo: Some(Box::new(Undo {
+                            backup,
+                            written: *written,
+                            complete: matches!(&r, Ok(rep) if rep.failed.is_empty()),
+                        })),
                         on,
                     };
                 }
@@ -625,11 +688,30 @@ impl Page {
         };
         form.pending = None;
         let note = match (r, ctx.snapshot, self.base.as_deref()) {
-            (Ok(keys), Some(snap), Some(base)) => {
-                let tpl = Template::from_current(form.name.trim(), snap.model, &keys, form.parts);
-                match store::save_template(base, &tpl) {
-                    Ok(_) => (true, t::SAVED.to_string()),
-                    Err(e) => (false, format!("{} {e}", t::SAVE_FAILED)),
+            (Ok(read), Some(snap), Some(base)) => {
+                let tpl =
+                    Template::from_current(form.name.trim(), snap.model, &read.keys, form.parts);
+                if !tpl.parts().any() {
+                    (false, format!("{} {}", t::SAVE_FAILED, t::NOTHING_READ))
+                } else {
+                    match store::save_template(base, &tpl) {
+                        Ok(_) if read.failed.is_empty() => (true, t::SAVED.to_string()),
+                        // Saved, but without the keys that could not be
+                        // read: say which.
+                        Ok(_) => {
+                            let keys: Vec<u8> = read.failed.iter().map(|(k, _)| *k).collect();
+                            (
+                                true,
+                                format!(
+                                    "{} {} {}.",
+                                    t::SAVED,
+                                    t::SAVED_WITHOUT,
+                                    legend_list(&keys, 8)
+                                ),
+                            )
+                        }
+                        Err(e) => (false, format!("{} {e}", t::SAVE_FAILED)),
+                    }
                 }
             }
             (Ok(_), _, None) => (false, format!("{} {}", t::SAVE_FAILED, t::NO_DATA_DIR)),
@@ -982,12 +1064,7 @@ impl Page {
                 let _ = row;
             }
             if let Some(s) = start {
-                self.start(
-                    ctx,
-                    s.template.clone(),
-                    Source::Saved(s.path.clone()),
-                    Then::Preview,
-                );
+                self.start(ctx, s.template.clone(), Source::Saved(s.path.clone()));
             }
             if let Some(s) = export {
                 self.export(&s);
@@ -1145,6 +1222,14 @@ impl Page {
                     }
                 });
                 ui.add_space(10.0);
+                for w in &summary.warnings {
+                    ui.add(egui::Label::new(RichText::new(w).color(color::DANGER)).wrap());
+                    ui.add_space(10.0);
+                }
+                if matches!(source, Source::Undo(_)) {
+                    card::hint(ui, t::UNDO_SCOPE);
+                    ui.add_space(10.0);
+                }
                 if !plan.is_empty() {
                     card::hint(ui, t::BACKUP_FIRST);
                     ui.add_space(10.0);
@@ -1181,7 +1266,7 @@ impl Page {
                 ok,
                 text,
                 tech,
-                backup,
+                undo,
                 ..
             } => {
                 card::title(ui, t::TITLE);
@@ -1205,7 +1290,7 @@ impl Page {
                             egui::Label::new(RichText::new(format!("✔ {text}")).color(c).strong())
                                 .wrap(),
                         );
-                        if *ok && backup.is_some() {
+                        if *ok && undo.is_some() {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(t::DONE_BODY)
@@ -1220,7 +1305,7 @@ impl Page {
                 if let Some(tech) = tech {
                     resp.on_hover_text(format!("{}: {tech}", i18n::common::TECH_DETAIL));
                 }
-                if backup.is_some() {
+                if undo.is_some() {
                     ui.add_space(10.0);
                     if ui.add_enabled(can, secondary(t::UNDO)).clicked() {
                         action = Some(RightAction::Undo);
@@ -1242,12 +1327,10 @@ impl Page {
             Some(RightAction::Apply) => self.confirm(ctx),
             Some(RightAction::KeepImported) => self.keep_imported(),
             Some(RightAction::Undo) => {
-                if let Flow::Done {
-                    backup: Some(p), ..
-                } = &self.flow
-                {
-                    let p = p.clone();
-                    self.restore_backup(ctx, &p, Then::Apply, Source::Undo);
+                if let Flow::Done { undo: Some(u), .. } = &self.flow {
+                    let u = u.clone();
+                    let path = u.backup.clone();
+                    self.restore_backup(ctx, &path, Some(u));
                 }
             }
             None => {}
@@ -1311,7 +1394,7 @@ impl Page {
                 });
         }
         if let Some(p) = restore {
-            self.restore_backup(ctx, &p, Then::Preview, Source::Backup(p.clone()));
+            self.restore_backup(ctx, &p, None);
         }
     }
 }

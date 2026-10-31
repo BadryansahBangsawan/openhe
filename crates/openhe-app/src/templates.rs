@@ -11,7 +11,9 @@
 //!   ([`TemplateFile`], versioned and model-tagged) in the app data
 //!   directory ([`store`]);
 //! - a backup: the whole key state read just before a template was applied
-//!   (also [`Template::from_current`]); "Urungkan" applies it back.
+//!   (also [`Template::from_current`]). "Pulihkan" applies all of it back;
+//!   "Urungkan" only what the applied template wrote
+//!   ([`Template::limited_to`] a [`plan::Footprint`]).
 //!
 //! [`plan::plan_template`] turns a template plus the keyboard's current
 //! state into the writes (an [`crate::pages::settings::profile_file::ImportPlan`],
@@ -20,10 +22,11 @@
 pub mod plan;
 pub mod store;
 
+use crate::pages::remap::{is_win_alt, LAYER_ORDER as LAYERS};
 use crate::pages::settings::profile_file::{
-    model_from, touch_from, touch_name, AdvancedEntry, KeyData,
+    model_from, perf_problem, touch_from, touch_name, AdvancedEntry, KeyData,
 };
-use openhe_device::{AdvancedConfig, FN_KEY};
+use openhe_device::{AdvancedConfig, KeySettings, PerformanceChange, FN_KEY};
 use openhe_proto::advanced::{Socd, SocdMode};
 use openhe_proto::{Layer, Micrometers, Model, TouchMode};
 use serde::{Deserialize, Serialize};
@@ -36,9 +39,7 @@ pub const VERSION: u32 = 1;
 pub const EXTENSION: &str = "openhe-template";
 
 /// Layer code 0x0001: transparent on the Fn layers, a dead key on Base.
-pub const TRANSPARENT: u16 = 0x0001;
-
-const LAYERS: [Layer; 4] = [Layer::Base, Layer::Fn1, Layer::Fn2, Layer::Fn3];
+pub use crate::pages::remap::TRANSPARENT;
 
 mod strings {
     pub const FPS: &str = "Gaming FPS";
@@ -89,6 +90,55 @@ pub struct KeyPerf {
 impl KeyPerf {
     pub fn is_empty(&self) -> bool {
         *self == KeyPerf::default()
+    }
+
+    /// The same values as a device change (the switch never changes).
+    pub fn change(&self) -> PerformanceChange {
+        PerformanceChange {
+            touch: self.touch,
+            actuation: self.actuation,
+            rt_press: self.rt_press,
+            rt_release: self.rt_release,
+            top_dz: self.top_dz,
+            bottom_dz: self.bottom_dz,
+            switch: None,
+        }
+    }
+
+    /// Every value of `s` (not the switch). A key in touch mode Global
+    /// does not use its own actuation and RT: they are kept only when its
+    /// switch could take them (so a restore puts them back exactly), and
+    /// left out otherwise, as the profile import does, so a leftover value
+    /// out of range never makes a restore skip the key or refuse the whole
+    /// template.
+    pub fn of(model: Model, key: u8, s: &KeySettings) -> KeyPerf {
+        let mut p = KeyPerf {
+            touch: Some(s.mode.touch),
+            actuation: Some(s.actuation),
+            rt_press: Some(s.rt_press),
+            rt_release: Some(s.rt_release),
+            top_dz: Some(s.top_dz),
+            bottom_dz: Some(s.bottom_dz),
+        };
+        if s.mode.touch == TouchMode::Global {
+            let max = model
+                .switches()
+                .iter()
+                .find(|sw| sw.id == s.switch)
+                .map(|sw| sw.max_travel);
+            let travel = PerformanceChange {
+                actuation: p.actuation,
+                rt_press: p.rt_press,
+                rt_release: p.rt_release,
+                ..Default::default()
+            };
+            if max.is_none() || perf_problem(key, &travel, max).is_some() {
+                p.actuation = None;
+                p.rt_press = None;
+                p.rt_release = None;
+            }
+        }
+        p
     }
 }
 
@@ -144,11 +194,12 @@ impl Template {
     }
 
     /// The whole state of `keys` (as read from the keyboard) as a template,
-    /// limited to `parts`: every performance value but the switch, every
-    /// layer code (not the Fn key's own Base code, never 0x0001 on Base),
-    /// and every advanced function (a key without one is cleared when the
-    /// template is applied). Macros cannot be read back, so a macro key's
-    /// function is left out.
+    /// limited to `parts`: every performance value but the switch (see
+    /// [`KeyPerf::of`] for keys in touch mode Global), every layer code (not
+    /// the Fn key's own Base code, never 0x0001 on Base), and every advanced
+    /// function (a key without one is cleared when the template is
+    /// applied). Macros cannot be read back, so a macro key's function is
+    /// left out.
     pub fn from_current(name: &str, model: Model, keys: &[KeyData], parts: Parts) -> Template {
         let mut t = Template {
             name: name.to_string(),
@@ -160,18 +211,8 @@ impl Template {
         };
         for k in keys {
             if parts.performance {
-                let s = &k.settings;
-                t.performance.push((
-                    k.code,
-                    KeyPerf {
-                        touch: Some(s.mode.touch),
-                        actuation: Some(s.actuation),
-                        rt_press: Some(s.rt_press),
-                        rt_release: Some(s.rt_release),
-                        top_dz: Some(s.top_dz),
-                        bottom_dz: Some(s.bottom_dz),
-                    },
-                ));
+                t.performance
+                    .push((k.code, KeyPerf::of(model, k.code, &k.settings)));
             }
             if parts.remap {
                 for (layer, code) in LAYERS.into_iter().zip(k.layers) {
@@ -187,6 +228,34 @@ impl Template {
             }
         }
         t
+    }
+
+    /// Only what `written` names: the performance fields, layer codes and
+    /// functions an applied plan wrote ("Urungkan" of a backup puts back
+    /// those and leaves everything else as it is now).
+    pub fn limited_to(mut self, written: &plan::Footprint) -> Template {
+        let only = |v: Option<Micrometers>, w: Option<Micrometers>| v.filter(|_| w.is_some());
+        self.performance = self
+            .performance
+            .into_iter()
+            .filter_map(|(k, p)| {
+                let w = written.perf.get(&k)?;
+                let p = KeyPerf {
+                    touch: p.touch.filter(|_| w.touch.is_some()),
+                    actuation: only(p.actuation, w.actuation),
+                    rt_press: only(p.rt_press, w.rt_press),
+                    rt_release: only(p.rt_release, w.rt_release),
+                    top_dz: only(p.top_dz, w.top_dz),
+                    bottom_dz: only(p.bottom_dz, w.bottom_dz),
+                };
+                (!p.is_empty()).then_some((k, p))
+            })
+            .collect();
+        self.layers
+            .retain(|&(k, l, _)| written.layers.iter().any(|&(wk, wl, _)| wk == k && wl == l));
+        self.advanced
+            .retain(|(k, _)| written.functions.iter().any(|(wk, _)| wk == k));
+        self
     }
 }
 
@@ -347,7 +416,7 @@ impl Builtin {
                             (Layer::Base, FN_KEY) => None,
                             // LAlt / LWin: their own code; the plan keeps
                             // the Win/Mac swap (see plan_template).
-                            (Layer::Base, 0xE2 | 0xE3) => Some(u16::from(k)),
+                            (Layer::Base, k) if is_win_alt(k) => Some(u16::from(k)),
                             _ => crate::pages::remap::factory_code(model, layer, k),
                         };
                         if let Some(c) = code {

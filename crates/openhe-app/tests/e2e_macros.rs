@@ -243,3 +243,41 @@ fn the_recorder_says_its_delays_are_frame_steps() {
     assert!(w.has_text("per frame layar"), "{:?}", w.labels());
     w.click("● Berhenti");
 }
+
+/// Top-bar switch to profile `label` ("3"), waiting for the reconnect.
+fn switch_profile(w: &mut World, label: &str) {
+    let want: u8 = label.parse::<u8>().unwrap() - 1;
+    w.click(label);
+    w.until("profile switched", 20, |w| {
+        w.worker.snapshot().is_some_and(|s| s.profile == want) && !w.worker.is_restarting()
+    });
+    w.idle();
+}
+
+/// A bind finishing while another page is shown is only read by this page
+/// later; by then the keyboard may be on another profile (a per-app rule,
+/// the top bar), whose snapshot must not get the old profile's key
+/// settings.
+#[test]
+fn a_bind_read_after_a_profile_switch_is_not_patched_into_the_new_profile() {
+    let mut w = recorded();
+    pick_target(&mut w, G);
+    w.idle();
+    w.sim().set_delay = std::time::Duration::from_millis(20);
+    w.click("Pasang ke tombol");
+    assert!(w.worker.is_busy());
+    w.page("Performa");
+    w.sim().set_delay = std::time::Duration::ZERO;
+    w.idle();
+    assert_eq!(w.sim().profiles[0].mode(G) & 0x0F, 6, "bound on profile 1");
+    switch_profile(&mut w, "3");
+    w.page("Macro");
+    w.frames(5);
+    w.idle();
+    assert_eq!(w.sim().p().mode(G) & 0x0F, 0);
+    assert_eq!(
+        w.snapshot().keys[&G].mode.advanced,
+        openhe_proto::key::Advanced::None,
+        "stale patch"
+    );
+}

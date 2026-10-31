@@ -2,8 +2,9 @@
 //! ([`crate::storage::AppData::default_dir`]):
 //!
 //! - `templates/*.openhe-template`: the user's own templates;
-//! - `backups/backup-<unix ms>.json`: the key state read before each apply
-//!   (a profile file with a small header), newest [`KEEP_BACKUPS`] kept.
+//! - `backups/backup-<unix ms>.json` (`backup-<unix ms>-2.json`, … when
+//!   taken): the key state read before each apply (a profile file with a
+//!   small header); the newest [`KEEP_BACKUPS`] of each keyboard are kept.
 //!
 //! Nothing here is sent anywhere.
 
@@ -11,13 +12,14 @@ use super::{Template, TemplateFile, EXTENSION};
 use crate::pages::settings::profile_file::{KeyData, ProfileData, ProfileFile};
 use openhe_proto::Model;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TEMPLATES_DIR: &str = "templates";
 pub const BACKUPS_DIR: &str = "backups";
-/// Backups kept per data directory (older ones are deleted).
+/// Backups kept per keyboard (model and serial); older ones are deleted.
 pub const KEEP_BACKUPS: usize = 10;
 pub const BACKUP_FORMAT: &str = "openhe-backup";
 pub const BACKUP_VERSION: u32 = 1;
@@ -192,24 +194,42 @@ impl BackupFile {
 }
 
 /// Saves a backup in `base`/backups, then deletes all but the newest
-/// [`KEEP_BACKUPS`].
+/// [`KEEP_BACKUPS`] of the same keyboard. Other keyboards' backups and
+/// files that do not parse are left alone.
 pub fn save_backup(base: &Path, b: &BackupFile) -> io::Result<PathBuf> {
     let dir = base.join(BACKUPS_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = free_path(&dir, &format!("backup-{:013}", b.created_ms), "json");
     let json = serde_json::to_string_pretty(b).map_err(io::Error::other)?;
     write_atomic(&path, &json)?;
-    let mut all = backup_files(&dir);
-    if all.len() > KEEP_BACKUPS {
-        all.sort();
-        let extra = all.len() - KEEP_BACKUPS;
-        for old in all.into_iter().take(extra) {
-            if old != path {
-                let _ = std::fs::remove_file(old);
+    if let Some(new) = read_backup(&path) {
+        for old in list_backups(base, new.model, &new.serial)
+            .into_iter()
+            .skip(KEEP_BACKUPS)
+        {
+            if old.path != path {
+                let _ = std::fs::remove_file(old.path);
             }
         }
     }
     Ok(path)
+}
+
+/// The `-n` [`free_path`] added to a backup file name taken in the same
+/// millisecond (0 without one): later saves get higher numbers.
+fn collision_suffix(path: &Path) -> u32 {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix("backup-"))
+        .and_then(|s| s.split_once('-'))
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Newest first: by the time stored in the file, then by the collision
+/// suffix (`backup-<ms>-2.json` is newer than `backup-<ms>.json`).
+fn newest_first(a: &Backup, b: &Backup) -> Ordering {
+    (b.created_ms, collision_suffix(&b.path)).cmp(&(a.created_ms, collision_suffix(&a.path)))
 }
 
 fn backup_files(dir: &Path) -> Vec<PathBuf> {
@@ -240,7 +260,7 @@ pub fn list_backups(base: &Path, model: Model, serial: &str) -> Vec<Backup> {
         .filter_map(|p| read_backup(p))
         .filter(|b| b.model == model && b.serial == serial)
         .collect();
-    out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then(b.path.cmp(&a.path)));
+    out.sort_by(newest_first);
     out
 }
 
@@ -323,6 +343,47 @@ mod tests {
         assert_eq!(list[0].profile, 1);
         assert!(list_backups(&dir.0, snap.model, "other").is_empty());
         assert!(list_backups(&dir.0, Model::Win60HeMax, "A68").is_empty());
+    }
+
+    /// Ten are kept per keyboard: a second keyboard's backups never push
+    /// the first one's out. Backups saved in the same millisecond keep
+    /// their save order (`-2` is newer), not the file names' byte order.
+    #[test]
+    fn backups_are_pruned_per_keyboard_in_save_order() {
+        let dir = TempDir::new("prune");
+        let snap = snapshot68();
+        let keys = factory_keys(&snap);
+        let save = |serial: &str, reason: &str, ms: u64| {
+            let b = BackupFile::new(reason, 0, serial, snap.model, &keys, ms);
+            save_backup(&dir.0, &b).unwrap()
+        };
+        for i in 0..KEEP_BACKUPS as u64 {
+            save("A68", "a", 1_000 + i);
+        }
+        for i in 0..KEEP_BACKUPS as u64 + 3 {
+            save("B68", "b", 2_000 + i);
+        }
+        assert_eq!(list_backups(&dir.0, snap.model, "A68").len(), KEEP_BACKUPS);
+        let b = list_backups(&dir.0, snap.model, "B68");
+        assert_eq!(b.len(), KEEP_BACKUPS);
+        assert_eq!(b.last().unwrap().created_ms, 2_003, "B's oldest went");
+        // Three in one millisecond: backup-…, backup-…-2, backup-…-3.
+        let p1 = save("A68", "first", 5_000);
+        let p2 = save("A68", "second", 5_000);
+        let p3 = save("A68", "third", 5_000);
+        assert!(p2.to_string_lossy().ends_with("-2.json"), "{p2:?}");
+        let a = list_backups(&dir.0, snap.model, "A68");
+        let reasons: Vec<&str> = a.iter().take(3).map(|b| b.reason.as_str()).collect();
+        assert_eq!(reasons, ["third", "second", "first"]);
+        assert_eq!(a.len(), KEEP_BACKUPS);
+        assert!(p1.exists() && p2.exists() && p3.exists(), "the newest stay");
+        assert_eq!(a.last().unwrap().created_ms, 1_003);
+        // One more in that millisecond: the oldest A goes, not "first".
+        save("A68", "fourth", 5_000);
+        let a = list_backups(&dir.0, snap.model, "A68");
+        assert_eq!(a[0].reason, "fourth");
+        assert_eq!(a.last().unwrap().created_ms, 1_004);
+        assert!(p1.exists());
     }
 
     #[test]

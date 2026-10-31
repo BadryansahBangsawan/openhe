@@ -34,12 +34,20 @@ pub fn run() -> eframe::Result {
         // No usable lock file: run anyway rather than not at all.
         instance::Acquire::Unavailable(_) => None,
     };
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title(i18n::common::APP_NAME)
+        .with_app_id("dev.openhe.OpenHE")
+        .with_inner_size(size::START_WINDOW)
+        .with_min_inner_size(size::MIN_WINDOW);
+    // Without an icon of our own, eframe sets its default "e" icon at run
+    // time, which on macOS also replaces the bundle's openhe.icns in the Dock.
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!(
+        "../../../assets/icons/png/openhe-512.png"
+    )) {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title(i18n::common::APP_NAME)
-            .with_app_id("dev.openhe.OpenHE")
-            .with_inner_size(size::START_WINDOW)
-            .with_min_inner_size(size::MIN_WINDOW),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(

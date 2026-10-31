@@ -131,6 +131,13 @@ impl<T: Transport> Keyboard<T> {
     /// multi-entry SET cannot answer a read-back. Nothing is read back after a
     /// failed SET, and an empty `entries` does no I/O. A `(key, param)` that
     /// appears twice is `Error::InvalidInput`, returned before any I/O.
+    ///
+    /// Every packet is registered with `Session::expect_echoes` before it is
+    /// sent, so per-entry echoes of this write (key, layout and the value
+    /// written) are dropped wherever they arrive instead of coming back as
+    /// `KeyDataChanged` events (a full reload in the app). Other reports,
+    /// such as a profile (0x80) or lighting (0x98) report, or a KEY report
+    /// with another value, are still queued as events.
     pub fn set_key_params(&mut self, entries: &[(u8, KeyParam, u16)]) -> Result<(), Error> {
         let mut seen = std::collections::HashSet::new();
         for &(key, param, _) in entries {
@@ -145,12 +152,14 @@ impl<T: Transport> Keyboard<T> {
             return Ok(());
         }
         for req in key::set(entries) {
+            self.session.expect_echoes(&req);
             self.session.call(&req)?;
         }
         if entries.len() > 1 {
             // A multi-entry SET may echo every entry (open question 17,
             // unverified); a late echo is byte-identical to a read-back
-            // GET reply (7.x finding 11). Let them arrive and drain them.
+            // GET reply (7.x finding 11). Let them arrive and drain them;
+            // being our own echoes, they are dropped, not queued as events.
             self.session.settle(BATCH_SETTLE)?;
         }
         for &(key, param, want) in entries {
@@ -483,6 +492,67 @@ mod tests {
         for (frame, &(key, _, _)) in w[2..].iter().zip(&entries) {
             assert_eq!(payload(frame), [0x00, key, 0x04, 0x00, 0x00]);
         }
+    }
+
+    /// If a multi-entry KEY SET echoes every entry (open question 17),
+    /// the echoes drained by the settle are this write's own, not
+    /// keyboard events (`KeyDataChanged` reloads everything in the app).
+    /// Reports the keyboard pushes on its own still come through.
+    #[test]
+    fn per_entry_echoes_are_not_events_but_keyboard_reports_are() {
+        use crate::TimedTransport;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let entries = [
+            (0x0A, KeyParam::Actuation, 1500),
+            (0x0B, KeyParam::Actuation, 1500),
+        ];
+        let mut light = [0u8; 64];
+        light[0] = 0x5C;
+        light[2] = 0x98;
+        let mut t = TimedTransport::new();
+        t.on_write(vec![
+            (ms(0), key_reply(0x0A, 4, 1500)),  // the SET reply
+            (ms(10), key_reply(0x0B, 4, 1500)), // second entry's echo
+            (ms(15), order_reply(0x70, 2)),     // Fn+profile
+            (ms(20), light),                    // Fn+light
+            (ms(25), key_reply(0x0B, 4, 1700)), // not what was written
+        ]);
+        t.on_write(vec![(ms(0), key_reply(0x0A, 4, 1500))]);
+        t.on_write(vec![(ms(0), key_reply(0x0B, 4, 1500))]);
+        let mut k = Keyboard::new(t, Model::Win68HeMax);
+        assert_eq!(k.set_key_params(&entries), Ok(()));
+        let ev = k.take_events();
+        let cmds: Vec<u8> = ev.iter().map(|r| r.raw[2]).collect();
+        assert_eq!(cmds, vec![0x80, 0x98, 0xA3], "{ev:?}");
+        assert_eq!(ev[0].raw[5], 0x70);
+        assert_eq!(key::parse_value(&ev[2]), Some((0x0B, 4, 1700)));
+    }
+
+    /// Echoes of the first packet that arrive while the next packet of the
+    /// batch is awaited are not events either.
+    #[test]
+    fn echoes_arriving_during_the_next_packet_are_not_events() {
+        use crate::TimedTransport;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let entries: Vec<_> = (0..15u8)
+            .map(|i| (0x10 + i, KeyParam::Actuation, 1000 + u16::from(i)))
+            .collect();
+        let mut first = vec![(ms(0), key_reply(0x10, 4, 1000))];
+        for &(key, _, v) in &entries[1..14] {
+            first.push((ms(2), key_reply(key, 4, v))); // after the call returned
+        }
+        let mut t = TimedTransport::new();
+        t.on_write(first);
+        t.on_write(vec![(ms(10), key_reply(0x1E, 4, 1014))]); // packet 2
+        for &(key, _, v) in &entries {
+            t.on_write(vec![(ms(0), key_reply(key, 4, v))]); // read-backs
+        }
+        let mut k = Keyboard::new(t, Model::Win68HeMax);
+        assert_eq!(k.set_key_params(&entries), Ok(()));
+        assert!(k.take_events().is_empty());
+        assert_eq!(k.session_mut().transport().written().len(), 2 + 15);
     }
 
     /// Scan finding 5 (open question 17): if a multi-entry KEY SET echoes

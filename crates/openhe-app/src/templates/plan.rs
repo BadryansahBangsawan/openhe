@@ -18,20 +18,26 @@
 //! - a key with a macro keeps it (macro contents cannot be read back, so a
 //!   backup could not restore it);
 //! - touch mode Global cannot be written together with actuation or RT, so
-//!   a template asking for both writes the values first and Global after.
+//!   a template asking for both writes the values first and Global after;
+//! - a key that was not read is never written (it is not in the backup);
+//! - removing the last Fn2 (tahan) from the Fn1 layer is warned about, as
+//!   on the Remap page.
 //!
 //! A value beyond a key's switch travel skips that key (the preview says
 //! so); a value no key could take (actuation below 0.1 mm, RT below
 //! 0.005 mm, deadzone above 1 mm) refuses the template.
+//!
+//! [`TemplatePlan::footprint`] records what a plan writes, for "Urungkan".
 
 use super::{KeyPerf, Template, TemplateError, TRANSPARENT};
-use crate::pages::settings::profile_file::{check_advanced, ImportPlan, KeyData};
+use crate::pages::remap::{is_win_alt, is_win_alt_code, writes_lose_fn2, LOSES_FN2};
+use crate::pages::settings::profile_file::{
+    check_advanced, perf_problem, ImportPlan, KeyData, PerfProblem,
+};
 use crate::widgets::keyboard::legend_list;
 use crate::widgets::slider_mm::mm_short;
 use crate::worker::DeviceSnapshot;
-use openhe_device::keyboard::performance::{MAX_DEADZONE_UM, MIN_RT_UM};
 use openhe_device::{AdvancedConfig, KeySettings, PerformanceChange, FN_KEY};
-use openhe_proto::model::MIN_ACTUATION_UM;
 use openhe_proto::{Layer, Micrometers, SystemMode, TouchMode};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -87,6 +93,59 @@ pub struct TemplatePlan {
     pub functions: Vec<(u8, AdvancedConfig)>,
     pub skipped: Vec<(u8, Skip)>,
     pub notes: Vec<&'static str>,
+    /// The layer writes remove the last Fn2 (tahan) from the Fn1 layer.
+    pub loses_fn2: bool,
+}
+
+/// What a plan writes, value by value: each performance field (the value
+/// it gets), layer code and function it changes, including an old SOCD
+/// partner the device clears. "Urungkan" puts back exactly these from the
+/// backup ([`Template::limited_to`]) and compares them with the keyboard to
+/// see what was changed again since ([`Footprint::changed_since`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Footprint {
+    pub perf: BTreeMap<u8, KeyPerf>,
+    pub layers: Vec<(u8, Layer, u16)>,
+    pub functions: Vec<(u8, AdvancedConfig)>,
+}
+
+impl Footprint {
+    /// Keys of `current` (read now) that no longer hold what the plan
+    /// wrote: changed elsewhere since. Keys not read are not counted.
+    pub fn changed_since(&self, current: &[KeyData]) -> Vec<u8> {
+        let mut out = BTreeSet::new();
+        for k in current {
+            let s = &k.settings;
+            if let Some(p) = self.perf.get(&k.code) {
+                let differs =
+                    |w: Option<Micrometers>, now: Micrometers| w.is_some_and(|w| w != now);
+                if p.touch.is_some_and(|t| t != s.mode.touch)
+                    || differs(p.actuation, s.actuation)
+                    || differs(p.rt_press, s.rt_press)
+                    || differs(p.rt_release, s.rt_release)
+                    || differs(p.top_dz, s.top_dz)
+                    || differs(p.bottom_dz, s.bottom_dz)
+                {
+                    out.insert(k.code);
+                }
+            }
+            if self
+                .layers
+                .iter()
+                .any(|&(c, l, code)| c == k.code && k.layers[l as usize] != code)
+            {
+                out.insert(k.code);
+            }
+            if self
+                .functions
+                .iter()
+                .any(|&(c, cfg)| c == k.code && k.advanced != cfg)
+            {
+                out.insert(k.code);
+            }
+        }
+        out.into_iter().collect()
+    }
 }
 
 impl TemplatePlan {
@@ -118,30 +177,32 @@ impl TemplatePlan {
             self.skipped.push((key, why));
         }
     }
+
+    /// What the writes change (see [`Footprint`]). A key written twice
+    /// (values, then Global) gets both.
+    pub fn footprint(&self) -> Footprint {
+        let mut perf: BTreeMap<u8, KeyPerf> = BTreeMap::new();
+        for (keys, c) in &self.writes.performance {
+            for &k in keys {
+                let p = perf.entry(k).or_default();
+                p.touch = c.touch.or(p.touch);
+                p.actuation = c.actuation.or(p.actuation);
+                p.rt_press = c.rt_press.or(p.rt_press);
+                p.rt_release = c.rt_release.or(p.rt_release);
+                p.top_dz = c.top_dz.or(p.top_dz);
+                p.bottom_dz = c.bottom_dz.or(p.bottom_dz);
+            }
+        }
+        Footprint {
+            perf,
+            layers: self.writes.layers.clone(),
+            functions: self.functions.clone(),
+        }
+    }
 }
 
 fn bad(msg: String) -> TemplateError {
     TemplateError::BadValue(msg)
-}
-
-/// Values no key could take refuse the template.
-fn check_values(key: u8, p: &KeyPerf) -> Result<(), TemplateError> {
-    if let Some(a) = p.actuation {
-        if a.0 < MIN_ACTUATION_UM {
-            return Err(bad(format!("0x{key:02X}: actuation {} um", a.0)));
-        }
-    }
-    for v in [p.rt_press, p.rt_release].into_iter().flatten() {
-        if v.0 < MIN_RT_UM {
-            return Err(bad(format!("0x{key:02X}: RT {} um", v.0)));
-        }
-    }
-    for v in [p.top_dz, p.bottom_dz].into_iter().flatten() {
-        if v.0 > MAX_DEADZONE_UM {
-            return Err(bad(format!("0x{key:02X}: deadzone {} um", v.0)));
-        }
-    }
-    Ok(())
 }
 
 /// `want` where it differs from `now`.
@@ -214,16 +275,15 @@ pub fn plan_template(
     let mut first = Vec::new();
     let mut then = Vec::new();
     for &(key, p) in &tpl.performance {
-        check_values(key, &p)?;
+        // Values no key could take refuse the template.
+        if let Some(PerfProblem::Invalid(m)) = perf_problem(key, &p.change(), None) {
+            return Err(bad(m));
+        }
         if !present.contains(&key) {
             plan.skip(key, Skip::NotOnKeyboard);
             continue;
         }
-        let Some(cur) = now
-            .get(&key)
-            .map(|k| k.settings)
-            .or(snap.keys.get(&key).copied())
-        else {
+        let Some(cur) = now.get(&key).map(|k| k.settings) else {
             plan.skip(key, Skip::NotRead);
             continue;
         };
@@ -231,12 +291,7 @@ pub fn plan_template(
             plan.skip(key, Skip::NotRead);
             continue;
         };
-        let max = sw.max_travel;
-        if [p.actuation, p.rt_press, p.rt_release]
-            .into_iter()
-            .flatten()
-            .any(|v| v > max)
-        {
+        if perf_problem(key, &p.change(), Some(sw.max_travel)).is_some() {
             plan.skip(key, Skip::BeyondTravel);
             continue;
         }
@@ -270,9 +325,8 @@ pub fn plan_template(
             plan.skip(key, Skip::NotRead);
             continue;
         };
-        let win_alt = |c: u16| matches!(c, 0x00E2 | 0x00E3);
-        let code = if layer == Layer::Base && win_alt(u16::from(key)) && win_alt(code) {
-            if win_alt(cur) {
+        let code = if layer == Layer::Base && is_win_alt(key) && is_win_alt_code(code) {
+            if is_win_alt_code(cur) {
                 continue;
             }
             match snap.system_mode {
@@ -291,6 +345,11 @@ pub fn plan_template(
         }
     }
     plan.writes.layers = plan.layers.clone();
+    let fn1: BTreeMap<u8, u16> = current
+        .iter()
+        .map(|k| (k.code, k.layers[Layer::Fn1 as usize]))
+        .collect();
+    plan.loses_fn2 = writes_lose_fn2(&fn1, plan.layers.iter().copied());
 
     // ---- advanced functions
     let mut pairs_done: Vec<(u8, u8)> = Vec::new();
@@ -381,6 +440,8 @@ pub struct Summary {
     pub lines: Vec<String>,
     /// Keys left out, and the template's notes.
     pub notes: Vec<String>,
+    /// What the user must know before applying (shown in red).
+    pub warnings: Vec<String>,
 }
 
 fn mm_pair(a: Micrometers, b: Micrometers) -> String {
@@ -515,10 +576,15 @@ pub fn summary(plan: &TemplatePlan, total: usize) -> Summary {
         notes.push(t::SKIP_FN.to_string());
     }
     notes.extend(plan.notes.iter().map(|n| n.to_string()));
+    let mut warnings = Vec::new();
+    if plan.loses_fn2 {
+        warnings.push(LOSES_FN2.to_string());
+    }
     Summary {
         headline,
         lines,
         notes,
+        warnings,
     }
 }
 
