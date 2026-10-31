@@ -1,7 +1,7 @@
 //! Pengaturan (mockup `docs/design/mockups/07-pengaturan.png`): polling
 //! rate, Win/Mac, the four onboard profiles (switch, local names,
 //! import/export to JSON), per-app automatic profile switching, launch at
-//! login, device info and factory reset.
+//! login, updates ([`updates`]), device info and factory reset.
 //!
 //! Also home of the profile and Win/Mac switch jobs, which the top bar
 //! shares, and of the restart flow ([`Restart`], [`RestartRun`]) for writes
@@ -13,6 +13,7 @@
 
 pub mod os;
 pub mod profile_file;
+pub mod updates;
 
 use crate::app::{firmware_label, page_with_right_panel, AppCtx};
 use crate::i18n;
@@ -812,6 +813,11 @@ pub struct Page {
     reset_text: String,
     /// The custom colour editor, while open.
     custom: Option<CustomEditor>,
+    /// Update checks and installs (the "Pembaruan" card, the sidebar
+    /// notice); runs whichever page is shown.
+    updates: crate::update::Updater,
+    /// The browser could not be opened for a link (shows the address).
+    link_error: Option<String>,
 }
 
 impl Default for Page {
@@ -835,6 +841,8 @@ impl Default for Page {
             reset_open: false,
             reset_text: String::new(),
             custom: None,
+            updates: Default::default(),
+            link_error: None,
         }
     }
 }
@@ -867,6 +875,7 @@ impl Page {
             egui_ctx.request_repaint_after(Duration::from_millis(250));
         }
         self.poll_transfer(ctx);
+        self.pump_updates(ctx, egui_ctx);
 
         let saved_on = ctx.data.borrow().auto_profile_enabled;
         if self.restore_auto_due(saved_on) {
@@ -1082,6 +1091,8 @@ impl Page {
                                 page.keyboard_section(ctx, ui);
                                 ui.add_space(20.0);
                                 page.app_section(ctx, ui);
+                                ui.add_space(20.0);
+                                page.update_section(ctx, ui);
                             });
                     });
             },

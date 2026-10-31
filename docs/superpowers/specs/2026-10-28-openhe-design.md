@@ -39,7 +39,7 @@ Keputusan yang sudah diambil:
 - Timeout dan percobaan: 1000 ms per percobaan, maksimal 3 percobaan, hanya satu perintah berjalan pada satu waktu.
 - Konversi mm ke µm memakai pembulatan, bukan pemotongan (1.13 mm → 1130 µm).
 - **Dilarang** membangun atau mengirim perintah bootloader/firmware `0x08`–`0x0E`. Perintah ini juga tidak dimasukkan ke enum `Cmd`.
-- Tidak ada akses jaringan sama sekali.
+- Akses jaringan hanya untuk memeriksa dan mengunduh pembaruan aplikasi (pembaru di aplikasi, `crates/openhe-app/src/update/`, ke rilis GitHub repo OpenHE). Tidak ada akses jaringan lain dan tidak ada telemetri.
 - `#![forbid(unsafe_code)]` di semua crate. Lulus `cargo fmt --check` dan `cargo clippy --all-targets -- -D warnings`.
 - `openhe-proto` hanya bergantung pada `thiserror`.
 - Setiap tahap yang menulis ke keyboard harus diuji ke keyboard asli setelah pengguna setuju, dan nilai awal dipulihkan sesudahnya.

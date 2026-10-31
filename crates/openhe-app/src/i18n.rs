@@ -249,6 +249,87 @@ pub mod events {
     pub const AUTO_SWITCH_FAILED: &str = "Ganti profil otomatis gagal.";
 }
 
+/// Updates (Pengaturan → Pembaruan, and the sidebar notice).
+pub mod update {
+    pub const TITLE: &str = "Pembaruan";
+    pub const VERSION: &str = "Versi terpasang";
+    pub const CHECK_NOW: &str = "Periksa sekarang";
+    pub const CHECKING: &str = "Memeriksa pembaruan…";
+    pub const UP_TO_DATE: &str = "OpenHE sudah versi terbaru.";
+    pub const LAST_CHECK: &str = "Terakhir diperiksa";
+    pub const NEVER_CHECKED: &str = "Belum pernah diperiksa.";
+    pub const JUST_NOW: &str = "baru saja";
+    pub const MINUTES_AGO: &str = "menit lalu";
+    pub const HOURS_AGO: &str = "jam lalu";
+    pub const DAYS_AGO: &str = "hari lalu";
+    pub const AVAILABLE: &str = "Versi baru tersedia:";
+    pub const PRERELEASE: &str = "versi uji";
+    pub const NOTES: &str = "Catatan rilis";
+    pub const NO_NOTES: &str = "Tidak ada catatan rilis.";
+    pub const INSTALL: &str = "Unduh & pasang";
+    pub const DOWNLOADING: &str = "Mengunduh…";
+    pub const INSTALLING: &str = "Memeriksa dan memasang…";
+    /// After "✔ Versi 0.3.0".
+    pub const INSTALLED: &str = "sudah terpasang. Mulai ulang OpenHE untuk memakainya.";
+    pub const RESTART: &str = "Mulai ulang sekarang";
+    pub const RESTART_BUSY: &str = "Tunggu sampai perubahan ke keyboard selesai.";
+    pub const RESTART_FAILED: &str =
+        "OpenHE versi baru tidak bisa dijalankan. Tutup lalu buka lagi OpenHE.";
+    pub const AUTO: &str = "Periksa pembaruan otomatis";
+    pub const AUTO_HINT: &str = "Paling sering sekali sehari, saat OpenHE dibuka.";
+    pub const BETA: &str = "Ikut versi uji (beta)";
+    pub const BETA_HINT: &str = "Juga menawarkan versi pra-rilis yang mungkin belum stabil.";
+    pub const RELEASES_LINK: &str = "Halaman rilis di GitHub";
+    pub const DOWNLOAD_PAGE: &str = "Buka halaman unduhan";
+    pub const LINK_FAILED: &str = "Browser tidak bisa dibuka. Alamatnya:";
+    pub const NETWORK_NOTE: &str =
+        "Hanya pembaruan yang memakai internet: OpenHE menghubungi GitHub untuk memeriksa dan mengunduh versi baru. Tidak ada data lain yang dikirim.";
+
+    pub const UNSUPPORTED_BUNDLE: &str =
+        "Pemasangan otomatis hanya untuk OpenHE.app. Unduh versi baru dari halaman rilis.";
+    pub const UNSUPPORTED_TRANSLOCATED: &str =
+        "macOS menjalankan OpenHE dari lokasi sementara. Pindahkan OpenHE.app ke folder Aplikasi lalu buka lagi, atau unduh manual.";
+    pub const UNSUPPORTED_APPIMAGE: &str =
+        "Pemasangan otomatis hanya untuk versi AppImage. Unduh versi baru dari halaman rilis.";
+    pub const UNSUPPORTED_PLATFORM: &str =
+        "Pemasangan otomatis belum tersedia untuk sistem ini. Unduh versi baru dari halaman rilis.";
+    pub const NO_ASSET: &str =
+        "Rilis ini belum punya file untuk sistem ini. Unduh manual dari halaman rilis.";
+
+    pub const CHECK_FAILED: &str = "Gagal memeriksa pembaruan.";
+    pub const INSTALL_FAILED: &str = "Pembaruan gagal dipasang.";
+    pub const ERR_NETWORK: &str =
+        "Tidak bisa menghubungi GitHub. Periksa koneksi internet, lalu coba lagi.";
+    pub const ERR_RATE: &str = "GitHub sedang membatasi permintaan. Coba lagi nanti.";
+    /// Before the HTTP status number.
+    pub const ERR_HTTP: &str = "GitHub menjawab dengan kode galat";
+    pub const ERR_TOO_LARGE: &str =
+        "File dari GitHub lebih besar dari yang diumumkan, jadi unduhan dihentikan. Tidak ada yang diganti.";
+    pub const ERR_LIST: &str = "Daftar rilis dari GitHub tidak bisa dibaca.";
+    pub const ERR_SIGNATURE: &str = "Tanda tangan pembaruan tidak cocok, jadi pembaruan ditolak.";
+    pub const ERR_MANIFEST: &str = "Data pembaruan tidak valid, jadi pembaruan ditolak.";
+    pub const ERR_VERSION: &str =
+        "Versi di data pembaruan tidak cocok dengan rilisnya, jadi pembaruan ditolak.";
+    pub const ERR_CHECKSUM: &str =
+        "File unduhan tidak cocok (ukuran atau SHA-256). Tidak ada yang diganti.";
+    pub const ERR_DISK: &str = "File pembaruan tidak bisa disimpan. Tidak ada yang diganti.";
+    pub const ERR_NOT_WRITABLE: &str =
+        "Folder tempat OpenHE berada tidak bisa ditulis. Pindahkan OpenHE ke folder yang bisa kamu ubah (misalnya Aplikasi atau folder pribadi), atau unduh manual.";
+    pub const ERR_EXTRACT: &str = "Arsip pembaruan tidak bisa dibuka. Tidak ada yang diganti.";
+    pub const ERR_BUNDLE: &str =
+        "Isi arsip pembaruan bukan versi yang diumumkan. Tidak ada yang diganti.";
+    pub const ERR_REPLACE: &str = "OpenHE tidak bisa diganti; versi lama tetap dipakai.";
+    pub const ERR_ROLLBACK: &str =
+        "OpenHE tidak bisa diganti dan versi lama tidak bisa dikembalikan otomatis. Unduh ulang dari halaman rilis.";
+    pub const INTERNAL: &str = "Terjadi kesalahan internal di pembaru OpenHE.";
+
+    /// Sidebar notice: "Versi 0.3.0 tersedia".
+    pub const NOTICE_PREFIX: &str = "Versi";
+    pub const NOTICE_SUFFIX: &str = "tersedia";
+    pub const NOTICE_OPEN: &str = "Lihat";
+    pub const NOTICE_LATER: &str = "Nanti";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

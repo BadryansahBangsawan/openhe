@@ -10,6 +10,7 @@ pub mod skin;
 pub mod storage;
 pub mod templates;
 pub mod theme;
+pub mod update;
 pub mod widgets;
 pub mod worker;
 
@@ -18,8 +19,17 @@ use theme::size;
 /// Opens the main window. Blocks until it is closed. A second instance
 /// only says that OpenHE is already running and exits: two apps must never
 /// talk to the keyboard at the same time.
+///
+/// Started by an update ([`update::AFTER_UPDATE_ARG`]), it first waits up
+/// to [`instance::AFTER_UPDATE_WAIT`] for the old version to close.
 pub fn run() -> eframe::Result {
-    let _instance = match instance::acquire_default() {
+    let after_update = std::env::args_os().any(|a| a == update::AFTER_UPDATE_ARG);
+    let acquired = if after_update {
+        instance::acquire_default_waiting(instance::AFTER_UPDATE_WAIT)
+    } else {
+        instance::acquire_default()
+    };
+    let _instance = match acquired {
         instance::Acquire::AlreadyRunning => {
             rfd::MessageDialog::new()
                 .set_level(rfd::MessageLevel::Info)
@@ -34,6 +44,11 @@ pub fn run() -> eframe::Result {
         // No usable lock file: run anyway rather than not at all.
         instance::Acquire::Unavailable(_) => None,
     };
+    // What an earlier update left behind (the previous version, the
+    // staging folder), quietly and off the UI thread.
+    if let Ok(target) = update::install::current_target() {
+        std::thread::spawn(move || update::install::cleanup_leftovers(&target));
+    }
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title(i18n::common::APP_NAME)
         .with_app_id("dev.openhe.OpenHE")

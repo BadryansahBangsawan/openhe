@@ -11,8 +11,25 @@ permissions:
   contents: write
 
 jobs:
+  version:
+    name: Tag matches the app version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the tag with crates/openhe-app
+        # The app compares its own version (Cargo.toml) with the release
+        # tag, and the macOS bundle version comes from Cargo.toml too: a tag
+        # that differs would offer the update again after installing it.
+        run: |
+          crate="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' crates/openhe-app/Cargo.toml | head -n 1)"
+          if [ "v${crate}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match crates/openhe-app version ${crate}"
+            exit 1
+          fi
+
   macos:
     name: macOS app bundle
+    needs: version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +47,7 @@ jobs:
 
   linux:
     name: Linux AppImage
+    needs: version
     # Oldest supported Ubuntu runner: the AppImage then runs on newer distributions too.
     runs-on: ubuntu-22.04
     steps:
@@ -56,6 +74,7 @@ jobs:
 
   windows:
     name: Windows executable
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,18 +94,130 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish GitHub release
+    # Signs the update manifest and publishes the release with the gh CLI
+    # (softprops/action-gh-release failed twice with HTTP 500 on v0.1.0).
+    name: Sign update manifest and publish GitHub release
     needs: [macos, linux, windows]
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the tag object
+        # actions/checkout may leave an annotated tag as a lightweight one;
+        # the release notes come from its message.
+        run: git fetch --force --depth=1 origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-      - name: List files
-        run: ls -l artifacts
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/*
-          generate_release_notes: true
-          draft: true
+
+      - name: Write the update manifest
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          ls -l
+          tag="${GITHUB_REF_NAME}"
+          mac="OpenHE-${tag}-macos-arm64.zip"
+          win="OpenHE-${tag}-windows-x86_64.exe"
+          lin="OpenHE-${tag}-linux-x86_64.AppImage"
+          sha() { sha256sum "$1" | cut -d ' ' -f 1; }
+          size() { stat -c %s "$1"; }
+          jq -cn \
+            --arg version "${tag#v}" \
+            --arg mac "$mac" --arg mac_sha "$(sha "$mac")" --argjson mac_size "$(size "$mac")" \
+            --arg win "$win" --arg win_sha "$(sha "$win")" --argjson win_size "$(size "$win")" \
+            --arg lin "$lin" --arg lin_sha "$(sha "$lin")" --argjson lin_size "$(size "$lin")" \
+            '{version: $version, assets: {
+                "macos-aarch64": {name: $mac, sha256: $mac_sha, size: $mac_size},
+                "windows-x86_64": {name: $win, sha256: $win_sha, size: $win_size},
+                "linux-x86_64": {name: $lin, sha256: $lin_sha, size: $lin_size}}}' \
+            > openhe-update.json
+          cat openhe-update.json
+
+      - name: Sign the update manifest
+        env:
+          OPENHE_SIGNING_KEY: ${{ secrets.OPENHE_SIGNING_KEY }}
+          # The raw public key built into the app (PUBLIC_KEY in
+          # crates/openhe-app/src/update/mod.rs).
+          APP_PUBLIC_KEY: 5f637861814fb77dbbce835aed2901b3a2a8f1aee7f80736241b3199c0201294
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENHE_SIGNING_KEY}" ]; then
+            echo "::error::the OPENHE_SIGNING_KEY secret is not set"
+            exit 1
+          fi
+          # The key only ever lives in this temp folder (never echoed).
+          umask 077
+          keydir="$(mktemp -d)"
+          trap 'rm -rf "$keydir"' EXIT
+          printf '%s\n' "${OPENHE_SIGNING_KEY}" > "$keydir/key.pem"
+          openssl pkey -in "$keydir/key.pem" -pubout -out "$keydir/pub.pem"
+          # The last 32 bytes of an Ed25519 SubjectPublicKeyInfo are the raw key.
+          derived="$(openssl pkey -pubin -in "$keydir/pub.pem" -outform DER | tail -c 32 | od -An -v -tx1 | tr -d ' \n')"
+          if [ "$derived" != "${APP_PUBLIC_KEY}" ]; then
+            echo "::error::OPENHE_SIGNING_KEY does not belong to the public key built into the app"
+            exit 1
+          fi
+          openssl pkeyutl -sign -inkey "$keydir/key.pem" -rawin \
+            -in artifacts/openhe-update.json -out "$keydir/sig.bin"
+          # Verify right away, so a bad secret or signature fails the release.
+          openssl pkeyutl -verify -pubin -inkey "$keydir/pub.pem" -rawin \
+            -in artifacts/openhe-update.json -sigfile "$keydir/sig.bin"
+          if [ "$(stat -c %s "$keydir/sig.bin")" -ne 64 ]; then
+            echo "::error::the signature is not 64 bytes"
+            exit 1
+          fi
+          od -An -v -tx1 "$keydir/sig.bin" | tr -d ' \n' > artifacts/openhe-update.json.sig
+          echo >> artifacts/openhe-update.json.sig
+          if ! grep -Eqx '[0-9a-f]{128}' artifacts/openhe-update.json.sig; then
+            echo "::error::the hex signature is malformed"
+            exit 1
+          fi
+          cat artifacts/openhe-update.json.sig
+
+      - name: Release notes
+        # The annotated tag's message, else a short default (no generated notes).
+        run: |
+          set -euo pipefail
+          : > notes.md
+          if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" = "tag" ]; then
+            git tag -l --format='%(contents:subject)' "${GITHUB_REF_NAME}" >> notes.md
+            body="$(git tag -l --format='%(contents:body)' "${GITHUB_REF_NAME}")"
+            if [ -n "$body" ]; then
+              printf '\n%s\n' "$body" >> notes.md
+            fi
+          fi
+          if [ -z "$(tr -d '[:space:]' < notes.md)" ]; then
+            printf 'OpenHE %s.\n\nUnduh file untuk sistem Anda di bawah. Download the file for your system below.\n' \
+              "${GITHUB_REF_NAME}" > notes.md
+          fi
+          cat notes.md
+
+      - name: Publish the release
+        # gh uploads every file into a draft and only then publishes it, so
+        # the app never sees a release with its manifest but without the
+        # files. Tags with a "-" (v0.3.0-beta.1) are pre-releases.
+        # (A draft can't be found again by its tag: GitHub may rename it
+        # "untagged-...", which is why this doesn't make its own draft.)
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          flags=()
+          case "$tag" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          files=(artifacts/OpenHE-* artifacts/openhe-update.json artifacts/openhe-update.json.sig)
+          ls -l "${files[@]}"
+          for attempt in 1 2 3; do
+            if gh release create "$tag" --repo "${GITHUB_REPOSITORY}" --verify-tag \
+              --title "OpenHE ${tag}" --notes-file notes.md "${flags[@]}" "${files[@]}"; then
+              exit 0
+            fi
+            echo "::warning::gh release create failed (attempt $attempt)"
+            sleep 20
+          done
+          echo "::error::could not publish the release; check for a leftover draft"
+          exit 1

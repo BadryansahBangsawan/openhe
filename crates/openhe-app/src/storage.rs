@@ -130,6 +130,33 @@ impl SavedMacro {
     }
 }
 
+/// Update settings. Missing fields load as their defaults (automatic checks
+/// on, pre-releases off), so older data files keep working.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatePrefs {
+    /// Check GitHub for a newer release when the app opens (at most once a
+    /// day).
+    pub auto_check: bool,
+    /// Also offer pre-releases ("Ikut versi uji").
+    pub beta: bool,
+    /// When the last check succeeded (Unix seconds).
+    pub last_check: Option<u64>,
+    /// The version whose sidebar notice was dismissed ("Nanti").
+    pub dismissed: Option<String>,
+}
+
+impl Default for UpdatePrefs {
+    fn default() -> Self {
+        UpdatePrefs {
+            auto_check: true,
+            beta: false,
+            last_check: None,
+            dismissed: None,
+        }
+    }
+}
+
 /// Everything the app keeps locally. Missing fields load as defaults, so
 /// older files keep working when fields are added.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +184,9 @@ pub struct AppData {
     /// colours show while it is unplugged.
     #[serde(default)]
     pub last_keyboard: Option<String>,
+    /// Update checks (Pengaturan → Pembaruan).
+    #[serde(default)]
+    pub update: UpdatePrefs,
     /// Set when the data file existed but could not be read or moved aside
     /// at load. [`AppData::save`] then refuses to write, so that file is
     /// never replaced by defaults. Not stored in the file; only this crate
@@ -498,6 +528,37 @@ mod tests {
         let d = AppData {
             auto_profile_enabled: true,
             last_calibrated: Some(1_793_000_000),
+            ..sample()
+        };
+        d.save_to(&dir.0).unwrap();
+        assert_eq!(AppData::load_from(&dir.0).unwrap(), d);
+    }
+
+    #[test]
+    fn update_settings_default_on_and_round_trip() {
+        let dir = TempDir::new("update-prefs");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        // A file from before updates: automatic checks on, no beta.
+        std::fs::write(dir.0.join(FILE_NAME), br#"{"launch_at_login":true}"#).unwrap();
+        let d = AppData::load_from(&dir.0).unwrap();
+        assert_eq!(d.update, UpdatePrefs::default());
+        assert!(d.update.auto_check && !d.update.beta);
+        assert_eq!(AppData::default().update, UpdatePrefs::default());
+        // Half a block (a later version may add fields).
+        std::fs::write(
+            dir.0.join(FILE_NAME),
+            br#"{"update":{"beta":true,"future":1}}"#,
+        )
+        .unwrap();
+        let d = AppData::load_from(&dir.0).unwrap();
+        assert!(d.update.auto_check && d.update.beta);
+        let d = AppData {
+            update: UpdatePrefs {
+                auto_check: false,
+                beta: true,
+                last_check: Some(1_793_000_000),
+                dismissed: Some("0.3.0".into()),
+            },
             ..sample()
         };
         d.save_to(&dir.0).unwrap();

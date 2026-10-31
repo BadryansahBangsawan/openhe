@@ -259,7 +259,21 @@ impl OpenHeApp {
         let (data, notice) = AppData::load();
         let mut app = Self::with_worker(worker, data);
         app.data_notice = notice;
+        // The real updater (GitHub); `with_worker` alone has none, so tests
+        // never reach the network.
+        app.set_update_env(crate::update::UpdateEnv::system());
         app
+    }
+
+    /// Sets where updates come from and what they replace (tests inject a
+    /// fake source and a temporary file).
+    pub fn set_update_env(&mut self, env: crate::update::UpdateEnv) {
+        self.settings.set_update_env(env);
+    }
+
+    /// The updater (tests read its state).
+    pub fn updater(&self) -> &crate::update::Updater {
+        self.settings.updater()
     }
 
     /// Builds the app around an existing worker (tests use one whose
@@ -510,7 +524,14 @@ impl OpenHeApp {
             )
             .show(ctx, |ui| {
                 let mut page = self.page;
-                sidebar(ui, &mut page, &status, loading);
+                let dismissed = self.data.borrow().update.dismissed.clone();
+                let notice = self.settings.update_notice(dismissed.as_deref());
+                let later = sidebar(ui, &mut page, &status, loading, notice.as_deref());
+                if let (true, Some(v)) = (later, notice) {
+                    self.data.borrow_mut().update.dismissed = Some(v);
+                    // Only a convenience: a failed save is not worth a notice.
+                    let _ = self.data.borrow().save();
+                }
                 page
             });
         let next_page = side.inner;
@@ -815,7 +836,15 @@ fn notice_bar(ui: &mut Ui, text: &str, button: &str, enabled: bool) -> bool {
 
 // ------------------------------------------------------------------ sidebar
 
-fn sidebar(ui: &mut Ui, page: &mut PageId, status: &ConnectionStatus, loading: bool) {
+/// The sidebar; `update` is the version of a found update whose notice
+/// shows above the device card. True when that notice was dismissed.
+fn sidebar(
+    ui: &mut Ui,
+    page: &mut PageId,
+    status: &ConnectionStatus,
+    loading: bool,
+    update: Option<&str>,
+) -> bool {
     ui.horizontal(|ui| {
         ui.add_space(4.0);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), Sense::hover());
@@ -838,7 +867,52 @@ fn sidebar(ui: &mut Ui, page: &mut PageId, status: &ConnectionStatus, loading: b
     egui::TopBottomPanel::bottom("device-card")
         .show_separator_line(false)
         .frame(Frame::new())
-        .show_inside(ui, |ui| device_card(ui, status, loading));
+        .show_inside(ui, |ui| {
+            let mut later = false;
+            if let Some(v) = update {
+                let (open, l) = update_notice(ui, v);
+                if open {
+                    *page = PageId::Settings;
+                }
+                later = l;
+            }
+            device_card(ui, status, loading);
+            later
+        })
+        .inner
+}
+
+/// "Versi 0.3.0 tersedia" with "Lihat" (opens Pengaturan) and "Nanti"
+/// (hides it for this version). Returns (open, later).
+fn update_notice(ui: &mut Ui, version: &str) -> (bool, bool) {
+    use i18n::update as t;
+    let mut clicks = (false, false);
+    Card::new()
+        .fill(color::ACCENT_SOFT)
+        .stroke(color::ACCENT.gamma_multiply(0.5))
+        .padding(12)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "{} {version} {}",
+                        t::NOTICE_PREFIX,
+                        t::NOTICE_SUFFIX
+                    ))
+                    .color(color::ACCENT)
+                    .strong(),
+                )
+                .wrap(),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                clicks.0 = ui.button(t::NOTICE_OPEN).clicked();
+                clicks.1 = ui.button(t::NOTICE_LATER).clicked();
+            });
+        });
+    ui.add_space(10.0);
+    clicks
 }
 
 fn nav_item(ui: &mut Ui, text: &str, active: bool) -> egui::Response {

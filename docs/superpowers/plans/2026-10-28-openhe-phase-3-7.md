@@ -30,7 +30,7 @@
   - `[0x00]+64` byte writes, the documented checksum, and the reply matching rules (Rulings 12/13).
   - Rounding mm→µm.
   - No 0x08–0x0E commands, ever.
-  - No network access.
+  - No network access. (Since v0.2.0: except checking for and downloading updates; see the design spec.)
   - `#![forbid(unsafe_code)]` in our crates.
   - fmt + clippy `-D warnings` clean, pristine test output.
 - **Never run a binary that opens the HID device, and never write to the user's keyboard.** The keyboard is attached. All hardware testing is done by the controller with the user's permission. Tests use `MockTransport`.

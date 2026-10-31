@@ -240,10 +240,11 @@ fn launch_at_login_shows_the_os_state_not_the_saved_flag() {
     data.launch_at_login = true;
     let mut w = World::with(Sim::new(), data, fast_config());
     w.page("Pengaturan");
-    // Checkboxes: per-app switching, then launch at login.
+    // Checkboxes: per-app switching, then launch at login (then the two
+    // of Pembaruan).
     assert_eq!(
         w.role_count(eframe::egui::accesskit::Role::CheckBox),
-        2,
+        4,
         "{:?}",
         w.labels()
     );
