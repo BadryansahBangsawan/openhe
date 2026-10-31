@@ -31,6 +31,14 @@ pub enum Error {
     Busy(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// A supported keyboard is connected (its keyboard or consumer
+    /// interfaces are listed) but its configuration interface (usage page
+    /// 0xFFA0, usage 1) is not: usually a keyboard still enumerating, or
+    /// one that needs reconnecting. Holds the model names.
+    #[error(
+        "{0} found, but not its configuration interface (usage page 0xFFA0, usage 1); reconnect the keyboard"
+    )]
+    NoConfigInterface(String),
     #[error("protocol error: {0}")]
     Frame(FrameError),
     #[error("I/O error: {0}")]

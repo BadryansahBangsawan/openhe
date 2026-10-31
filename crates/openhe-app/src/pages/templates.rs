@@ -119,6 +119,9 @@ mod strings {
     pub const PROFILE: &str = "Profil";
     pub const RESTORE: &str = "Pulihkan";
     pub const BACKUP_GONE: &str = "Cadangan ini tidak bisa dibaca lagi.";
+    pub const NOT_READY: &str = "Keyboard belum siap";
+    pub const NOT_READY_BODY: &str =
+        "Keyboard sedang dimuat ulang atau tersambung ulang. Tunggu sampai tersambung, lalu coba lagi.";
     pub const OTHER_PROFILE: &str = "Cadangan dari profil lain";
     pub const OTHER_PROFILE_BODY: &str = "Cadangan ini dibaca dari";
     pub const OTHER_PROFILE_NOW: &str = "sedangkan yang aktif";
@@ -340,7 +343,10 @@ impl Page {
 
     /// Starts a preview of `tpl`.
     fn start(&mut self, ctx: &AppCtx, tpl: Template, source: Source) {
-        let Some(on) = Stamp::now(ctx) else { return };
+        let Some(on) = Stamp::now(ctx) else {
+            self.not_ready();
+            return;
+        };
         self.dropped = false;
         self.lib_note = None;
         self.flow = Flow::Reading {
@@ -396,12 +402,25 @@ impl Page {
         self.import_path(ctx, &path);
     }
 
+    /// No snapshot (the keyboard is reloading or reconnecting): nothing to
+    /// plan against yet. Says so rather than doing nothing.
+    fn not_ready(&mut self) {
+        self.flow = Flow::Failed {
+            title: t::NOT_READY,
+            detail: t::NOT_READY_BODY.to_string(),
+            tech: None,
+        };
+    }
+
     /// Previews the backup at `path`: all of it ("Pulihkan"), or with
     /// `undo` only what that apply wrote ("Urungkan"). A backup read from
     /// another onboard profile is refused: switching profiles re-enumerates
     /// the keyboard, so that is left to the user.
     fn restore_backup(&mut self, ctx: &AppCtx, path: &Path, undo: Option<Box<Undo>>) {
-        let Some(snap) = ctx.snapshot else { return };
+        let Some(snap) = ctx.snapshot else {
+            self.not_ready();
+            return;
+        };
         match store::read_backup(path) {
             Some(b) if b.profile != snap.profile => {
                 self.flow = Flow::Failed {
@@ -1307,7 +1326,7 @@ impl Page {
                 }
                 if undo.is_some() {
                     ui.add_space(10.0);
-                    if ui.add_enabled(can, secondary(t::UNDO)).clicked() {
+                    if not_ready_hint(ui.add_enabled(can, secondary(t::UNDO)), ctx).clicked() {
                         action = Some(RightAction::Undo);
                     }
                 }
@@ -1386,7 +1405,8 @@ impl Page {
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add_enabled(can, egui::Button::new(t::RESTORE)).clicked() {
+                            let btn = ui.add_enabled(can, egui::Button::new(t::RESTORE));
+                            if not_ready_hint(btn, ctx).clicked() {
                                 restore = Some(b.path.clone());
                             }
                         });
@@ -1396,6 +1416,15 @@ impl Page {
         if let Some(p) = restore {
             self.restore_backup(ctx, &p, None);
         }
+    }
+}
+
+/// A button that is off because there is no snapshot yet says why on hover.
+fn not_ready_hint(resp: egui::Response, ctx: &AppCtx) -> egui::Response {
+    if ctx.snapshot.is_none() {
+        resp.on_disabled_hover_text(t::NOT_READY_BODY)
+    } else {
+        resp
     }
 }
 

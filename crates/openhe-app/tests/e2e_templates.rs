@@ -7,6 +7,7 @@
 
 mod support;
 use openhe_app::templates::{store, Builtin, TemplateFile};
+use support::sim::Reject;
 use support::*;
 
 const W: u8 = 0x1A;
@@ -353,4 +354,103 @@ fn settings_saved_as_a_template_are_listed_and_apply_back() {
     run_until(&mut w, "Terapkan", DONE);
     assert_eq!(w.sim().p().key(CAPS, 0), 0x00E0);
     assert_eq!(w.sim().p().key(W, 4), 900, "performance was not in it");
+}
+
+/// "Urungkan" puts back only what the template wrote: a key changed
+/// elsewhere since is named in its preview (and put back), a key the
+/// template did not touch keeps its later change.
+#[test]
+fn urungkan_names_later_changes_and_leaves_other_keys_alone() {
+    let sim = Sim::new();
+    let w_before = sim.state().p().key(W, 4);
+    let mut w = templates(sim);
+    preview(&mut w, "Gaming FPS");
+    run_until(&mut w, "Terapkan", DONE);
+    // Changed on another page (or by another program) since.
+    {
+        let mut s = w.sim();
+        let p = s.p_mut();
+        p.keys.insert((W, 4), 900);
+        p.keys.insert((Q, 4), 900);
+    }
+    w.click("Urungkan");
+    w.until("the undo preview", 20, |w| {
+        w.app().templates().preview_keys().is_some()
+    });
+    assert!(
+        w.has_text("Sejak template diterapkan, tombol ini diubah lagi: W."),
+        "{:?}",
+        w.labels()
+    );
+    assert!(w.has_text("Hanya yang diubah template tadi yang dikembalikan"));
+    run_until(&mut w, "Terapkan", DONE);
+    assert_eq!(w.sim().p().key(W, 4), w_before);
+    assert_eq!(w.sim().p().key(Q, 4), 900, "not the template's: kept");
+    assert_eq!(nibble(&w, A), 0);
+}
+
+/// A backup is applied only on the profile it was read from.
+#[test]
+fn a_backup_of_another_profile_is_refused() {
+    let mut w = templates(Sim::new());
+    preview(&mut w, "Caps jadi Ctrl");
+    run_until(&mut w, "Terapkan", DONE);
+    let c = w.worker.connects();
+    w.click("2");
+    w.until("reconnected on profile 2", 30, |w| {
+        w.worker.connects() > c
+            && !w.worker.is_restarting()
+            && w.worker.snapshot().map(|s| s.profile) == Some(1)
+    });
+    w.idle();
+    let on_2 = w.sim().profiles[1].keys.clone();
+    let sets = w.sim().sets(0x23).len();
+    w.click("Pulihkan");
+    w.frames(3);
+    assert!(w.has_text("Cadangan dari profil lain"), "{:?}", w.labels());
+    assert!(
+        w.has_text("Cadangan ini dibaca dari Profil 1, sedangkan yang aktif Profil 2."),
+        "{:?}",
+        w.labels()
+    );
+    assert!(w.app().templates().preview_keys().is_none());
+    w.idle();
+    assert_eq!(w.sim().profiles[1].keys, on_2, "nothing written");
+    assert_eq!(w.sim().sets(0x23).len(), sets);
+}
+
+/// A key that cannot be read does not stop a preview, an apply or "Simpan
+/// setting sekarang": it is left out and named.
+#[test]
+fn an_unreadable_key_is_left_out_and_named() {
+    let mut w = templates(Sim::new());
+    // Every read of Q is refused from now on.
+    w.sim().rejects.push(Reject {
+        cmd: 0x23,
+        sets_only: false,
+        at: vec![(0, 0x00), (1, Q)],
+        times: u32::MAX,
+    });
+    preview(&mut w, "Kompetitif (semua RT)");
+    assert!(
+        w.has_text("Dilewati, belum terbaca dari keyboard: Q"),
+        "{:?}",
+        w.labels()
+    );
+    let (_, skipped) = w.app().templates().preview_keys().unwrap();
+    assert_eq!(skipped, vec![Q]);
+    run_until(&mut w, "Terapkan", DONE);
+    assert_eq!(w.sim().p().key(W, 4), 600);
+    assert_eq!(w.sim().p().key(Q, 4), 2000, "never written");
+    assert_eq!(touch(&w, Q), 0);
+
+    w.click("Simpan setting sekarang…");
+    w.type_in_last_field("Tanpa Q");
+    w.click("Simpan");
+    w.until("saved", 20, |w| w.has_text("Template disimpan."));
+    assert!(
+        w.has_text("Tidak terbaca, jadi tidak ikut disimpan: Q."),
+        "{:?}",
+        w.labels()
+    );
 }

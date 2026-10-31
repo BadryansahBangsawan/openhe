@@ -280,4 +280,11 @@ fn a_bind_read_after_a_profile_switch_is_not_patched_into_the_new_profile() {
         openhe_proto::key::Advanced::None,
         "stale patch"
     );
+    // The bind did work, on profile 1: that is said, not "Terpasang".
+    assert!(
+        w.has_text("Macro terpasang di tombol G di Profil 1."),
+        "{:?}",
+        w.labels()
+    );
+    assert!(!w.has_text("Macro terpasang di keyboard"));
 }

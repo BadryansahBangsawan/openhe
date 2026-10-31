@@ -1029,8 +1029,14 @@ pub fn poll_events<T: Transport>(kb: &mut Keyboard<T>) -> Result<Vec<DeviceEvent
     kb.poll_events()
 }
 
-fn connect_error_status(e: &Error) -> ConnectionStatus {
+/// The status after a connect that failed with `e`; `again`: the attempt
+/// before failed the same way. A keyboard that is still enumerating (just
+/// plugged in, or after a profile switch) can list its other interfaces a
+/// moment before the configuration one, so a missing configuration
+/// interface is only reported once it is seen twice in a row.
+fn connect_error_status(e: &Error, again: bool) -> ConnectionStatus {
     match e {
+        Error::NoConfigInterface(_) if !again => ConnectionStatus::Searching,
         Error::Unsupported(_) | Error::Disconnected => ConnectionStatus::Searching,
         other => ConnectionStatus::Error(i18n::device_error(other)),
     }
@@ -1153,6 +1159,8 @@ fn run<T: Transport>(
     let mut connect_at = Instant::now();
     // Id of the open connection (see `Control::link`).
     let mut link = 0u64;
+    // The last connect failed for a missing configuration interface.
+    let mut no_iface_before = false;
     loop {
         if ctl.stop.load(Ordering::SeqCst) {
             shutdown(&ctl, kb.as_mut(), &mut connect, &cfg);
@@ -1167,6 +1175,7 @@ fn run<T: Transport>(
             if Instant::now() >= connect_at {
                 match guarded(&mut connect).0 {
                     Ok(mut k) => {
+                        no_iface_before = false;
                         ctl.set_current(Some(LOAD_LABEL));
                         // The guard's stop goes out right after the
                         // handshake, so a keyboard in bootloader mode is
@@ -1205,7 +1214,11 @@ fn run<T: Transport>(
                             Err(e) => ctl.set_status(load_error_status(&e)),
                         }
                     }
-                    Err(e) => ctl.set_status(connect_error_status(&e)),
+                    Err(e) => {
+                        let missing = matches!(e, Error::NoConfigInterface(_));
+                        ctl.set_status(connect_error_status(&e, missing && no_iface_before));
+                        no_iface_before = missing;
+                    }
                 }
                 connect_at = Instant::now() + cfg.retry_interval;
             }
@@ -1415,6 +1428,24 @@ pub(crate) mod tests {
             raw[4 + at..4 + at + bytes.len()].copy_from_slice(bytes);
         }
         raw
+    }
+
+    /// A keyboard without its configuration interface is reported only
+    /// when two connects in a row find it so (it may still be
+    /// enumerating); "no keyboard" stays "searching".
+    #[test]
+    fn a_missing_configuration_interface_is_shown_once_it_repeats() {
+        let e = Error::NoConfigInterface("WIN 68 HE MAX".into());
+        assert_eq!(connect_error_status(&e, false), ConnectionStatus::Searching);
+        match connect_error_status(&e, true) {
+            ConnectionStatus::Error(m) => assert!(m.contains("colokkan lagi"), "{m}"),
+            s => panic!("{s:?}"),
+        }
+        let none = Error::Unsupported("no supported keyboard was found".into());
+        assert_eq!(
+            connect_error_status(&none, true),
+            ConnectionStatus::Searching
+        );
     }
 
     pub(crate) fn order_reply(ty: u8, v: u8) -> [u8; 64] {

@@ -902,4 +902,44 @@ pub(crate) mod tests {
         let back = parse(&TemplateFile::from_template(&tpl).to_json()).unwrap();
         assert_eq!(back, tpl);
     }
+
+    /// A key in touch mode Global does not use its own actuation and RT.
+    /// Values its switch could take are kept (a restore puts them back
+    /// exactly); a leftover out of range is left out, as the profile
+    /// import does, so it neither skips the key nor refuses the backup.
+    #[test]
+    fn global_keys_keep_only_travel_values_their_switch_takes() {
+        let snap = snapshot68();
+        let mut keys = factory_keys(&snap);
+        let set = |keys: &mut Vec<KeyData>, code: u8, act: u16, rt: u16| {
+            let k = keys.iter_mut().find(|k| k.code == code).unwrap();
+            k.settings.mode.touch = TouchMode::Global;
+            k.settings.actuation = Micrometers(act);
+            k.settings.rt_press = Micrometers(rt);
+        };
+        set(&mut keys, 0x14, 1500, 100); // fine
+        set(&mut keys, 0x1A, 9000, 100); // beyond any switch
+        set(&mut keys, 0x04, 1500, 0); // RT below 0.005 mm
+        let tpl = Template::from_current("b", snap.model, &keys, Parts::ALL);
+        let perf = |code: u8| tpl.performance.iter().find(|(k, _)| *k == code).unwrap().1;
+        assert_eq!(perf(0x14).actuation, Some(Micrometers(1500)));
+        assert_eq!(perf(0x14).rt_press, Some(Micrometers(100)));
+        for code in [0x1A, 0x04] {
+            let p = perf(code);
+            assert_eq!(p.touch, Some(TouchMode::Global));
+            assert_eq!((p.actuation, p.rt_press, p.rt_release), (None, None, None));
+            assert!(
+                p.top_dz.is_some() && p.bottom_dz.is_some(),
+                "deadzones stay"
+            );
+        }
+        // The backup plans on a keyboard where those keys changed since.
+        let mut now = factory_keys(&snap);
+        for k in now.iter_mut().filter(|k| matches!(k.code, 0x1A | 0x04)) {
+            k.settings.mode.touch = TouchMode::RapidTrigger;
+        }
+        let p = plan::plan_template(&tpl, &snap, &now).unwrap();
+        assert!(p.skipped.is_empty() || p.skipped.iter().all(|(k, _)| *k == FN_KEY));
+        assert!(p.changed_keys().contains(&0x1A) && p.changed_keys().contains(&0x04));
+    }
 }

@@ -55,7 +55,7 @@ fn plan_open(ifaces: &[Iface]) -> OpenPlan {
                 if !plan.models.contains(&model) {
                     plan.models.push(model);
                 }
-                if classify(f.vid, f.pid, f.usage_page, &f.product).is_some() && f.usage == USAGE {
+                if f.usage_page == USAGE_PAGE && f.usage == USAGE {
                     plan.candidates.push((i, model));
                 }
             }
@@ -87,8 +87,8 @@ fn failure_rank(e: &Error) -> u8 {
 /// The error of an `open_first` that opened nothing: the most telling
 /// failure of the candidates tried (`failure_rank`, the first one on a
 /// tie); else, with a supported keyboard present but no configuration
-/// interface, says so; else "no supported keyboard was found", naming the
-/// vendor's unsupported devices.
+/// interface, `Error::NoConfigInterface` naming it; else "no supported
+/// keyboard was found", naming the vendor's unsupported devices.
 fn not_opened(plan: &OpenPlan, failures: Vec<Error>) -> Error {
     if let Some(e) = failures
         .into_iter()
@@ -98,11 +98,7 @@ fn not_opened(plan: &OpenPlan, failures: Vec<Error>) -> Error {
     }
     if !plan.models.is_empty() {
         let names: Vec<&str> = plan.models.iter().map(|m| m.name()).collect();
-        return Error::Unsupported(format!(
-            "{} found, but not its configuration interface \
-             (usage page 0x{USAGE_PAGE:04X}, usage {USAGE}); reconnect the keyboard",
-            names.join(", ")
-        ));
+        return Error::NoConfigInterface(names.join(", "));
     }
     let mut msg = String::from("no supported keyboard was found");
     if !plan.unsupported.is_empty() {
@@ -320,16 +316,14 @@ mod tests {
     fn a_keyboard_without_its_configuration_interface_is_named() {
         let plan = plan_open(&win68_other_ifaces());
         assert!(plan.candidates.is_empty());
-        match not_opened(&plan, Vec::new()) {
-            Error::Unsupported(m) => {
-                assert!(
-                    m.starts_with("WIN 68 HE MAX found, but not its configuration interface"),
-                    "{m}"
-                );
-                assert!(!m.contains("unsupported devices seen"), "{m}");
-            }
-            e => panic!("expected Unsupported, got {e:?}"),
-        }
+        let e = not_opened(&plan, Vec::new());
+        assert_eq!(e, Error::NoConfigInterface("WIN 68 HE MAX".into()));
+        let m = e.to_string();
+        assert!(
+            m.starts_with("WIN 68 HE MAX found, but not its configuration interface"),
+            "{m}"
+        );
+        assert!(m.ends_with("reconnect the keyboard"), "{m}");
     }
 
     #[test]

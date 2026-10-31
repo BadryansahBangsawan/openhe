@@ -1958,6 +1958,17 @@ mod tests {
         Keyboard::new(m, Model::Win68HeMax)
     }
 
+    /// The user's own profile name can hold `/`, `:` and the like, which
+    /// would break the save dialog: the suggested name is a slug.
+    #[test]
+    fn the_export_file_name_is_safe_for_any_profile_name() {
+        assert_eq!(export_file_name("1 · Kerja"), "openhe-profil-1-kerja.json");
+        assert_eq!(
+            export_file_name("2 · CS2/Valorant: rank"),
+            "openhe-profil-2-cs2-valorant-rank.json"
+        );
+    }
+
     /// A profile switch re-enumerates the keyboard (PROTOCOL 7.x finding
     /// 23): one write, no read-back on the dying connection.
     #[test]

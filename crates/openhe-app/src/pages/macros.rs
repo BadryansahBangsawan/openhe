@@ -136,6 +136,10 @@ mod strings {
     pub const BINDING: &str = "Memasang…";
     pub const BOUND: &str = "Macro terpasang di keyboard";
     pub const BIND_FAILED: &str = "Gagal memasang macro";
+    pub const BOUND_ON: &str = "Macro terpasang di tombol";
+    pub const BOUND_ON_PROFILE: &str = "di Profil";
+    pub const BOUND_BEFORE_TAIL: &str =
+        "Profil berganti atau keyboard tersambung ulang sebelum pemasangan selesai.";
     pub const RELOADED_HINT: &str = "Isi tombol dibaca ulang dari keyboard.";
     pub const PARTIAL_WRITE: &str =
         "Keyboard terputus. Macro mungkin terpasang sebagian; isi tombol dibaca ulang saat tersambung.";
@@ -846,6 +850,19 @@ pub fn bind_effects(result: Result<BindOutcome, Error>) -> BindEffects {
     }
 }
 
+/// "Macro terpasang di tombol G di Profil 1. …": a bind that finished only
+/// after a profile switch or a reconnect (`profile` is 0-based).
+pub fn bound_before_text(key: u8, profile: u8) -> String {
+    format!(
+        "{} {} {} {}. {}",
+        strings::BOUND_ON,
+        keycodes::legend(key),
+        strings::BOUND_ON_PROFILE,
+        profile + 1,
+        strings::BOUND_BEFORE_TAIL
+    )
+}
+
 fn mode_title(m: PlayMode) -> &'static str {
     match m {
         PlayMode::Once => strings::MODE_ONCE,
@@ -922,6 +939,10 @@ pub struct Page {
     last_bind: Option<(u8, SavedMacro)>,
     failure: Option<Failure>,
     bound: bool,
+    /// A bind that worked but finished only after a profile switch or a
+    /// reconnect: it went to the key on the profile of back then, which
+    /// this says (the key and that profile).
+    bound_before: Option<String>,
     /// The user saw that the target's function will be replaced and
     /// clicked once; the next click binds.
     confirm_replace: bool,
@@ -955,6 +976,7 @@ impl Default for Page {
             last_bind: None,
             failure: None,
             bound: false,
+            bound_before: None,
             confirm_replace: false,
             bind_replaces: false,
         }
@@ -1023,6 +1045,7 @@ impl Page {
         if self.current(ctx).as_ref() != Some(sent) {
             self.last_bind = None;
             self.bound = false;
+            self.bound_before = None;
             self.failure = None;
         }
     }
@@ -1178,6 +1201,7 @@ impl Page {
                     // the settings read back belong to the keyboard state
                     // of back then and the snapshot was loaded afresh since.
                     // Nothing is patched; the target's binding is read again.
+                    // A bind that worked says where it went.
                     self.binding_for = None;
                     self.bind_replaces = false;
                     self.failure = fx.error.map(|text| Failure {
@@ -1186,14 +1210,14 @@ impl Page {
                         technical: fx.technical,
                     });
                     self.bound = false;
+                    self.bound_before = match (fx.bound, key, sent_on) {
+                        (true, Some(k), Some(on)) => Some(bound_before_text(k, on.profile)),
+                        _ => None,
+                    };
                     return;
                 }
-                let profile = sent_on.map(|s| s.profile);
                 if let (Some(key), Some(s)) = (key, fx.patch) {
                     ctx.worker.patch_snapshot(move |snap| {
-                        if Some(snap.profile) != profile {
-                            return;
-                        }
                         snap.keys.insert(key, s);
                     });
                 }
@@ -1214,6 +1238,7 @@ impl Page {
                 // "Terpasang" only while the bound macro is still the one
                 // shown.
                 self.bound = fx.bound && self.last_bind.is_some();
+                self.bound_before = None;
             }
         }
     }
@@ -1252,6 +1277,7 @@ impl Page {
     fn submit_bind(&mut self, ctx: &AppCtx, key: u8, m: SavedMacro) {
         self.failure = None;
         self.bound = false;
+        self.bound_before = None;
         self.confirm_replace = false;
         self.bind_replaces = ctx
             .snapshot
@@ -1946,6 +1972,11 @@ impl Page {
                         .font(font::small())
                         .color(color::SUCCESS),
                 );
+            } else if let Some(text) = &self.bound_before {
+                ui.add(
+                    egui::Label::new(RichText::new(text).font(font::small()).color(color::TEXT))
+                        .wrap(),
+                );
             } else {
                 let text = if !ctx.connected() {
                     strings::OFFLINE
@@ -2014,6 +2045,7 @@ impl Page {
                 self.binding_for = None;
                 self.failure = None;
                 self.bound = false;
+                self.bound_before = None;
                 self.confirm_replace = false;
             }
         }

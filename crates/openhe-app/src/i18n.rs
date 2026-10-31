@@ -37,6 +37,9 @@ pub mod error {
     pub const BUSY: &str = "Keyboard sedang dipakai program lain (tutup OpenHE/AULA HUB lain)";
     pub const BOOTLOADER: &str = "Keyboard sedang dalam mode bootloader. Cabut lalu colokkan lagi.";
     pub const UNSUPPORTED: &str = "Perangkat ini tidak didukung.";
+    /// After the model name(s).
+    pub const NO_CONFIG_INTERFACE: &str =
+        "terdeteksi, tetapi antarmuka pengaturannya tidak ditemukan. Cabut lalu colokkan lagi keyboard.";
     pub const FRAME: &str = "Balasan keyboard tidak dikenali.";
     pub const INVALID: &str = "Nilai di luar batas yang diizinkan untuk switch tombol ini.";
     pub const VERIFY: &str = "Keyboard menyimpan nilai yang berbeda dari yang dikirim.";
@@ -85,6 +88,9 @@ pub fn device_error(e: &openhe_device::Error) -> String {
             );
         }
     }
+    if let E::NoConfigInterface(models) = e {
+        return format!("{models} {}", error::NO_CONFIG_INTERFACE);
+    }
     let s = match e {
         E::Timeout => error::TIMEOUT,
         E::Disconnected => common::DISCONNECTED,
@@ -92,7 +98,7 @@ pub fn device_error(e: &openhe_device::Error) -> String {
         E::Permission(_) => error::PERMISSION,
         E::Busy(_) => error::BUSY,
         E::Unsupported(m) if m == "bootloader" => error::BOOTLOADER,
-        E::Unsupported(_) => error::UNSUPPORTED,
+        E::Unsupported(_) | E::NoConfigInterface(_) => error::UNSUPPORTED,
         E::Frame(_) => error::FRAME,
         E::InvalidInput(_) => error::INVALID,
         E::Io(m) if m.starts_with("verify failed") => error::VERIFY,
@@ -261,5 +267,18 @@ mod tests {
         );
         assert_ne!(msg, device_error(&E::Permission("x".into())));
         assert!(!msg.contains("udev"));
+    }
+
+    /// The keyboard is there but not its configuration interface: named,
+    /// with the advice to reconnect it, not "not supported".
+    #[test]
+    fn a_missing_configuration_interface_says_to_reconnect() {
+        let msg = device_error(&E::NoConfigInterface("WIN 68 HE MAX".into()));
+        assert_eq!(
+            msg,
+            "WIN 68 HE MAX terdeteksi, tetapi antarmuka pengaturannya tidak ditemukan. \
+             Cabut lalu colokkan lagi keyboard."
+        );
+        assert_ne!(msg, device_error(&E::Unsupported("x".into())));
     }
 }

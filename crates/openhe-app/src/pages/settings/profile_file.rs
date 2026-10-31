@@ -1352,4 +1352,59 @@ mod tests {
             .unwrap();
         assert_eq!(back, out.data);
     }
+
+    /// One key whose reply cannot be used (here an unknown Mode value) is
+    /// left out and named; the other keys are still read and exported.
+    /// With no key read at all, the export fails.
+    #[test]
+    fn an_unreadable_key_is_left_out_and_named() {
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x1B, 8, 0xFFFF));
+        for (layout, v) in [
+            (8, 0x0020),
+            (4, 1200),
+            (20, 150),
+            (21, 200),
+            (22, 100),
+            (23, 200),
+            (25, 2),
+            (0, 0x1A),
+            (1, 0x3A),
+            (2, 0),
+            (3, 0x01),
+            (8, 0x0020),
+        ] {
+            m.push_reply(key_reply(0x1A, layout, v));
+        }
+        let mut kb = Keyboard::new(m, Model::Win68HeMax);
+        let out = export_job(&mut kb, &[0x1B, 0x1A]).unwrap();
+        assert_eq!(
+            out.data.keys,
+            vec![key(0x1A, TouchMode::RapidTrigger, AdvancedConfig::None)]
+        );
+        assert_eq!(out.keys_skipped.len(), 1);
+        assert_eq!(out.keys_skipped[0].0, 0x1B);
+        assert!(matches!(out.keys_skipped[0].1, Error::Io(_)));
+
+        let mut m = MockTransport::new();
+        m.push_reply(key_reply(0x1B, 8, 0xFFFF));
+        let mut kb = Keyboard::new(m, Model::Win68HeMax);
+        assert!(matches!(export_job(&mut kb, &[0x1B]), Err(Error::Io(_))));
+        // A timeout is no odd key: it fails the whole read.
+        let mut kb = Keyboard::new(MockTransport::new(), Model::Win68HeMax);
+        assert_eq!(read_keys(&mut kb, &[0x1A]), Err(Error::Timeout));
+    }
+
+    #[test]
+    fn a_socd_pair_of_a_key_with_itself_is_refused() {
+        let present: BTreeSet<u8> = [0x04, 0x07].into();
+        let ok = AdvancedConfig::Socd(socd());
+        assert_eq!(check_advanced(0x04, &ok, &present), Ok(()));
+        let same = AdvancedConfig::Socd(Socd {
+            pos2: 0x04,
+            key2: 0x04,
+            ..socd()
+        });
+        assert!(check_advanced(0x04, &same, &present).is_err());
+    }
 }

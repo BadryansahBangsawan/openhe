@@ -129,11 +129,9 @@ impl Footprint {
                     out.insert(k.code);
                 }
             }
-            if self
-                .layers
-                .iter()
-                .any(|&(c, l, code)| c == k.code && k.layers[l as usize] != code)
-            {
+            if self.layers.iter().any(|&(c, l, code)| {
+                c == k.code && !same_layer_code(c, l, code, k.layers[l as usize])
+            }) {
                 out.insert(k.code);
             }
             if self
@@ -198,6 +196,27 @@ impl TemplatePlan {
             layers: self.writes.layers.clone(),
             functions: self.functions.clone(),
         }
+    }
+}
+
+/// Whether layer code `now` on `key` still is `wrote`. LAlt / LWin's Base
+/// codes swap with the Win/Mac mode (PROTOCOL 7.x finding 16), so a Win or
+/// Alt code there counts as the same as any other Win or Alt code: a mode
+/// switch alone is no change made elsewhere.
+fn same_layer_code(key: u8, layer: Layer, wrote: u16, now: u16) -> bool {
+    if layer == Layer::Base && is_win_alt(key) && is_win_alt_code(wrote) {
+        is_win_alt_code(now)
+    } else {
+        wrote == now
+    }
+}
+
+/// The other key of `key`'s SOCD pair, if `cfg` is one.
+fn socd_partner(cfg: AdvancedConfig, key: u8) -> Option<u8> {
+    match cfg {
+        AdvancedConfig::Socd(s) if s.pos1 == key => Some(s.pos2),
+        AdvancedConfig::Socd(s) => Some(s.pos1),
+        _ => None,
     }
 }
 
@@ -368,6 +387,19 @@ pub fn plan_template(
             plan.skip(key, Skip::MacroKept);
             continue;
         }
+        // The device also clears the key's old SOCD partner when the key
+        // leaves its pair.
+        let old_partner = socd_partner(cur, key);
+        // Keys a write changes besides `key` must have been read: an unread
+        // key is not in the backup, so "Urungkan" could not put it back.
+        // The whole entry is skipped instead.
+        let unread = |also: &[Option<u8>]| -> Vec<u8> {
+            also.iter()
+                .flatten()
+                .copied()
+                .filter(|k| !now.contains_key(k))
+                .collect()
+        };
         let mut touched = vec![key];
         match cfg {
             AdvancedConfig::Socd(s) => {
@@ -377,48 +409,56 @@ pub fn plan_template(
                 }
                 pairs_done.push(pair);
                 let partner = if s.pos1 == key { s.pos2 } else { s.pos1 };
-                let partner_now = now.get(&partner).map(|k| k.advanced);
-                if partner_now == Some(AdvancedConfig::Macro) {
+                let Some(partner_now) = now.get(&partner).map(|k| k.advanced) else {
+                    plan.skip(key, Skip::NotRead);
+                    plan.skip(partner, Skip::NotRead);
+                    continue;
+                };
+                if partner_now == AdvancedConfig::Macro {
                     plan.skip(key, Skip::MacroKept);
                     plan.skip(partner, Skip::MacroKept);
                     continue;
                 }
-                if cur == cfg && partner_now == Some(cfg) {
+                if cur == cfg && partner_now == cfg {
+                    continue;
+                }
+                let partners_old = socd_partner(partner_now, partner).filter(|&o| o != key);
+                let missing = unread(&[partners_old, old_partner]);
+                if !missing.is_empty() {
+                    plan.skip(key, Skip::NotRead);
+                    for k in missing {
+                        plan.skip(k, Skip::NotRead);
+                    }
                     continue;
                 }
                 plan.writes.advanced.push((key, cfg));
                 plan.functions.push((key, cfg));
                 plan.functions.push((partner, cfg));
                 touched.push(partner);
-                if let Some(AdvancedConfig::Socd(old)) = partner_now {
-                    let other = if old.pos1 == partner {
-                        old.pos2
-                    } else {
-                        old.pos1
-                    };
-                    if other != key && !named.contains(&other) {
-                        plan.functions.push((other, AdvancedConfig::None));
-                    }
+                if let Some(other) = partners_old.filter(|o| !named.contains(o)) {
+                    plan.functions.push((other, AdvancedConfig::None));
                 }
             }
-            AdvancedConfig::None => {
-                if cur == AdvancedConfig::None {
-                    continue;
-                }
-                plan.writes.clear_advanced.push(key);
-                plan.functions.push((key, cfg));
-            }
+            _ if cur == cfg => continue,
             _ => {
-                if cur == cfg {
+                let missing = unread(&[old_partner]);
+                if !missing.is_empty() {
+                    plan.skip(key, Skip::NotRead);
+                    for k in missing {
+                        plan.skip(k, Skip::NotRead);
+                    }
                     continue;
                 }
-                plan.writes.advanced.push((key, cfg));
+                if cfg == AdvancedConfig::None {
+                    plan.writes.clear_advanced.push(key);
+                } else {
+                    plan.writes.advanced.push((key, cfg));
+                }
                 plan.functions.push((key, cfg));
             }
         }
         // A key leaving its SOCD pair takes its old partner with it.
-        if let AdvancedConfig::Socd(old) = cur {
-            let other = if old.pos1 == key { old.pos2 } else { old.pos1 };
+        if let Some(other) = old_partner {
             if !touched.contains(&other) && !named.contains(&other) {
                 plan.functions.push((other, AdvancedConfig::None));
             }
@@ -957,6 +997,141 @@ mod tests {
             "{:?}",
             s.lines
         );
+    }
+
+    fn pair(a: u8, b: u8) -> AdvancedConfig {
+        AdvancedConfig::Socd(Socd {
+            pos1: a,
+            pos2: b,
+            key1: u16::from(a),
+            key2: u16::from(b),
+            bind_values: false,
+            mode: SocdMode::LastInput,
+            delay: 0,
+        })
+    }
+
+    /// A key that was not read is never written, also not as the partner
+    /// of a SOCD pair or as an old partner the device clears: it is not in
+    /// the backup, so "Urungkan" could not put it back. The entry is
+    /// skipped and the unread key named.
+    #[test]
+    fn a_socd_pair_touching_an_unread_key_is_skipped() {
+        let mut snap = snapshot68();
+        let cur = plain(&mut snap);
+        let fps = Builtin::GamingFps.template(snap.model, &keys_of(&snap));
+        let without = |gone: u8, cur: &[KeyData]| -> Vec<KeyData> {
+            cur.iter().filter(|k| k.code != gone).cloned().collect()
+        };
+        // D (A's partner) not read: A↔D left out, W↔S still set.
+        let p = plan_template(&fps, &snap, &without(D, &cur)).unwrap();
+        assert_eq!(p.writes.advanced.len(), 1, "{:?}", p.writes.advanced);
+        assert!(p.skipped.contains(&(D, Skip::NotRead)));
+        assert!(p.skipped.contains(&(A, Skip::NotRead)));
+        assert!(!p.functions.iter().any(|(k, _)| matches!(*k, A | D)));
+        // D is paired with J, and J was not read: setting A↔D would clear
+        // J on the device.
+        let mut dj = cur.clone();
+        for k in dj.iter_mut().filter(|k| matches!(k.code, D | 0x0D)) {
+            k.advanced = pair(D, 0x0D);
+        }
+        let p = plan_template(&fps, &snap, &without(0x0D, &dj)).unwrap();
+        assert!(
+            p.skipped.contains(&(0x0D, Skip::NotRead)),
+            "{:?}",
+            p.skipped
+        );
+        assert!(!p.writes.advanced.iter().any(|(k, _)| matches!(*k, A | D)));
+        // With J read, it is cleared and named.
+        let p = plan_template(&fps, &snap, &dj).unwrap();
+        assert!(p.functions.contains(&(0x0D, AdvancedConfig::None)));
+        // A key leaving its pair: its own old partner must be read too.
+        let mut tpl = Builtin::CapsCtrl.template(snap.model, &[]);
+        tpl.advanced.push((A, AdvancedConfig::None));
+        let mut aj = cur.clone();
+        for k in aj.iter_mut().filter(|k| matches!(k.code, A | 0x0D)) {
+            k.advanced = pair(A, 0x0D);
+        }
+        let p = plan_template(&tpl, &snap, &without(0x0D, &aj)).unwrap();
+        assert!(p.writes.clear_advanced.is_empty());
+        assert!(p.skipped.contains(&(0x0D, Skip::NotRead)));
+        let p = plan_template(&tpl, &snap, &aj).unwrap();
+        assert_eq!(p.writes.clear_advanced, vec![A]);
+        assert!(p.functions.contains(&(0x0D, AdvancedConfig::None)));
+    }
+
+    /// Removing the last Fn2 (tahan) from the Fn1 layer is warned about in
+    /// the preview, as on the Remap page.
+    #[test]
+    fn losing_the_last_fn2_is_warned_about() {
+        let mut snap = snapshot68();
+        let mut cur = plain(&mut snap);
+        for k in cur.iter_mut() {
+            k.layers[1] = if k.code == 0xE4 { 0xF002 } else { TRANSPARENT };
+        }
+        let mut tpl = Builtin::CapsCtrl.template(snap.model, &[]);
+        tpl.layers.push((0xE4, Layer::Fn1, 0x0004));
+        let p = plan_template(&tpl, &snap, &cur).unwrap();
+        assert!(p.loses_fn2);
+        assert_eq!(summary(&p, 68).warnings, vec![LOSES_FN2.to_string()]);
+        // Fn2 put on another key in the same template: still reachable.
+        tpl.layers.push((0xE5, Layer::Fn1, 0xF002));
+        let p = plan_template(&tpl, &snap, &cur).unwrap();
+        assert!(!p.loses_fn2);
+        assert!(summary(&p, 68).warnings.is_empty());
+    }
+
+    /// "Urungkan" puts back only what the apply wrote, and names what was
+    /// changed again since. A Win/Mac switch alone (LAlt / LWin's Base
+    /// codes swap) is no such change.
+    #[test]
+    fn urungkan_covers_only_the_footprint_and_sees_later_changes() {
+        let mut snap = snapshot68();
+        snap.system_mode = Some(SystemMode::Windows);
+        let mut before = plain(&mut snap);
+        // LAlt remapped to A: the factory template writes its Win code.
+        before.iter_mut().find(|k| k.code == 0xE2).unwrap().layers[0] = 0x0004;
+        let backup = super::super::Template::from_current("b", snap.model, &before, Parts::ALL);
+        let mut tpl = Builtin::GamingFps.template(snap.model, &keys_of(&snap));
+        tpl.layers.push((0xE2, Layer::Base, 0x00E2));
+        let applied = plan_template(&tpl, &snap, &before).unwrap();
+        let written = applied.footprint();
+        assert_eq!(
+            written.perf.keys().copied().collect::<Vec<_>>(),
+            [A, D, S, W]
+        );
+        assert!(written.layers.contains(&(0xE2, Layer::Base, 0x00E2)));
+        // The keyboard right after the apply.
+        let mut after = before.clone();
+        for k in after.iter_mut() {
+            if let Some(&(_, p)) = tpl.performance.iter().find(|(c, _)| *c == k.code) {
+                k.settings.mode.touch = p.touch.unwrap();
+                k.settings.actuation = p.actuation.unwrap();
+                k.settings.rt_press = p.rt_press.unwrap();
+                k.settings.rt_release = p.rt_release.unwrap();
+                k.advanced = tpl.advanced.iter().find(|(c, _)| *c == k.code).unwrap().1;
+            }
+            if k.code == 0xE2 {
+                k.layers[0] = 0x00E2;
+            }
+        }
+        assert!(written.changed_since(&after).is_empty());
+        // Mac mode now: LAlt reads 0xE3. Not a change made elsewhere.
+        let mut mac = after.clone();
+        mac.iter_mut().find(|k| k.code == 0xE2).unwrap().layers[0] = 0x00E3;
+        assert!(written.changed_since(&mac).is_empty());
+        // W changed on the Performa page, Q too (Q was not written).
+        let mut later = after.clone();
+        for k in later.iter_mut().filter(|k| matches!(k.code, W | 0x14)) {
+            k.settings.actuation = Micrometers(900);
+        }
+        assert_eq!(written.changed_since(&later), vec![W]);
+        // The undo plan writes W A S D back and leaves Q at 0.90 mm.
+        let undo = backup.limited_to(&written);
+        let p = plan_template(&undo, &snap, &later).unwrap();
+        assert!(!p.changed_keys().contains(&0x14));
+        assert_eq!(p.changed_keys(), BTreeSet::from([W, A, S, D, 0xE2]));
+        assert!(p.layers.contains(&(0xE2, Layer::Base, 0x0004)));
     }
 
     #[test]
