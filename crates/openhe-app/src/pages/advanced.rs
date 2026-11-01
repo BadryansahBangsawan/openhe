@@ -35,34 +35,25 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod strings {
     pub const ALL: &str = "Semua";
-    pub const EMPTY_TABLE: &str =
-        "Belum ada tombol dengan fungsi lanjutan. Pilih tombol di keyboard lalu atur fungsinya di panel kanan.";
+    pub const EMPTY_TABLE: &str = "Belum ada tombol dengan fungsi lanjutan.";
     pub const COL_KEY: &str = "TOMBOL";
     pub const COL_FUNC: &str = "FUNGSI";
     pub const COL_BEHAVIOUR: &str = "PERILAKU";
-    pub const COL_ACTION: &str = "AKSI";
-    pub const EDIT: &str = "Edit";
-    pub const EDITING: &str = "Sedang diedit";
     pub const READING_TABLE: &str = "Membaca detail fungsi…";
     pub const UNKNOWN_BEHAVIOUR: &str = "Detail belum terbaca";
 
     pub const NOTHING_SELECTED: &str = "Pilih tombol";
-    pub const NOTHING_SELECTED_BODY: &str =
-        "Klik satu tombol di keyboard untuk memberinya fungsi lanjutan atau mengubahnya.";
     pub const READING: &str = "Membaca fungsi tombol…";
     pub const READ_FAILED: &str = "Gagal membaca fungsi tombol";
-    pub const MACRO_HINT: &str =
-        "Tombol ini terhubung ke macro. Mengatur fungsi di sini menggantikan macro tersebut.";
+    pub const MACRO_HINT: &str = "Terhubung ke macro; fungsi baru akan menggantikannya.";
     pub const CHANGE_TYPE: &str = "Jenis fungsi";
 
-    pub const DESC_DKS: &str =
-        "Satu tombol, sampai 4 aksi berbeda tergantung seberapa dalam ditekan dan dilepas.";
-    pub const DESC_MT: &str = "Ketuk sebentar mengirim satu tombol, ditahan mengirim tombol lain.";
-    pub const DESC_TGL: &str = "Ketuk sekali, tombol tetap tertekan; ketuk lagi untuk melepas.";
+    pub const DESC_DKS: &str = "Sampai 4 aksi sesuai tahap tekan dan lepas.";
+    pub const DESC_MT: &str = "Diketuk dan ditahan mengirim tombol berbeda.";
+    pub const DESC_TGL: &str = "Ketuk untuk menahan, ketuk lagi untuk melepas.";
     pub const DESC_MPT: &str = "Tiga tombol berbeda sesuai kedalaman tekan.";
-    pub const DESC_SOCD: &str =
-        "Dua tombol berlawanan (mis. A dan D) ditekan bersamaan: pilih tombol mana yang menang.";
-    pub const DESC_END: &str = "Tombol mengirim tombol lain saat dilepas.";
+    pub const DESC_SOCD: &str = "Dua tombol berlawanan ditekan bersamaan: pilih yang menang.";
+    pub const DESC_END: &str = "Mengirim tombol lain saat dilepas.";
 
     pub const DKS_PHASES: [&str; 4] = [
         "Mulai\ntekan",
@@ -72,7 +63,6 @@ mod strings {
     ];
     pub const DKS_LEGEND: &str = "Lingkaran = tekan · garis = tahan antar titik";
     pub const DKS_FIRST: &str = "Titik aktuasi pertama";
-    pub const DKS_BOTTOM: &str = "Dasar tetap 3.40 mm";
 
     pub const HOLD_KEY: &str = "Tombol saat ditahan";
     pub const TAP_KEY: &str = "Tombol saat diketuk";
@@ -100,7 +90,6 @@ mod strings {
     pub const APPLYING: &str = "Menerapkan…";
     pub const APPLIED: &str = "Tersimpan di keyboard";
     pub const SAVED_IN_PROFILE: &str = "Disimpan di profil";
-    pub const WORKS_WITHOUT_APP: &str = "tetap aktif tanpa app";
     pub const APPLY_FAILED: &str = "Gagal menerapkan";
     pub const RELOADED_HINT: &str = "Fungsi tombol dibaca ulang dari keyboard.";
     pub const PARTIAL_WRITE: &str =
@@ -116,8 +105,7 @@ mod strings {
     pub const V_END_KEY: &str = "Pilih tombol yang dikirim saat dilepas.";
     pub const V_DELAY: &str = "Waktu harus antara 10 dan 1000 ms.";
     pub const V_DEPTH_RANGE: &str = "Kedalaman harus antara 0.10 dan 3.40 mm.";
-    pub const V_DEPTH_ORDER: &str =
-        "Kedalaman harus makin dalam: titik 2 lebih dalam dari titik 1, titik 3 lebih dalam dari titik 2.";
+    pub const V_DEPTH_ORDER: &str = "Tiap titik harus lebih dalam dari titik sebelumnya.";
     pub const V_SOCD_PARTNER: &str = "Pilih tombol pasangan di keyboard.";
     pub const V_SOCD_SAME: &str = "Pasangan harus tombol yang berbeda.";
     pub const V_SOCD_DELAY: &str = "Jeda SOCD harus antara 0 dan 50.";
@@ -1375,15 +1363,14 @@ impl Page {
             let (hr, _) = ui.allocate_exact_size(egui::vec2(w, 38.0), Sense::hover());
             let cols = columns(hr);
             let p = ui.painter();
-            for (x, text, align) in [
-                (cols.key, t::COL_KEY, Align2::LEFT_CENTER),
-                (cols.func, t::COL_FUNC, Align2::LEFT_CENTER),
-                (cols.desc, t::COL_BEHAVIOUR, Align2::LEFT_CENTER),
-                (cols.action, t::COL_ACTION, Align2::RIGHT_CENTER),
+            for (x, text) in [
+                (cols.key, t::COL_KEY),
+                (cols.func, t::COL_FUNC),
+                (cols.desc, t::COL_BEHAVIOUR),
             ] {
                 p.text(
                     egui::pos2(x, hr.center().y),
-                    align,
+                    Align2::LEFT_CENTER,
                     text,
                     font::tiny(),
                     color::FAINT,
@@ -1464,14 +1451,9 @@ impl Page {
                     .color(color::TEXT)
                     .strong(),
             );
-            card::hint(
-                ui,
-                if ctx.connected() {
-                    t::NOTHING_SELECTED_BODY
-                } else {
-                    i18n::common::WAITING_DEVICE_BODY
-                },
-            );
+            if !ctx.connected() {
+                card::hint(ui, i18n::common::WAITING_DEVICE_BODY);
+            }
             return;
         };
         let loaded_func = self
@@ -1622,14 +1604,9 @@ impl Page {
                 );
             } else if let Some(s) = ctx.snapshot {
                 ui.label(
-                    RichText::new(format!(
-                        "{} {} · {}",
-                        t::SAVED_IN_PROFILE,
-                        s.profile + 1,
-                        t::WORKS_WITHOUT_APP
-                    ))
-                    .font(font::small())
-                    .color(color::MUTED),
+                    RichText::new(format!("{} {}", t::SAVED_IN_PROFILE, s.profile + 1))
+                        .font(font::small())
+                        .color(color::MUTED),
                 );
             }
         });
@@ -1690,7 +1667,7 @@ struct Columns {
     key: f32,
     func: f32,
     desc: f32,
-    action: f32,
+    end: f32,
 }
 
 fn columns(r: Rect) -> Columns {
@@ -1698,7 +1675,7 @@ fn columns(r: Rect) -> Columns {
         key: r.left() + 20.0,
         func: r.left() + 150.0,
         desc: r.left() + 250.0,
-        action: r.right() - 20.0,
+        end: r.right() - 20.0,
     }
 }
 
@@ -1750,18 +1727,6 @@ fn table_row(ui: &mut Ui, row: &Row, selected: bool, enabled: bool) -> bool {
     p.rect_filled(pr, CornerRadius::same(6), c.gamma_multiply(0.18));
     p.galley(pr.min + egui::vec2(8.0, 3.0), galley, c);
 
-    let action = if selected { t::EDITING } else { t::EDIT };
-    let action_rect = p.text(
-        egui::pos2(cols.action, cy),
-        Align2::RIGHT_CENTER,
-        action,
-        font::body(),
-        if selected {
-            color::ACCENT
-        } else {
-            color::MUTED
-        },
-    );
     let text = match &row.cfg {
         Some(cfg) => describe(cfg),
         None => t::UNKNOWN_BEHAVIOUR.to_string(),
@@ -1770,7 +1735,7 @@ fn table_row(ui: &mut Ui, row: &Row, selected: bool, enabled: bool) -> bool {
         text,
         font::body(),
         color::TEXT,
-        (action_rect.left() - cols.desc - 16.0).max(40.0),
+        (cols.end - cols.desc).max(40.0),
     );
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -1994,7 +1959,6 @@ fn dks_editor(ui: &mut Ui, f: &mut DksForm) {
     SliderMm::new(&mut f.first, MIN_DEPTH_UM..=MAX_DEPTH_UM)
         .end_labels(mm_short(MIN_DEPTH_UM), mm_short(MAX_DEPTH_UM))
         .show(ui);
-    card::hint(ui, t::DKS_BOTTOM);
 }
 
 /// Seven flags: nodes at even indexes (press at P0..P3), links at odd ones

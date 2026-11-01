@@ -38,19 +38,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 mod strings {
-    pub const HEADER: &str = "Tekan setiap tombol pelan-pelan sampai mentok, lalu lepas";
     pub const KEYS: &str = "tombol";
     pub const TITLE_IDLE: &str = "Kalibrasi";
     pub const TITLE_RUNNING: &str = "Kalibrasi berjalan";
-    pub const NO_TYPING: &str = "Selama kalibrasi, ketikan tidak dikirim ke komputer.";
+    pub const NO_TYPING: &str = "Selama kalibrasi keyboard tidak bisa mengetik.";
     pub const SWITCH: &str = "Switch";
     pub const MIXED: &str = "Campuran";
     pub const MEASURED: &str = "Jarak tekan terukur";
     pub const LAST: &str = "Terakhir dikalibrasi";
     pub const LAST_NEVER: &str = "belum tercatat";
     pub const LAST_SESSION: &str = "di sesi ini";
-    pub const REDO_WARNING: &str =
-        "Kalibrasi perlu diulang setelah mengganti switch, supaya titik aktuasi tetap akurat.";
+    pub const REDO_WARNING: &str = "Ulangi kalibrasi setelah mengganti switch.";
     pub const START: &str = "Mulai kalibrasi";
     pub const AGAIN: &str = "Kalibrasi lagi";
     pub const STARTING: &str = "Memulai…";
@@ -61,14 +59,13 @@ mod strings {
     pub const PRESS: &str = "tekan";
 
     pub const STEP1: &str = "1. Lepas semua tombol";
-    pub const STEP1_BODY: &str =
-        "Keyboard mengukur posisi diam tiap switch. Jangan sentuh keyboard selama 2 detik.";
+    pub const STEP1_BODY: &str = "Jangan sentuh keyboard selama 2 detik.";
     pub const STEP2: &str = "2. Tekan tiap tombol sampai mentok";
-    pub const STEP2_BODY: &str = "Tombol jadi hijau setelah terukur.";
+    pub const STEP2_BODY: &str = "Pelan-pelan, lalu lepas.";
     pub const STEP2_LEFT: &str = "Sisa:";
     pub const STEP2_ALL: &str = "Semua tombol sudah terukur.";
     pub const STEP3: &str = "3. Simpan";
-    pub const STEP3_BODY: &str = "Hasil disimpan di keyboard. Lakukan lagi kalau ganti switch.";
+    pub const STEP3_BODY: &str = "Hasil disimpan di keyboard.";
 
     pub const SAVED: &str = "Kalibrasi selesai dan disimpan di keyboard.";
     pub const CANCELLED: &str =
@@ -79,7 +76,7 @@ mod strings {
     pub const INTERRUPTED: &str =
         "Keyboard terputus saat kalibrasi. Mode kalibrasi dihentikan begitu keyboard tersambung lagi.";
     pub const INTERRUPTED_DONE: &str =
-        "Keyboard terputus saat kalibrasi; mode kalibrasi sudah dihentikan. Mulai lagi bila perlu.";
+        "Keyboard terputus saat kalibrasi; mode kalibrasi sudah dihentikan.";
     pub const STOP_FAILED: &str =
         "Keyboard belum menjawab perintah berhenti; mungkin masih dalam mode kalibrasi (tidak bisa mengetik).";
     pub const STOP_AGAIN: &str = "Hentikan lagi";
@@ -700,12 +697,9 @@ impl Page {
         let done = self.progress.done.len().min(total);
         let show_progress = self.life.is_active() || self.life.outcome.is_some();
 
+        // The count only; the instructions are in the step cards below.
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(t::HEADER)
-                    .font(font::bold(15.0))
-                    .color(color::TEXT),
-            );
+            ui.set_min_height(20.0);
             if show_progress {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(

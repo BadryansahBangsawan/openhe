@@ -47,8 +47,6 @@ use std::path::{Path, PathBuf};
 
 mod strings {
     pub const BUILTIN: &str = "Template bawaan";
-    pub const BUILTIN_HINT: &str =
-        "Hanya mengubah yang disebut template, di profil yang aktif. Pilih satu untuk melihat pratinjau.";
     pub const MINE: &str = "Template saya";
     pub const MINE_EMPTY: &str = "Belum ada template tersimpan.";
     pub const SAVE_CURRENT: &str = "Simpan setting sekarang…";
@@ -74,34 +72,28 @@ mod strings {
     pub const FILE_FAILED: &str = "File tidak bisa dibaca atau ditulis.";
 
     pub const KEYBOARD: &str = "Tombol yang berubah";
-    pub const KEYBOARD_IDLE: &str = "Pilih template untuk melihat tombol yang berubah.";
     pub const LEGEND_CHANGED: &str = "berubah";
     pub const LEGEND_SKIPPED: &str = "dilewati";
 
     pub const TITLE: &str = "Template";
-    pub const INTRO: &str =
-        "Template mengubah profil yang aktif saja. Sebelum menulis, OpenHE menyimpan cadangan setting sekarang di komputer ini.";
+    pub const INTRO: &str = "Pilih template untuk pratinjau; hanya profil aktif yang diubah.";
     pub const READING: &str = "Membaca keyboard…";
     pub const PREVIEW: &str = "Pratinjau";
-    pub const ON_PROFILE: &str = "Untuk Profil";
-    pub const BACKUP_FIRST: &str = "Cadangan otomatis disimpan sebelum menulis.";
+    pub const ON_PROFILE: &str = "Ditulis ke Profil";
+    pub const BACKUP_FIRST: &str = "cadangan disimpan dulu.";
     pub const APPLY: &str = "Terapkan";
     pub const APPLYING: &str = "Menerapkan…";
     pub const KEEP_IMPORTED: &str = "Simpan ke Template saya";
-    pub const REFRESHED: &str =
-        "Keyboard berubah sejak pratinjau dibuat. Pratinjau sudah diperbarui; periksa lalu terapkan lagi.";
+    pub const REFRESHED: &str = "Keyboard berubah; pratinjau sudah diperbarui.";
     pub const DONE: &str = "Tersimpan di keyboard";
-    pub const DONE_BODY: &str = "Nilai sudah dibaca ulang dari keyboard.";
     pub const UNDO: &str = "Urungkan";
     pub const UNDO_PREFIX: &str = "Urungkan";
-    pub const UNDO_SCOPE: &str =
-        "Hanya yang diubah template tadi yang dikembalikan; perubahan lain tetap.";
+    pub const UNDO_SCOPE: &str = "Hanya yang diubah template tadi yang dikembalikan.";
     pub const UNDO_CHANGED: &str = "Sejak template diterapkan, tombol ini diubah lagi:";
     pub const UNDO_CHANGED_TAIL: &str = "Urungkan menimpa perubahan itu dengan nilai cadangan.";
     pub const RESTORE_PREFIX: &str = "Pulihkan cadangan";
     pub const NOTHING_TO_UNDO: &str = "Tidak ada yang perlu dikembalikan.";
-    pub const PARTIAL: &str =
-        "Sebagian perubahan gagal ditulis; nilai sudah dibaca ulang. Cadangan tetap tersimpan.";
+    pub const PARTIAL: &str = "Sebagian perubahan gagal ditulis. Cadangan tetap tersimpan.";
     pub const DISCONNECTED: &str =
         "Keyboard terputus saat menulis. Setelah tersambung lagi, periksa nilainya atau pulihkan cadangan.";
     pub const FAILED: &str = "Gagal";
@@ -113,15 +105,13 @@ mod strings {
     pub const DROPPED_PROFILE: &str = "Profil atau koneksi berganti, jadi pratinjau dibatalkan.";
 
     pub const BACKUPS: &str = "Cadangan terakhir";
-    pub const BACKUPS_EMPTY: &str =
-        "Belum ada cadangan. Cadangan dibuat setiap kali template diterapkan.";
+    pub const BACKUPS_EMPTY: &str = "Belum ada cadangan.";
     pub const BEFORE: &str = "Sebelum";
     pub const PROFILE: &str = "Profil";
     pub const RESTORE: &str = "Pulihkan";
     pub const BACKUP_GONE: &str = "Cadangan ini tidak bisa dibaca lagi.";
     pub const NOT_READY: &str = "Keyboard belum siap";
-    pub const NOT_READY_BODY: &str =
-        "Keyboard sedang dimuat ulang atau tersambung ulang. Tunggu sampai tersambung, lalu coba lagi.";
+    pub const NOT_READY_BODY: &str = "Tunggu keyboard tersambung, lalu coba lagi.";
     pub const OTHER_PROFILE: &str = "Cadangan dari profil lain";
     pub const OTHER_PROFILE_BODY: &str = "Cadangan ini dibaca dari";
     pub const OTHER_PROFILE_NOW: &str = "sedangkan yang aktif";
@@ -861,18 +851,15 @@ impl Page {
                         _ => KeyDecoration::default(),
                     });
             });
-            ui.add_space(8.0);
-            match &preview {
-                Some((_, skipped)) => {
-                    ui.horizontal_wrapped(|ui| {
-                        legend_chip(ui, color::ACCENT, t::LEGEND_CHANGED);
-                        if !skipped.is_empty() {
-                            ui.add_space(12.0);
-                            legend_chip(ui, color::DANGER, t::LEGEND_SKIPPED);
-                        }
-                    });
-                }
-                None => card::hint(ui, t::KEYBOARD_IDLE),
+            if let Some((_, skipped)) = &preview {
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    legend_chip(ui, color::ACCENT, t::LEGEND_CHANGED);
+                    if !skipped.is_empty() {
+                        ui.add_space(12.0);
+                        legend_chip(ui, color::DANGER, t::LEGEND_SKIPPED);
+                    }
+                });
             }
         });
     }
@@ -923,7 +910,6 @@ impl Page {
 
     fn builtins(&mut self, ctx: &AppCtx, ui: &mut Ui) {
         card::title(ui, t::BUILTIN);
-        card::hint(ui, t::BUILTIN_HINT);
         ui.add_space(10.0);
         let enabled = self.can_start(ctx);
         let selected = self.selected_builtin();
@@ -1185,16 +1171,6 @@ impl Page {
                 refreshed,
                 ..
             } => {
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {} {}",
-                        t::PREVIEW,
-                        t::ON_PROFILE,
-                        on.profile + 1
-                    ))
-                    .font(font::small())
-                    .color(color::MUTED),
-                );
                 ui.add(
                     egui::Label::new(
                         RichText::new(&tpl.name)
@@ -1250,7 +1226,10 @@ impl Page {
                     ui.add_space(10.0);
                 }
                 if !plan.is_empty() {
-                    card::hint(ui, t::BACKUP_FIRST);
+                    card::hint(
+                        ui,
+                        format!("{} {}; {}", t::ON_PROFILE, on.profile + 1, t::BACKUP_FIRST),
+                    );
                     ui.add_space(10.0);
                 }
                 ui.horizontal(|ui| {
@@ -1309,16 +1288,6 @@ impl Page {
                             egui::Label::new(RichText::new(format!("✔ {text}")).color(c).strong())
                                 .wrap(),
                         );
-                        if *ok && undo.is_some() {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(t::DONE_BODY)
-                                        .font(font::small())
-                                        .color(color::MUTED),
-                                )
-                                .wrap(),
-                            );
-                        }
                     })
                     .response;
                 if let Some(tech) = tech {

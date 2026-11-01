@@ -5,25 +5,19 @@
 pub mod common {
     pub const APP_NAME: &str = "OpenHE";
     pub const ALREADY_RUNNING: &str = "OpenHE sudah berjalan";
-    pub const ALREADY_RUNNING_BODY: &str =
-        "OpenHE sudah terbuka di jendela lain. Pakai jendela itu: hanya satu OpenHE yang boleh terhubung ke keyboard.";
-    pub const COMING_SOON: &str = "Segera hadir";
-    pub const COMING_SOON_BODY: &str =
-        "Halaman ini sedang dibuat. Pengaturan lain sudah bisa dipakai.";
+    pub const ALREADY_RUNNING_BODY: &str = "Pakai jendela OpenHE yang sudah terbuka.";
     pub const RETRY: &str = "Coba lagi";
     pub const CLOSE: &str = "Tutup";
     pub const MM: &str = "mm";
     pub const UNTESTED_LAYOUT: &str = "Tata letak WIN 60 belum diuji";
     pub const WAITING_DEVICE: &str = "Menunggu keyboard…";
-    pub const WAITING_DEVICE_BODY: &str =
-        "Colokkan WIN 68 HE MAX atau WIN 60 HE MAX lewat USB. OpenHE mencari setiap detik.";
+    pub const WAITING_DEVICE_BODY: &str = "Colokkan WIN 68 HE MAX atau WIN 60 HE MAX lewat USB.";
     pub const LOADING_DEVICE: &str = "Membaca pengaturan keyboard…";
     pub const DISCONNECTED: &str = "Keyboard terputus.";
     pub const DISMISS: &str = "Tutup";
     pub const RELOAD: &str = "Muat ulang";
     pub const TECH_DETAIL: &str = "Detail teknis";
-    pub const CLOSING: &str =
-        "Menunggu perubahan selesai… OpenHE ditutup sesudahnya (paling lama 10 detik).";
+    pub const CLOSING: &str = "Menunggu perubahan selesai, lalu OpenHE ditutup…";
 }
 
 /// Error texts. Every user-facing error goes through [`device_error`], so no
@@ -129,18 +123,6 @@ pub mod nav {
     pub const SETTINGS: &str = "Pengaturan";
 }
 
-/// Page subtitles in the top bar.
-pub mod subtitle {
-    pub const PERFORMANCE: &str = "Titik aktuasi, rapid trigger, deadzone";
-    pub const ADVANCED: &str = "DKS, MT, TGL, MPT, SOCD, END";
-    pub const REMAP: &str = "Ubah fungsi tombol di 4 layer";
-    pub const MACROS: &str = "Rekam urutan tombol, pasang ke tombol mana saja";
-    pub const LIGHTING: &str = "Efek, warna per tombol, kecerahan";
-    pub const CALIBRATION: &str = "Ukur ulang jarak tekan semua switch";
-    pub const TEMPLATES: &str = "Preset siap pakai, template sendiri, cadangan";
-    pub const SETTINGS: &str = "Polling rate, profil, app, reset";
-}
-
 /// Top bar.
 pub mod topbar {
     pub const PROFILE: &str = "Profil";
@@ -177,23 +159,19 @@ pub mod perf {
     pub const VIEW_LIVE: &str = "Kedalaman live";
 
     pub const NOTHING_SELECTED: &str = "Pilih tombol";
-    pub const NOTHING_SELECTED_BODY: &str =
-        "Klik tombol di keyboard untuk mengatur titik aktuasi dan rapid trigger.";
     pub const KEYS_SELECTED: &str = "tombol dipilih";
-    pub const SWITCH_PREFIX: &str = "switch";
     pub const MIXED_VALUES: &str = "Nilai berbeda antar tombol; yang tampil milik tombol pertama.";
 
     pub const MODE: &str = "Mode";
     pub const MODE_NORMAL: &str = "Normal";
     pub const MODE_RT: &str = "Rapid Trigger";
     pub const MODE_GLOBAL_HINT: &str =
-        "Tombol ini masih mode global bawaan. Menerapkan aktuasi mengubahnya ke Normal.";
+        "Masih mode global; menerapkan aktuasi mengubahnya ke Normal.";
 
     pub const ACTUATION: &str = "Titik aktuasi";
     pub const SENSITIVE: &str = "sensitif";
     pub const DEEP: &str = "dalam";
 
-    pub const RAPID_TRIGGER: &str = "Rapid Trigger";
     pub const RT_PRESS: &str = "Sensitivitas tekan";
     pub const RT_RELEASE: &str = "Sensitivitas lepas";
     pub const RT_SYNC: &str = "Samakan tekan & lepas";
@@ -203,35 +181,31 @@ pub mod perf {
     pub const DZ_BOTTOM: &str = "Bawah";
 
     pub const SWITCH: &str = "Switch";
-    pub const SWITCH_HINT: &str = "Menentukan jarak tekan maksimum.";
 
     pub const APPLY: &str = "Terapkan ke keyboard";
     pub const APPLYING: &str = "Menerapkan…";
     pub const APPLIED: &str = "Tersimpan di keyboard";
-    pub const NO_CHANGES: &str = "Belum ada perubahan";
     pub const SAVED_IN_PROFILE: &str = "Disimpan di profil";
-    pub const WORKS_WITHOUT_APP: &str = "tetap aktif tanpa app";
     pub const APPLY_FAILED: &str = "Gagal menerapkan";
-    pub const RELOADED_HINT: &str = "Nilai di layar sudah dibaca ulang dari keyboard.";
+    pub const RELOADED_HINT: &str = "Nilai di layar dibaca ulang dari keyboard.";
     pub const PARTIAL_WRITE: &str =
         "Keyboard terputus. Sebagian perubahan mungkin sudah terkirim; nilai dibaca ulang saat tersambung.";
     pub const CLAMPED: &str =
-        "Nilai yang melebihi jarak tekan switch baru disesuaikan ke batasnya dan ikut dikirim. Maks";
+        "Nilai di atas jarak tekan switch baru disesuaikan ke batasnya dan ikut dikirim. Maks";
 
     pub const LEGEND: &str = "Keterangan";
     pub const LEGEND_SELECTED: &str = "Dipilih";
     pub const LEGEND_VALUE: &str = "Angka = titik aktuasi (mm)";
     pub const LEGEND_CHANGED: &str = "Berbeda dari bawaan (2.00)";
-    pub const LEGEND_RT: &str = "RT = rapid trigger aktif";
-    pub const SELECT_HINT: &str =
-        "Klik atau seret untuk memilih beberapa tombol. Shift+klik untuk menambah.";
+    pub const LEGEND_RT: &str = "Rapid trigger aktif";
+    pub const SELECT_HINT: &str = "Seret untuk memilih banyak, Shift+klik untuk menambah.";
 
     pub const TRAVEL: &str = "Gerak tombol";
     pub const ACTUATION_MARK: &str = "Aktuasi";
     pub const DZ_SUMMARY_TOP: &str = "Deadzone atas";
     pub const DZ_SUMMARY_BOTTOM: &str = "bawah";
-    pub const RT_SUMMARY: &str = "RT: lepas setelah naik";
-    pub const RT_SUMMARY_PRESS: &str = "tekan lagi setelah turun";
+    pub const RT_SUMMARY: &str = "RT: lepas";
+    pub const RT_SUMMARY_PRESS: &str = "tekan";
 }
 
 /// Shell texts for keyboard events, the interactive top bar, and the
@@ -264,35 +238,28 @@ pub mod update {
     pub const DAYS_AGO: &str = "hari lalu";
     pub const AVAILABLE: &str = "Versi baru tersedia:";
     pub const PRERELEASE: &str = "versi uji";
-    pub const NOTES: &str = "Catatan rilis";
     pub const NO_NOTES: &str = "Tidak ada catatan rilis.";
     pub const INSTALL: &str = "Unduh & pasang";
     pub const DOWNLOADING: &str = "Mengunduh…";
     pub const INSTALLING: &str = "Memeriksa dan memasang…";
     /// After "✔ Versi 0.3.0".
-    pub const INSTALLED: &str = "sudah terpasang. Mulai ulang OpenHE untuk memakainya.";
+    pub const INSTALLED: &str = "sudah terpasang.";
     pub const RESTART: &str = "Mulai ulang sekarang";
     pub const RESTART_BUSY: &str = "Tunggu sampai perubahan ke keyboard selesai.";
     pub const RESTART_FAILED: &str =
         "OpenHE versi baru tidak bisa dijalankan. Tutup lalu buka lagi OpenHE.";
     pub const AUTO: &str = "Periksa pembaruan otomatis";
-    pub const AUTO_HINT: &str = "Paling sering sekali sehari, saat OpenHE dibuka.";
     pub const BETA: &str = "Ikut versi uji (beta)";
-    pub const BETA_HINT: &str = "Juga menawarkan versi pra-rilis yang mungkin belum stabil.";
+    pub const BETA_HINT: &str = "Mungkin belum stabil.";
     pub const RELEASES_LINK: &str = "Halaman rilis di GitHub";
     pub const DOWNLOAD_PAGE: &str = "Buka halaman unduhan";
     pub const LINK_FAILED: &str = "Browser tidak bisa dibuka. Alamatnya:";
-    pub const NETWORK_NOTE: &str =
-        "Hanya pembaruan yang memakai internet: OpenHE menghubungi GitHub untuk memeriksa dan mengunduh versi baru. Tidak ada data lain yang dikirim.";
 
-    pub const UNSUPPORTED_BUNDLE: &str =
-        "Pemasangan otomatis hanya untuk OpenHE.app. Unduh versi baru dari halaman rilis.";
+    pub const UNSUPPORTED_BUNDLE: &str = "Pemasangan otomatis hanya untuk OpenHE.app.";
     pub const UNSUPPORTED_TRANSLOCATED: &str =
-        "macOS menjalankan OpenHE dari lokasi sementara. Pindahkan OpenHE.app ke folder Aplikasi lalu buka lagi, atau unduh manual.";
-    pub const UNSUPPORTED_APPIMAGE: &str =
-        "Pemasangan otomatis hanya untuk versi AppImage. Unduh versi baru dari halaman rilis.";
-    pub const UNSUPPORTED_PLATFORM: &str =
-        "Pemasangan otomatis belum tersedia untuk sistem ini. Unduh versi baru dari halaman rilis.";
+        "Pindahkan OpenHE.app ke folder Aplikasi lalu buka lagi untuk memasang otomatis.";
+    pub const UNSUPPORTED_APPIMAGE: &str = "Pemasangan otomatis hanya untuk versi AppImage.";
+    pub const UNSUPPORTED_PLATFORM: &str = "Pemasangan otomatis belum tersedia untuk sistem ini.";
     pub const NO_ASSET: &str =
         "Rilis ini belum punya file untuk sistem ini. Unduh manual dari halaman rilis.";
 

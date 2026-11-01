@@ -41,10 +41,9 @@ mod strings {
     pub const NEW: &str = "+ Baru";
     pub const NEW_NAME: &str = "Macro baru";
     pub const COPY_SUFFIX: &str = "salinan";
-    pub const LIBRARY_EMPTY: &str = "Belum ada macro. Tekan Baru untuk membuat satu.";
-    pub const LIBRARY_NOTE: &str =
-        "Daftar macro disimpan di komputer ini. Hanya macro yang dipasang ke tombol yang dikirim ke keyboard.";
-    pub const NO_MACRO_SELECTED: &str = "Pilih atau buat macro di daftar sebelah kiri.";
+    pub const LIBRARY_EMPTY: &str = "Belum ada macro.";
+    pub const LIBRARY_NOTE: &str = "Disimpan di komputer ini, bukan di keyboard.";
+    pub const NO_MACRO_SELECTED: &str = "Pilih atau buat macro.";
     pub const STEPS: &str = "langkah";
     pub const TOTAL: &str = "Total";
     pub const SECONDS: &str = "detik";
@@ -56,11 +55,9 @@ mod strings {
 
     pub const RECORD: &str = "Rekam";
     pub const STOP: &str = "Berhenti";
-    pub const RECORDING: &str =
-        "Merekam. Tekan tombol di keyboard komputer; pencet Berhenti kalau selesai.";
-    pub const RECORD_APPENDS: &str = "Hasil rekaman ditambahkan di akhir langkah.";
+    pub const RECORDING: &str = "Merekam";
     pub const RECORD_TIMING: &str =
-        "Jeda direkam per frame layar (sekitar 16 ms), jadi tombol yang ditekan sangat cepat bisa tercatat 0 ms. Ubah jedanya di tabel kalau perlu lebih tepat.";
+        "Jeda direkam per frame layar (±16 ms); ubah di tabel jika perlu lebih tepat.";
     pub const RECORD_FULL: &str = "Batas 255 langkah tercapai; rekaman dihentikan.";
     pub const RECORD_INTERRUPTED: &str = "Rekaman dihentikan karena halaman ditinggalkan.";
     pub const ADD_STEP: &str = "+ Tambah langkah";
@@ -78,16 +75,14 @@ mod strings {
     pub const PRESS: &str = "Tekan";
     pub const RELEASE: &str = "Lepas";
     pub const MS: &str = "ms";
-    pub const NO_STEPS: &str = "Belum ada langkah. Tekan Rekam atau Tambah langkah.";
+    pub const NO_STEPS: &str = "Belum ada langkah.";
     pub const UP: &str = "Naikkan";
     pub const DOWN: &str = "Turunkan";
     pub const REMOVE: &str = "Hapus langkah";
-    pub const DELAY_HINT: &str = "Jeda setelah langkah ini sebelum langkah berikutnya.";
 
     pub const SKIPPED: &str = "Tombol ini dilewati karena belum didukung perekam:";
     pub const UNBALANCED: &str = "Ada tombol yang ditekan tetapi tidak dilepas:";
-    pub const UNBALANCED_BLOCK: &str =
-        "Tambahkan pelepasan untuk tombol yang masih ditekan sebelum memasang, supaya tidak ada tombol yang macet.";
+    pub const UNBALANCED_BLOCK: &str = "Tambahkan pelepasan dulu agar tombol tidak macet.";
     pub const ADD_RELEASES: &str = "Tambahkan pelepasan otomatis";
     pub const TOO_MANY: &str = "Terlalu banyak langkah (maksimum 255).";
     pub const EMPTY_MACRO: &str = "Macro belum punya langkah.";
@@ -95,7 +90,6 @@ mod strings {
     pub const SAVE_FAILED: &str = "Gagal menyimpan daftar macro";
 
     pub const PLAY_TITLE: &str = "Cara diputar";
-    pub const PLAY_DESC: &str = "Berlaku saat macro dipasang ke tombol";
     pub const MODE_ONCE: &str = "Sekali per tekan";
     pub const MODE_ONCE_DESC: &str = "Tekan sekali, jalan sekali";
     pub const MODE_TOGGLE: &str = "Nyala/mati";
@@ -106,7 +100,6 @@ mod strings {
     pub const MODE_HELD_FINISH_DESC: &str = "Setelah dilepas, selesaikan putaran dulu";
     pub const REPEAT: &str = "Jumlah ulang";
     pub const INTERVAL: &str = "Jeda antar ulangan";
-    pub const REPEAT_HINT: &str = "Berapa kali urutan dijalankan tiap tekan.";
 
     pub const TARGET: &str = "Dipasang di tombol";
     pub const TARGET_NONE: &str = "Belum dipilih";
@@ -114,23 +107,19 @@ mod strings {
     pub const CHANGE: &str = "Ganti";
     pub const PICK: &str = "Pilih tombol";
     pub const PICK_TITLE: &str = "Pilih tombol untuk macro";
-    pub const PICK_HINT: &str = "Klik tombol di keyboard. Macro dipasang di layer Base.";
     pub const PICK_CLOSE: &str = "Batal";
     pub const FN_BLOCKED: &str = "Tombol Fn tidak bisa diberi macro.";
     pub const CURRENT: &str = "Sekarang di tombol ini";
     pub const NO_BINDING: &str = "Belum ada macro";
     pub const BINDING_LOADING: &str = "Membaca…";
     pub const BINDING_FAILED: &str = "Gagal membaca macro di tombol ini";
-    pub const WARN_REPLACE: &str =
-        "Peringatan: memasang macro baru bisa menggantikan macro di tombol lain. Perilaku ini belum diuji di keyboard sungguhan.";
-    pub const WARN_SHORT: &str =
-        "Belum diuji di keyboard sungguhan: macro lain bisa tergantikan, dan arti jeda belum pasti.";
-    pub const WARN_DELAY: &str =
-        "Arti jeda (sebelum atau sesudah langkah) belum diuji di keyboard sungguhan.";
+    pub const WARN_REPLACE: &str = "Memasang macro bisa menggantikan macro di tombol lain.";
+    pub const WARN_SHORT: &str = "Belum diuji: macro lain bisa tergantikan, arti jeda belum pasti.";
+    pub const WARN_DELAY: &str = "Jeda mungkin berlaku sebelum langkah, bukan sesudahnya.";
 
     pub const BIND: &str = "Pasang ke tombol";
-    pub const REPLACES: &str = "Tombol ini punya fungsi lanjutan";
-    pub const REPLACES_TAIL: &str = "Memasang macro menghapus fungsi itu.";
+    pub const REPLACES: &str = "Fungsi";
+    pub const REPLACES_TAIL: &str = "di tombol ini akan dihapus.";
     pub const REPLACES_SOCD: &str = "Pasangan SOCD-nya ikut dilepas.";
     pub const CONFIRM_REPLACE: &str = "Ya, ganti dengan macro";
     pub const BINDING: &str = "Memasang…";
@@ -144,7 +133,6 @@ mod strings {
     pub const PARTIAL_WRITE: &str =
         "Keyboard terputus. Macro mungkin terpasang sebagian; isi tombol dibaca ulang saat tersambung.";
     pub const OFFLINE: &str = "Sambungkan keyboard untuk memasang macro.";
-    pub const READY: &str = "Pilih macro dan tombol, lalu pasang.";
 }
 
 // ------------------------------------------------------------ key mapping
@@ -732,10 +720,10 @@ pub fn replaced_function(snap: &DeviceSnapshot, key: u8) -> Option<Func> {
         .and_then(|s| Func::of_nibble(s.mode.advanced))
 }
 
-/// "Tombol ini punya fungsi lanjutan SOCD. Memasang macro ...".
+/// "Fungsi SOCD di tombol ini akan dihapus. ...".
 pub fn replace_warning(f: Func) -> String {
     let mut text = format!(
-        "{} {}. {}",
+        "{} {} {}",
         strings::REPLACES,
         f.label(),
         strings::REPLACES_TAIL
@@ -1538,7 +1526,6 @@ impl Page {
                     .color(color::DANGER),
                 );
             });
-            card::hint(ui, strings::RECORD_APPENDS);
         }
         if let Some(n) = &self.notice {
             ui.add_space(6.0);
@@ -1736,7 +1723,6 @@ impl Page {
                     ui.add_space(8.0);
                     card::hint(ui, strings::RECORD_TIMING);
                 }
-                card::hint(ui, strings::DELAY_HINT);
             });
     }
 
@@ -1769,7 +1755,6 @@ impl Page {
                 .color(color::TEXT)
                 .strong(),
         );
-        card::hint(ui, strings::PLAY_DESC);
         ui.add_space(10.0);
 
         let editable = !self.recording();
@@ -1815,7 +1800,6 @@ impl Page {
                     );
                 });
             });
-            card::hint(ui, strings::REPEAT_HINT);
             if m != original {
                 self.store(ctx, m);
             }
@@ -1979,13 +1963,13 @@ impl Page {
                 );
             } else {
                 let text = if !ctx.connected() {
-                    strings::OFFLINE
-                } else if let Some(p) = problem {
-                    p
+                    Some(strings::OFFLINE)
                 } else {
-                    strings::READY
+                    problem
                 };
-                ui.label(RichText::new(text).font(font::small()).color(color::MUTED));
+                if let Some(text) = text {
+                    ui.label(RichText::new(text).font(font::small()).color(color::MUTED));
+                }
             }
         });
     }
@@ -2014,8 +1998,6 @@ impl Page {
             )
             .show(ui.ctx(), |ui| {
                 ui.set_width(820.0);
-                card::hint(ui, strings::PICK_HINT);
-                ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
                     KeyboardView::new(snap.model, &snap.matrix)
                         .skin(ctx.skin())

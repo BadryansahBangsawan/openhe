@@ -554,18 +554,16 @@ impl AutoSwitcher {
 mod strings {
     pub const KEYBOARD: &str = "Keyboard";
     pub const POLLING: &str = "Polling rate";
-    pub const POLLING_HINT: &str = "Makin tinggi makin responsif, tapi makin berat untuk CPU";
     pub const POLLING_RESTART: &str = "Keyboard tersambung ulang sebentar setelah diganti.";
     pub const SYSTEM: &str = "Mode sistem";
-    pub const SYSTEM_HINT: &str = "Menukar posisi Win/Alt dan tombol media sesuai OS";
+    pub const SYSTEM_HINT: &str = "Menukar Win/Alt dan tombol media";
     pub const WIN_LINUX: &str = "Windows / Linux";
     pub const MACOS: &str = "macOS";
     pub const PROFILES: &str = "Profil di keyboard";
     pub const PROFILE: &str = "Profil";
     pub const ACTIVE: &str = "aktif";
     pub const UNNAMED: &str = "Tanpa nama";
-    pub const NAME_HINT: &str =
-        "Nama disimpan di komputer ini. Klik kartu untuk mengaktifkan profil.";
+    pub const NAME_HINT: &str = "Klik kartu untuk mengaktifkan profil.";
     pub const IMPORT: &str = "Impor…";
     pub const EXPORT: &str = "Ekspor…";
     pub const EXPORTING: &str = "Membaca profil dari keyboard…";
@@ -581,12 +579,12 @@ mod strings {
     pub const IMPORT_LIGHT: &str = "lampu";
     pub const IMPORT_OVERWRITE: &str = "Pengaturan profil ini di keyboard akan ditimpa.";
     pub const IMPORT_CHANGED: &str =
-        "Keyboard berubah sejak file dibaca, jadi rencana impor dibuat ulang. Periksa lagi, lalu tekan Terapkan.";
+        "Keyboard berubah sejak file dibaca; rencana sudah diperbarui.";
     pub const IMPORT_MACROS: &str = "Isi macro tidak ikut diimpor; tombol macro dilewati:";
     pub const IMPORT_APPLY: &str = "Terapkan";
     pub const CANCEL: &str = "Batal";
     pub const IMPORTING: &str = "Mengimpor ke keyboard…";
-    pub const IMPORTED: &str = "Profil diimpor dan dibaca ulang dari keyboard.";
+    pub const IMPORTED: &str = "Profil diimpor.";
     pub const IMPORT_PARTIAL: &str = "Sebagian impor gagal; nilai sudah dibaca ulang:";
     pub const IMPORT_DISCONNECTED: &str =
         "Keyboard terputus saat impor. Sebagian pengaturan mungkin sudah tertulis; nilai dibaca ulang saat tersambung.";
@@ -603,20 +601,18 @@ mod strings {
     pub const FILE_BAD_VALUE: &str = "File berisi nilai yang tidak valid.";
     pub const FILE_TRANSPARENT_BASE: &str = "File memberi kode 0x0001 di layer Base untuk tombol";
     pub const FILE_TRANSPARENT_BASE_TAIL: &str =
-        "— kode itu \"Ikut Base\" (transparan), bukan Fn, dan di Base membuat tombol mati. Profil tidak diimpor.";
+        "(transparan), yang membuat tombol mati. Profil tidak diimpor.";
 
     pub const APP: &str = "Aplikasi";
     pub const AUTO: &str = "Ganti profil otomatis per aplikasi";
-    pub const AUTO_HINT: &str = "Contoh: buka Valorant → Profil 2. Butuh OpenHE tetap berjalan.";
+    pub const AUTO_HINT: &str = "Hanya selama OpenHE berjalan.";
     pub const AUTO_FRONT: &str = "Aplikasi di depan:";
     pub const AUTO_NONE: &str = "belum terbaca";
     pub const AUTO_ADD: &str = "Tambah";
     pub const AUTO_APP_HINT: &str = "Nama aplikasi";
     pub const AUTO_REMOVE: &str = "Hapus";
-    pub const AUTO_NO_RULES: &str = "Belum ada aturan. Tambahkan aplikasi dan profilnya.";
+    pub const AUTO_NO_RULES: &str = "Belum ada aturan.";
     pub const AUTO_FAILED: &str = "Pemantau aplikasi tidak bisa dijalankan.";
-    pub const AUTO_SESSION: &str =
-        "Aturan dan sakelar ini disimpan di komputer ini. Pergantian hanya terjadi selama OpenHE berjalan.";
     pub const LOGIN: &str = "Jalankan saat komputer menyala";
     pub const LOGIN_FAILED: &str = "Pengaturan jalan otomatis gagal diubah.";
     pub const LANGUAGE: &str = "Bahasa";
@@ -633,8 +629,7 @@ mod strings {
     pub const FIRMWARE: &str = "Firmware";
     pub const SERIAL: &str = "Nomor seri";
     pub const USB: &str = "USB";
-    pub const FIRMWARE_NOTE: &str =
-        "Update firmware tidak tersedia di OpenHE. Gunakan updater resmi Aula di Windows.";
+    pub const FIRMWARE_NOTE: &str = "Update firmware: pakai updater resmi Aula di Windows.";
     pub const RESET: &str = "Reset pabrik";
     pub const RESET_BODY: &str =
         "Menghapus semua profil, remap, macro, dan lampu di keyboard. Tidak bisa dibatalkan.";
@@ -646,7 +641,7 @@ mod strings {
     pub const RESTARTING: &str = "Keyboard memulai ulang — membaca ulang…";
     pub const POLLING_DONE: &str = "Polling rate sekarang";
     pub const POLLING_MISMATCH: &str = "Keyboard tersambung lagi, tapi melaporkan";
-    pub const RESET_DONE: &str = "Keyboard sudah direset ke bawaan pabrik dan dibaca ulang.";
+    pub const RESET_DONE: &str = "Keyboard sudah direset ke bawaan pabrik.";
     pub const PROFILE_DONE: &str = "Keyboard tersambung lagi dengan Profil";
     pub const PROFILE_MISMATCH: &str = "Keyboard tersambung lagi, tapi melaporkan Profil";
     pub const NOT_BACK: &str = "Keyboard belum tersambung lagi. Cabut lalu colokkan kembali.";
@@ -1165,7 +1160,7 @@ impl Page {
         let can = self.can_write(ctx);
         section_card(ui, t::KEYBOARD, |ui| {
             // Polling rate.
-            setting_row(ui, t::POLLING, Some(t::POLLING_HINT), true, |ui| {
+            setting_row(ui, t::POLLING, None, true, |ui| {
                 let rates = [
                     (PollingRate::Hz125, "125"),
                     (PollingRate::Hz250, "250"),
@@ -1776,7 +1771,6 @@ impl Page {
                         changed = true;
                     }
                 });
-                card::hint(ui, t::AUTO_SESSION);
             });
         if changed || typed {
             self.auto

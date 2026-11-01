@@ -157,7 +157,11 @@ fn macro_key_shows_macro_hint_and_can_be_replaced() {
     w.page("Tombol Lanjutan");
     w.click_key(G, false);
     w.frames(3);
-    assert!(w.has_text("Macro"), "{:?}", w.labels());
+    assert!(
+        w.has_text("Terhubung ke macro; fungsi baru akan menggantikannya."),
+        "{:?}",
+        w.labels()
+    );
     w.click("END");
     w.pick_code("Kosong", 0, "esc", "ESC");
     w.apply("Terapkan");

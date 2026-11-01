@@ -39,49 +39,39 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod strings {
     pub const LAYER: &str = "Layer";
-    pub const HINT_BASE: &str = "Layer utama · tombol Fn terkunci";
-    pub const HINT_FN: &str = "Aktif saat tombol Fn-nya ditahan · Ikut Base = sama seperti di Base";
     pub const RESET: &str = "Kembalikan ke bawaan";
-    pub const RESET_UNKNOWN_FN: &str =
-        "Isi bawaan layer Fn keyboard ini belum dikenal OpenHE; hanya layer Base yang bisa dikembalikan.";
+    pub const RESET_UNKNOWN_FN: &str = "Isi bawaan layer Fn keyboard ini belum dikenal.";
     pub const RESET_CONFIRM_BASE: &str =
-        "Semua tombol di layer Base kembali ke fungsi bawaannya (tombol Fn, Win dan Alt dilewati; Win dan Alt bertukar menurut mode Win/Mac). Perubahan Base yang belum diterapkan dibuang.";
+        "Semua tombol Base kembali ke bawaan (kecuali Fn, Win dan Alt); perubahan Base yang belum diterapkan dibuang.";
     pub const RESET_CONFIRM_FN: &str =
-        "Semua tombol di layer ini kembali ke isi bawaan pabrik. Perubahan layer ini yang belum diterapkan dibuang.";
+        "Semua tombol di layer ini kembali ke bawaan pabrik; perubahan layer ini yang belum diterapkan dibuang.";
     pub const FOLLOW_BASE: &str = "Ikut Base";
     pub const FOLLOW_BASE_PICK: &str = "Ikut Base (transparan)";
     pub const TRANSPARENT_ON_BASE: &str = "Kode 0x0001 — bukan Fn; ganti ke Fn1 (tahan)";
     pub const TRANSPARENT_ON_BASE_SHORT: &str = "0x0001 !";
     pub const ONLY_FN2: &str =
-        "Tombol ini satu-satunya Fn2 (tahan) di layer Fn1. Kalau diganti, layer Fn2 tidak bisa dibuka lagi.";
+        "Tombol ini satu-satunya Fn2 (tahan); jika diganti, layer Fn2 tidak bisa dibuka lagi.";
     pub const LOSES_FN2: &str =
-        "Perubahan ini menghapus Fn2 (tahan) terakhir di layer Fn1: layer Fn2 tidak bisa dibuka lagi. Pasang Fn2 (tahan) di tombol lain dulu, atau batalkan.";
+        "Perubahan ini menghapus Fn2 (tahan) terakhir: layer Fn2 tidak bisa dibuka lagi. Pasang Fn2 (tahan) di tombol lain dulu.";
     pub const RESET_YES: &str = "Ya, kembalikan";
     pub const CANCEL: &str = "Batal";
 
     pub const SEARCH: &str = "Cari tombol…";
     pub const NO_MATCH: &str = "Tidak ada tombol yang cocok.";
-    pub const PICK_HINT: &str = "Pilih tombol di keyboard, lalu klik fungsi pengganti di sini.";
-    pub const PICK_DISABLED: &str = "Menunggu keyboard…";
     pub const EMPTY: &str = "Kosong";
 
     pub const NOTHING_SELECTED: &str = "Pilih tombol";
-    pub const NOTHING_SELECTED_BODY: &str =
-        "Klik tombol di keyboard, lalu pilih fungsi penggantinya di bawah. Seret untuk memilih beberapa.";
+    pub const NOTHING_SELECTED_BODY: &str = "Seret untuk memilih beberapa tombol.";
     pub const KEY_PREFIX: &str = "Tombol";
     pub const LAYER_WORD: &str = "layer";
-    pub const NOW_SENDS: &str = "sekarang mengirim";
     pub const ORIGINAL: &str = "Sekarang";
     pub const DEFAULT_IS: &str = "Bawaan";
-    pub const FN_PLUS: &str = "Fn +";
-    pub const KEYS_SELECTED: &str = "tombol dipilih";
     pub const UNREAD: &str = "…";
     pub const UNKNOWN_CODE: &str = "Kode";
-    pub const RESET_NOTHING: &str = "Semua tombol di layer ini sudah memakai fungsi bawaan.";
+    pub const RESET_NOTHING: &str = "Layer ini sudah bawaan.";
     pub const NEW: &str = "Baru";
     pub const UNCHANGED: &str = "—";
-    pub const LOCKED: &str =
-        "Tombol Fn di layer Base terkunci, supaya keyboard selalu punya tombol Fn. Di layer Fn tombol ini boleh diubah.";
+    pub const LOCKED: &str = "Tombol Fn terkunci di layer Base agar keyboard selalu punya Fn.";
     pub const LOCKED_BADGE: &str = "Kunci";
     pub const FN_SKIPPED: &str = "Tombol Fn (Base) dilewati.";
 
@@ -93,7 +83,6 @@ mod strings {
     pub const APPLYING: &str = "Menerapkan…";
     pub const APPLIED: &str = "Tersimpan di keyboard";
     pub const SAVED_IN_PROFILE: &str = "Disimpan di profil";
-    pub const WORKS_WITHOUT_APP: &str = "tetap aktif tanpa app";
     pub const APPLY_FAILED: &str = "Gagal menerapkan";
     pub const RELOADED_HINT: &str = "Isi layer dibaca ulang dari keyboard.";
     pub const PARTIAL_WRITE: &str =
@@ -1285,12 +1274,6 @@ impl Page {
             }
         };
 
-        let hint = if self.layer == Layer::Base {
-            t::HINT_BASE
-        } else {
-            t::HINT_FN
-        };
-        let mut hint_inline = true;
         ui.horizontal(|ui| {
             ui.set_min_height(40.0);
             ui.label(RichText::new(t::LAYER).color(color::MUTED));
@@ -1300,18 +1283,6 @@ impl Page {
                 .show(ui, &mut self.layer);
             if self.layer != old {
                 self.confirm_reset = false;
-            }
-            // The hint goes beside the layers only when it fits left of the
-            // reset button, else on its own row below (never under it).
-            let measure = |text: &str, f: egui::FontId| {
-                ui.fonts(|fo| fo.layout_no_wrap(text.to_string(), f, color::TEXT).size().x)
-            };
-            let button_w = measure(t::RESET, font::body()) + 2.0 * ui.spacing().button_padding.x;
-            hint_inline =
-                measure(hint, font::small()) + button_w + 3.0 * ui.spacing().item_spacing.x
-                    <= ui.available_width();
-            if hint_inline {
-                ui.label(RichText::new(hint).font(font::small()).color(color::MUTED));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let supported = reset_supported(model, self.layer);
@@ -1330,13 +1301,6 @@ impl Page {
                 }
             });
         });
-        if !hint_inline {
-            ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(RichText::new(hint).font(font::small()).color(color::MUTED))
-                    .wrap(),
-            );
-        }
         if self.confirm_reset {
             ui.add_space(8.0);
             Card::new()
@@ -1433,15 +1397,6 @@ impl Page {
                 editable && selectable,
                 h,
             );
-            ui.add_space(8.0);
-            card::hint(
-                ui,
-                if connected {
-                    t::PICK_HINT
-                } else {
-                    t::PICK_DISABLED
-                },
-            );
         });
         if let Some(code) = picked {
             self.pick(ctx, code);
@@ -1504,25 +1459,20 @@ impl Page {
             .strong(),
         );
         let first = keys[0];
-        if keys.len() == 1 {
-            let now = match code_of(&self.codes, layer, first) {
-                Some(c) => layer_code_name(layer, c),
-                None => t::UNREAD.to_string(),
-            };
-            let who = if layer == Layer::Base {
-                keycodes::legend(first).to_string()
-            } else {
-                format!("{} {}", t::FN_PLUS, keycodes::legend(first))
-            };
-            card::hint(ui, format!("{who} {} {now}", t::NOW_SENDS));
+        let single = keys.len() == 1;
+        if single && layer == Layer::Base && code_of(&self.codes, layer, first) == Some(TRANSPARENT)
+        {
+            ui.label(
+                RichText::new(t::TRANSPARENT_ON_BASE)
+                    .font(font::small())
+                    .color(color::ACCENT),
+            );
+        }
+        if single && !is_locked(layer, first) {
             let model = ctx.snapshot.map_or(Model::Win68HeMax, |s| s.model);
             if let Some(factory) = factory_code(model, layer, first) {
-                if !is_locked(layer, first) {
-                    card::hint(ui, format!("{}: {}", t::DEFAULT_IS, code_name(factory)));
-                }
+                card::hint(ui, format!("{}: {}", t::DEFAULT_IS, code_name(factory)));
             }
-        } else {
-            card::hint(ui, format!("{} {}", keys.len(), t::KEYS_SELECTED));
         }
         if layer == Layer::Fn1 {
             if let Some(fn1) = self.codes.get(&(Layer::Fn1 as u8)) {
@@ -1690,14 +1640,9 @@ impl Page {
                 );
             } else if let Some(s) = ctx.snapshot {
                 ui.label(
-                    RichText::new(format!(
-                        "{} {} · {}",
-                        t::SAVED_IN_PROFILE,
-                        s.profile + 1,
-                        t::WORKS_WITHOUT_APP
-                    ))
-                    .font(font::small())
-                    .color(color::MUTED),
+                    RichText::new(format!("{} {}", t::SAVED_IN_PROFILE, s.profile + 1))
+                        .font(font::small())
+                        .color(color::MUTED),
                 );
             }
         });

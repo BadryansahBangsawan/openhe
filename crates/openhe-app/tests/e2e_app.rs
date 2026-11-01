@@ -5,6 +5,7 @@
 mod support;
 use eframe::egui::accesskit::Role;
 use eframe::App as _;
+use egui_kittest::kittest::Queryable as _;
 use openhe_app::storage::AppData;
 use support::*;
 
@@ -23,14 +24,19 @@ fn long_profile_names_never_run_into_the_top_bar_title() {
     ]
     .map(String::from);
     let mut w = World::with(Sim::new(), data, fast_config());
-    w.page("Macro");
+    w.page("Tombol Lanjutan");
     w.h.set_size(eframe::egui::vec2(1280.0, 800.0));
     w.frames(5);
-    let subtitle = w.rect("Rekam urutan tombol, pasang ke tombol mana saja");
+    // The rightmost "Tombol Lanjutan" is the top-bar title (the other is
+    // the sidebar entry).
+    let title =
+        w.h.query_all_by_label("Tombol Lanjutan")
+            .map(|n| n.rect().right())
+            .fold(f32::MIN, f32::max);
     let profil = w.rect("Profil");
     assert!(
-        subtitle.right() <= profil.left(),
-        "subtitle {subtitle:?} runs under the profile switch at {profil:?}"
+        title <= profil.left(),
+        "title ends at {title} under the profile switch at {profil:?}"
     );
     // A shortened name keeps its number to click.
     assert!(w.has_text("1 · Kerja"), "{:?}", w.labels());
@@ -87,7 +93,13 @@ fn a_change_on_one_page_shows_on_the_others() {
     w.page("Remap");
     w.idle();
     w.click_key(0x39, false);
-    assert!(w.has_text("Caps sekarang mengirim ESC"), "{:?}", w.labels());
+    // The "Sekarang" tile shows ESC next to the picker's ESC chip (it shows
+    // "…" while the code is unread).
+    assert!(
+        w.has("Sekarang") && w.h_count("ESC") >= 2,
+        "{:?}",
+        w.labels()
+    );
 }
 
 #[test]

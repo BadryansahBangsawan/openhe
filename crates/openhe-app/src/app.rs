@@ -189,20 +189,6 @@ impl PageId {
             PageId::Settings => SETTINGS,
         }
     }
-
-    pub fn subtitle(self) -> &'static str {
-        use i18n::subtitle::*;
-        match self {
-            PageId::Performance => PERFORMANCE,
-            PageId::Advanced => ADVANCED,
-            PageId::Remap => REMAP,
-            PageId::Macros => MACROS,
-            PageId::Lighting => LIGHTING,
-            PageId::Calibration => CALIBRATION,
-            PageId::Templates => TEMPLATES,
-            PageId::Settings => SETTINGS,
-        }
-    }
 }
 
 pub struct OpenHeApp {
@@ -1096,7 +1082,7 @@ fn topbar(
             }
             ui.label(RichText::new(i18n::topbar::PROFILE).color(color::MUTED));
             ui.add_space(16.0);
-            // The title, then the subtitle cut to the room that is left.
+            // The title, cut to the room that is left.
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.add(
                     egui::Label::new(
@@ -1105,11 +1091,7 @@ fn topbar(
                             .color(color::TEXT)
                             .strong(),
                     )
-                    .extend(),
-                );
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(RichText::new(page.subtitle()).color(color::MUTED)).truncate(),
+                    .truncate(),
                 );
             });
         });
