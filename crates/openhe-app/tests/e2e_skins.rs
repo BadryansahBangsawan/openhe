@@ -22,7 +22,6 @@ fn dialog_asks_once_and_stores_the_choice() {
     let mut w = World::first_connect(AppData::default());
     w.frames(3);
     assert!(w.has_text(TITLE), "{:?}", w.labels());
-    assert!(w.has_text("WIN 68 HE MAX TERSAMBUNG"));
     // Abu Kuning is offered first; pick Hitam Merah instead.
     assert!(w.selected("Abu Kuning"));
     w.click("Hitam Merah");

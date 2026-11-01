@@ -3067,7 +3067,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openhe-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "active-win-pos-rs",
  "auto-launch",
@@ -3089,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "openhe-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "openhe-device",
@@ -3100,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "openhe-device"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hidapi",
  "openhe-proto",
@@ -3109,7 +3109,7 @@ dependencies = [
 
 [[package]]
 name = "openhe-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror 1.0.69",
 ]

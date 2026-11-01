@@ -40,10 +40,6 @@ mod strings {
     pub const TAB_KEYS: &str = "Warna per tombol";
     pub const LIGHT_ON: &str = "Lampu menyala";
 
-    pub const EFFECTS_TITLE: &str = "Efek";
-    pub const EFFECTS_HINT: &str = "Pratinjau di layar; kirim dengan Terapkan ke keyboard";
-    pub const EFFECTS_NOTE: &str =
-        "Nama efek diterjemahkan dari daftar bawaan firmware (20 efek + statis + kustom).";
     pub const STATIC: &str = "Statis";
     pub const CUSTOM: &str = "Kustom";
 
@@ -72,23 +68,17 @@ mod strings {
         (20, "Riak air"),          // Water Ripple
     ];
 
-    pub const DESC_STATIC: &str = "Semua tombol menyala dengan satu warna tetap.";
-    pub const DESC_EFFECT: &str = "Efek bergerak di seluruh keyboard.";
-    pub const DESC_CUSTOM: &str = "Memakai warna tiap tombol dari tab Warna per tombol.";
-
     pub const COLOR: &str = "Warna";
     pub const COLOR_RAINBOW: &str = "Pelangi";
     pub const COLOR_ONE: &str = "Satu warna";
-    pub const COLOR_CUSTOM_HINT: &str = "Efek Kustom tidak memakai palet; warna diatur per tombol.";
-    pub const PALETTE_HINT: &str = "Tujuh warna palet disimpan di keyboard.";
+    pub const COLOR_CUSTOM_HINT: &str = "Diatur di tab Warna per tombol.";
     pub const HEX: &str = "Hex";
     pub const BRIGHTNESS: &str = "Kecerahan";
     pub const SPEED: &str = "Kecepatan";
-    pub const SPEED_OFF_HINT: &str = "Efek statis dan kustom tidak punya kecepatan.";
+    pub const SPEED_OFF_HINT: &str = "Kecepatan dan arah hanya untuk efek bergerak.";
     pub const DIRECTION: &str = "Arah";
     pub const DIRECTION_FWD: &str = "→";
     pub const DIRECTION_REV: &str = "←";
-    pub const DIRECTION_HINT: &str = "Hanya berlaku untuk efek bergerak.";
     pub const SLEEP: &str = "Mati otomatis";
     pub const SLEEP_NEVER: &str = "Tidak pernah";
     pub const SLEEP_MIN: &str = "menit";
@@ -100,20 +90,18 @@ mod strings {
     pub const NO_CHANGES: &str = "Belum ada perubahan";
     pub const UNSENT: &str = "Perubahan belum dikirim ke keyboard";
     pub const APPLY_FAILED: &str = "Gagal menerapkan lampu";
-    pub const RELOADED_HINT: &str = "Nilai di layar sudah dibaca ulang dari keyboard.";
+    pub const RELOADED_HINT: &str = "Nilai dibaca ulang dari keyboard.";
     pub const PARTIAL_WRITE: &str =
         "Keyboard terputus. Sebagian perubahan mungkin sudah terkirim; nilai dibaca ulang saat tersambung.";
     pub const LOADING: &str = "Membaca pengaturan lampu…";
     pub const LOAD_FAILED: &str = "Gagal membaca pengaturan lampu";
     pub const OFFLINE: &str = "Sambungkan keyboard untuk mengatur lampu.";
     pub const EXTERNAL_CHANGE: &str =
-        "Lampu diubah dari keyboard. Muat ulang untuk melihatnya (perubahan di layar dibuang), atau abaikan untuk tetap memakai perubahan di layar.";
+        "Lampu diubah dari keyboard. Muat ulang membuang perubahan di layar.";
     pub const IGNORE: &str = "Abaikan";
-    pub const UNVERIFIED: &str =
-        "Pengaturan lampu belum diuji di keyboard sungguhan. Jika hasilnya berbeda, nilai dibaca ulang.";
+    pub const UNVERIFIED: &str = "Belum diuji di keyboard sungguhan; hasil bisa berbeda.";
 
     pub const KEYS_PAINT: &str = "Warna kuas";
-    pub const KEYS_PAINT_DESC: &str = "Pilih tombol di keyboard lalu cat dengan warna ini.";
     pub const KEYS_PALETTE: &str = "Palet";
     pub const KEYS_PAINT_SELECTED: &str = "Cat tombol terpilih";
     pub const KEYS_PAINT_ALL: &str = "Cat semua tombol";
@@ -122,9 +110,8 @@ mod strings {
     pub const KEYS_CLEAR: &str = "Hapus pilihan";
     pub const KEYS_SELECTED: &str = "tombol dipilih";
     pub const KEYS_CHANGED: &str = "tombol berubah";
-    pub const KEYS_HINT: &str = "Klik atau seret untuk memilih tombol. Shift+klik menambah.";
-    pub const KEYS_MODE_HINT: &str =
-        "Warna per tombol hanya terlihat saat efek Kustom aktif di tab Efek.";
+    pub const KEYS_HINT: &str = "Klik atau seret untuk memilih; Shift+klik menambah.";
+    pub const KEYS_MODE_HINT: &str = "Hanya terlihat saat efek Kustom aktif.";
     pub const KEYS_USE_CUSTOM: &str = "Pilih efek Kustom";
     pub const KEYS_LOADING: &str = "Membaca warna tombol…";
     pub const KEYS_LOAD_FAILED: &str = "Gagal membaca warna tombol";
@@ -1109,20 +1096,6 @@ impl Page {
     fn effects_card(&mut self, ui: &mut Ui, editable: bool) {
         Card::new().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                card::title(
-                    ui,
-                    format!("{} · {}", strings::EFFECTS_TITLE, 2 + EFFECTS.len()),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(strings::EFFECTS_HINT)
-                            .font(font::small())
-                            .color(color::MUTED),
-                    );
-                });
-            });
-            ui.add_space(12.0);
             let mut modes: Vec<u8> = vec![MODE_STATIC];
             modes.extend(EFFECTS.iter().map(|(m, _)| *m));
             modes.push(MODE_CUSTOM);
@@ -1140,8 +1113,6 @@ impl Page {
                     }
                 });
             }
-            ui.add_space(8.0);
-            card::hint(ui, strings::EFFECTS_NOTE);
         });
     }
 
@@ -1230,12 +1201,6 @@ impl Page {
                 .color(color::TEXT)
                 .strong(),
         );
-        let desc = match self.form.mode {
-            MODE_STATIC => strings::DESC_STATIC,
-            MODE_CUSTOM => strings::DESC_CUSTOM,
-            _ => strings::DESC_EFFECT,
-        };
-        card::hint(ui, desc);
         if self.loading.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -1289,9 +1254,6 @@ impl Page {
         let speed_ok = editable && self.form.has_speed();
         value_header(ui, strings::SPEED, &format!("{} / 5", self.form.speed));
         changed |= level_slider(ui, &mut self.form.speed, speed_ok);
-        if !self.form.has_speed() {
-            card::hint(ui, strings::SPEED_OFF_HINT);
-        }
         ui.add_space(8.0);
 
         // ---- direction and sleep
@@ -1324,7 +1286,7 @@ impl Page {
             changed |= before != self.form.sleep_minutes;
         });
         if !self.form.has_speed() {
-            card::hint(ui, strings::DIRECTION_HINT);
+            card::hint(ui, strings::SPEED_OFF_HINT);
         }
         if changed {
             self.applied = false;
@@ -1387,7 +1349,6 @@ impl Page {
         ) {
             self.applied = false;
         }
-        card::hint(ui, strings::PALETTE_HINT);
     }
 
     fn paint_settings(&mut self, ctx: &AppCtx, ui: &mut Ui) {
@@ -1398,7 +1359,6 @@ impl Page {
                 .color(color::TEXT)
                 .strong(),
         );
-        card::hint(ui, strings::KEYS_PAINT_DESC);
         ui.add_space(12.0);
 
         card::section(ui, strings::KEYS_PALETTE);

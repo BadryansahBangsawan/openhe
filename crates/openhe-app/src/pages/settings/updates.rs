@@ -7,7 +7,7 @@
 use super::{section_card, setting_row, Page};
 use crate::app::AppCtx;
 use crate::i18n::update as t;
-use crate::theme::{color, font};
+use crate::theme::color;
 use crate::update::install::{self, Unsupported};
 use crate::update::updater::{Event, Offer};
 use crate::update::{self, Phase, UpdateEnv, Updater};
@@ -129,7 +129,7 @@ impl Page {
             });
             self.update_status(ctx, ui);
 
-            setting_row(ui, t::AUTO, Some(t::AUTO_HINT), true, |ui| {
+            setting_row(ui, t::AUTO, None, true, |ui| {
                 let mut on = prefs.auto_check;
                 if toggle(ui, &mut on, true).changed() {
                     ctx.data.borrow_mut().update.auto_check = on;
@@ -146,9 +146,8 @@ impl Page {
             if ui.link(t::RELEASES_LINK).clicked() {
                 self.open_link(update::RELEASES_PAGE);
             }
-            ui.add_space(4.0);
-            card::hint(ui, t::NETWORK_NOTE);
             if let Some(e) = &self.link_error {
+                ui.add_space(4.0);
                 card::hint(ui, e);
             }
         });
@@ -207,11 +206,6 @@ impl Page {
                         .strong(),
                 );
                 ui.add_space(6.0);
-                ui.label(
-                    RichText::new(t::NOTES)
-                        .font(font::small())
-                        .color(color::MUTED),
-                );
                 egui::ScrollArea::vertical()
                     .id_salt("update-notes")
                     .max_height(160.0)

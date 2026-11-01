@@ -691,11 +691,7 @@ impl Page {
             ui.set_min_size(egui::vec2(ui.available_width(), h - 42.0));
             card::title(ui, t::LEGEND);
             ui.add_space(6.0);
-            legend_row(
-                ui,
-                Swatch::Selected,
-                &format!("{} · {} tombol", t::LEGEND_SELECTED, self.selection.len()),
-            );
+            legend_row(ui, Swatch::Selected, t::LEGEND_SELECTED);
             legend_row(ui, Swatch::Plain, t::LEGEND_VALUE);
             legend_row(ui, Swatch::Changed, t::LEGEND_CHANGED);
             legend_row(ui, Swatch::Rt, t::LEGEND_RT);
@@ -738,34 +734,40 @@ impl Page {
                 Some(c) => format!("{} · {}", t::TRAVEL, openhe_proto::keycodes::legend(c)),
                 None => t::TRAVEL.to_string(),
             };
+            // Live view only: which key to press.
             let hint = match (live, codes.first()) {
-                (false, _) => live_strings::SWITCH_TO_LIVE.to_string(),
-                (true, Some(&c)) if codes.len() == 1 => format!(
-                    "{} {} {}",
+                (false, _) => None,
+                (true, Some(&c)) if codes.len() == 1 => Some(format!(
+                    "{} {}",
                     live_strings::PRESS,
-                    openhe_proto::keycodes::legend(c),
-                    live_strings::TO_SEE_LIVE
-                ),
-                (true, _) => live_strings::PRESS_ANY.to_string(),
+                    openhe_proto::keycodes::legend(c)
+                )),
+                (true, _) => Some(live_strings::PRESS_ANY.to_string()),
             };
             // The hint sits right of the title when both fit on one row,
             // else on its own (wrapped) row below it: never on top.
             let width = |text: &str, f: egui::FontId| {
                 ui.fonts(|fo| fo.layout_no_wrap(text.to_string(), f, color::TEXT).size().x)
             };
-            let one_row = width(&title, font::heading()) + 24.0 + width(&hint, font::small())
-                <= ui.available_width();
-            let hint_text = RichText::new(hint).font(font::small()).color(color::MUTED);
-            if one_row {
-                ui.horizontal(|ui| {
-                    card::title(ui, title);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(hint_text);
-                    });
-                });
-            } else {
-                card::title(ui, title);
-                ui.add(egui::Label::new(hint_text).wrap());
+            match hint {
+                None => card::title(ui, title),
+                Some(hint) => {
+                    let one_row =
+                        width(&title, font::heading()) + 24.0 + width(&hint, font::small())
+                            <= ui.available_width();
+                    let hint_text = RichText::new(hint).font(font::small()).color(color::MUTED);
+                    if one_row {
+                        ui.horizontal(|ui| {
+                            card::title(ui, title);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(hint_text);
+                            });
+                        });
+                    } else {
+                        card::title(ui, title);
+                        ui.add(egui::Label::new(hint_text).wrap());
+                    }
+                }
             }
             ui.add_space(12.0);
             if let (true, Some((msg, tech))) = (live, &self.live.error) {
@@ -792,7 +794,7 @@ impl Page {
                     let max = max_travel(s, &codes, &self.form, &self.touched);
                     paint_travel(ui, &self.form, max, None);
                 }
-                _ => card::hint(ui, t::NOTHING_SELECTED_BODY),
+                _ => card::hint(ui, t::NOTHING_SELECTED),
             }
         });
         if retry {
@@ -832,14 +834,6 @@ impl Page {
                     .color(color::TEXT)
                     .strong(),
             );
-            card::hint(
-                ui,
-                if ctx.connected() {
-                    t::NOTHING_SELECTED_BODY
-                } else {
-                    i18n::common::WAITING_DEVICE_BODY
-                },
-            );
             return;
         };
         let editable = ctx.can_write() && self.pending.is_none();
@@ -857,15 +851,9 @@ impl Page {
                 .strong(),
         );
         ui.label(
-            RichText::new(format!(
-                "{} {} · {} {}",
-                codes.len(),
-                t::KEYS_SELECTED,
-                t::SWITCH_PREFIX,
-                switch_name
-            ))
-            .font(font::small())
-            .color(color::MUTED),
+            RichText::new(format!("{} {}", codes.len(), t::KEYS_SELECTED))
+                .font(font::small())
+                .color(color::MUTED),
         );
         if self.form.mixed {
             card::hint(ui, t::MIXED_VALUES);
@@ -928,12 +916,6 @@ impl Page {
         if self.form.rt_mode {
             Card::new().padding(16).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(t::RAPID_TRIGGER)
-                        .color(color::ACCENT)
-                        .strong(),
-                );
-                ui.add_space(6.0);
                 let mut changed = false;
                 value_header(ui, t::RT_PRESS, |ui| {
                     changed |= mm_value_box(ui, &mut self.form.rt_press, MIN_RT_UM..=max, editable)
@@ -1015,7 +997,6 @@ impl Page {
                     }
                 });
         });
-        card::hint(ui, t::SWITCH_HINT);
     }
 
     /// After the user picks a switch with less travel, the form's values
@@ -1088,14 +1069,9 @@ impl Page {
                 );
             } else if let Some(s) = ctx.snapshot {
                 ui.label(
-                    RichText::new(format!(
-                        "{} {} · {}",
-                        t::SAVED_IN_PROFILE,
-                        s.profile + 1,
-                        t::WORKS_WITHOUT_APP
-                    ))
-                    .font(font::small())
-                    .color(color::MUTED),
+                    RichText::new(format!("{} {}", t::SAVED_IN_PROFILE, s.profile + 1))
+                        .font(font::small())
+                        .color(color::MUTED),
                 );
             }
         });
@@ -1379,9 +1355,7 @@ fn paint_travel(ui: &mut Ui, form: &Form, max: u16, depth: Option<u16>) {
 mod live_strings {
     pub const FAILED: &str = "Kedalaman live tidak terbaca";
     pub const PRESS: &str = "Tekan tombol";
-    pub const TO_SEE_LIVE: &str = "untuk melihat secara live";
-    pub const PRESS_ANY: &str = "Tekan tombol mana saja untuk melihat kedalamannya";
-    pub const SWITCH_TO_LIVE: &str = "Pilih \"Kedalaman live\" untuk melihat gerak tombol";
+    pub const PRESS_ANY: &str = "Tekan tombol mana saja";
     pub const FRAME_HINT: &str = "Data jarak tekan dari keyboard tidak dikenali.";
 }
 

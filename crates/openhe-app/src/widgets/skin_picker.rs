@@ -25,22 +25,16 @@ pub mod strings {
     pub const GELAP: &str = "Gelap";
     pub const CUSTOM: &str = "Kustom…";
 
-    pub const CONNECTED: &str = "TERSAMBUNG";
     pub const DIALOG_TITLE: &str = "Warna keyboard kamu yang mana?";
-    pub const DIALOG_BODY: &str = "Keyboard tidak memberi tahu warnanya, jadi pilih sekali saja. Tampilan keyboard di app akan mengikuti. Bisa diganti kapan pun di Pengaturan.";
-    pub const DIALOG_NOTE: &str = "Disimpan per keyboard (nomor seri) di komputer ini.";
+    pub const DIALOG_BODY: &str = "Hanya untuk tampilan di app; bisa diganti di Pengaturan.";
     pub const LATER: &str = "Nanti saja";
     pub const USE: &str = "Pakai warna ini";
 
     pub const ROW_TITLE: &str = "Warna keyboard";
-    pub const ROW_HINT: &str = "Tampilan keyboard di app. Keyboard tidak melaporkan warnanya, jadi dipilih manual. Disimpan untuk keyboard ini.";
+    pub const ROW_HINT: &str = "Hanya untuk tampilan di app.";
     pub const ROW_OFFLINE: &str = "Sambungkan keyboard untuk memilih warnanya.";
 
-    pub const EDITOR_PATH: &str = "PENGATURAN · WARNA KEYBOARD · KUSTOM";
     pub const EDITOR_TITLE: &str = "Keycap kustom";
-    pub const EDITOR_BODY: &str = "Untuk keycap yang sudah diganti. Pilih warna atas tiga kelompok tombol; sisi keycap dan warna huruf dihitung otomatis supaya tetap terbaca.";
-    pub const EDITOR_PREVIEW: &str =
-        "Pratinjau langsung. Tombol yang dipilih tetap bergaris amber.";
     pub const EDITOR_COLORS: &str = "Warna";
     pub const FIELD_ALPHA: &str = "Tombol huruf & angka";
     pub const FIELD_MOD: &str = "Modifier (Tab, Shift, Ctrl…)";
@@ -59,13 +53,6 @@ pub fn skin_name(s: &KeyboardSkin) -> &'static str {
         KeyboardSkin::WhiteBlue => t::WHITE_BLUE,
         KeyboardSkin::Gelap => t::GELAP,
         KeyboardSkin::Custom { .. } => t::CUSTOM,
-    }
-}
-
-fn model_name(m: Model) -> &'static str {
-    match m {
-        Model::Win68HeMax => "WIN 68 HE MAX",
-        Model::Win60HeMax => "WIN 60 HE MAX",
     }
 }
 
@@ -208,12 +195,6 @@ pub fn first_connect_dialog(
         .show(ctx, |ui| {
             ui.set_width(width);
             ui.label(
-                RichText::new(format!("{} {}", model_name(model), t::CONNECTED))
-                    .font(font::bold(12.0))
-                    .color(color::MUTED),
-            );
-            ui.add_space(4.0);
-            ui.label(
                 RichText::new(t::DIALOG_TITLE)
                     .font(font::bold(22.0))
                     .color(color::TEXT),
@@ -251,11 +232,6 @@ pub fn first_connect_dialog(
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(t::DIALOG_NOTE)
-                        .font(font::small())
-                        .color(color::MUTED),
-                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if primary_button(ui, t::USE, 150.0).clicked() {
                         out = Some(DialogOutcome::Use(*choice));
@@ -581,19 +557,9 @@ impl CustomEditor {
                         |ui| {
                             ui.set_width(left_w);
                             ui.label(
-                                RichText::new(t::EDITOR_PATH)
-                                    .font(font::bold(12.0))
-                                    .color(color::MUTED),
-                            );
-                            ui.add_space(2.0);
-                            ui.label(
                                 RichText::new(t::EDITOR_TITLE)
                                     .font(font::bold(22.0))
                                     .color(color::TEXT),
-                            );
-                            ui.add(
-                                egui::Label::new(RichText::new(t::EDITOR_BODY).color(color::MUTED))
-                                    .wrap(),
                             );
                             ui.add_space(14.0);
                             let mut sel = Selection::default();
@@ -604,12 +570,6 @@ impl CustomEditor {
                                 .max_unit(50.0)
                                 .id_salt("custom-preview")
                                 .show(ui, &mut sel, |_| Default::default());
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new(t::EDITOR_PREVIEW)
-                                    .font(font::small())
-                                    .color(color::MUTED),
-                            );
                         },
                     );
                     ui.allocate_ui_with_layout(
